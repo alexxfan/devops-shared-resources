@@ -4,7 +4,7 @@ from pathlib import Path
 
 from lib.merge_resolver import merge_branches
 from scripts.sync_branches import run_sync_entry
-from tests.conftest import run
+from tests.conftest import configure_git_identity, run
 
 
 def _commit(repo: Path, relative_path: str, content: str, message: str) -> None:
@@ -70,9 +70,9 @@ def test_merge_resolver_end_to_end_with_bare_remote(git_repo_factory, tmp_path: 
     run(["git", "branch", "stable"], cwd=downstream)
     run(["git", "push", "-u", "origin", "stable"], cwd=downstream)
 
-    upstream = git_repo_factory("upstream")
     run(["git", "clone", str(origin), str(tmp_path / "upstream-clone")], cwd=tmp_path)
     upstream = tmp_path / "upstream-clone"
+    configure_git_identity(upstream)
     _commit(upstream, "README.md", "main\n", "main change")
     run(["git", "push", "origin", "main"], cwd=upstream)
 

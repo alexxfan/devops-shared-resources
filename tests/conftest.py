@@ -6,6 +6,12 @@ from pathlib import Path
 import pytest
 
 
+def configure_git_identity(repo_path: Path) -> None:
+    """Set local git author identity (CI runners often have none configured)."""
+    run(["git", "config", "user.name", "test"], cwd=repo_path)
+    run(["git", "config", "user.email", "test@example.com"], cwd=repo_path)
+
+
 def run(cmd: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
     if cmd[:2] == ["git", "commit"]:
         cmd = [*cmd[:2], "--no-verify", *cmd[2:]]
@@ -23,8 +29,7 @@ def git_repo_factory(tmp_path: Path):
         repo_path = tmp_path / name
         repo_path.mkdir()
         run(["git", "init", "-b", default_branch], cwd=repo_path)
-        run(["git", "config", "user.name", "test"], cwd=repo_path)
-        run(["git", "config", "user.email", "test@example.com"], cwd=repo_path)
+        configure_git_identity(repo_path)
         return repo_path
 
     return _create_repo
