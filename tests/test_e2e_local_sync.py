@@ -4,7 +4,7 @@ from pathlib import Path
 
 from lib.merge_resolver import merge_branches
 from scripts.sync_branches import run_sync_entry
-from tests.conftest import configure_git_identity, run
+from tests.conftest import configure_git_identity, run, set_bare_repo_default_branch
 
 
 def _commit(repo: Path, relative_path: str, content: str, message: str) -> None:
@@ -26,6 +26,7 @@ def test_local_commit_merge_sync(git_repo_factory, tmp_path: Path) -> None:
     run(["git", "push", "-u", "origin", "main"], cwd=repo)
     run(["git", "branch", "stable"], cwd=repo)
     run(["git", "push", "-u", "origin", "stable"], cwd=repo)
+    set_bare_repo_default_branch(origin, "main")
     _commit(repo, "README.md", "main\n", "main readme")
     _commit(repo, "keep.txt", "main value\n", "main keep")
     run(["git", "push", "origin", "main"], cwd=repo)
@@ -69,10 +70,12 @@ def test_merge_resolver_end_to_end_with_bare_remote(git_repo_factory, tmp_path: 
     run(["git", "push", "-u", "origin", "main"], cwd=downstream)
     run(["git", "branch", "stable"], cwd=downstream)
     run(["git", "push", "-u", "origin", "stable"], cwd=downstream)
+    set_bare_repo_default_branch(origin, "main")
 
     run(["git", "clone", str(origin), str(tmp_path / "upstream-clone")], cwd=tmp_path)
     upstream = tmp_path / "upstream-clone"
     configure_git_identity(upstream)
+    run(["git", "checkout", "main"], cwd=upstream)
     _commit(upstream, "README.md", "main\n", "main change")
     run(["git", "push", "origin", "main"], cwd=upstream)
 
