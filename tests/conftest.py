@@ -12,6 +12,14 @@ def configure_git_identity(repo_path: Path) -> None:
     run(["git", "config", "user.email", "test@example.com"], cwd=repo_path)
 
 
+def set_bare_repo_default_branch(bare_repo: Path, branch: str) -> None:
+    """Point a bare remote's HEAD at a branch so clones check out the expected ref."""
+    run(
+        ["git", "--git-dir", str(bare_repo), "symbolic-ref", "HEAD", f"refs/heads/{branch}"],
+        cwd=bare_repo.parent,
+    )
+
+
 def run(cmd: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
     if cmd[:2] == ["git", "commit"]:
         cmd = [*cmd[:2], "--no-verify", *cmd[2:]]
