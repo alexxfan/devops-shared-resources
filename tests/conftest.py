@@ -1,0 +1,30 @@
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+
+def run(cmd: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    if cmd[:2] == ["git", "commit"]:
+        cmd = [*cmd[:2], "--no-verify", *cmd[2:]]
+    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"command failed: {' '.join(cmd)}\nstdout={result.stdout}\nstderr={result.stderr}"
+        )
+    return result
+
+
+@pytest.fixture
+def git_repo_factory(tmp_path: Path):
+    def _create_repo(name: str, *, default_branch: str = "main") -> Path:
+        repo_path = tmp_path / name
+        repo_path.mkdir()
+        run(["git", "init", "-b", default_branch], cwd=repo_path)
+        run(["git", "config", "user.name", "test"], cwd=repo_path)
+        run(["git", "config", "user.email", "test@example.com"], cwd=repo_path)
+        return repo_path
+
+    return _create_repo
