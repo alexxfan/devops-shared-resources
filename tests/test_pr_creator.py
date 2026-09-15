@@ -49,6 +49,20 @@ def test_format_default_pr_body_includes_commit_summary() -> None:
     assert "GitHub automerge is enabled" in body
 
 
+def test_format_default_pr_body_includes_conflict_files() -> None:
+    body = format_default_pr_body(
+        "main",
+        "stable",
+        source_repo="https://github.com/org/repo.git",
+        target_repo="https://github.com/org/repo.git",
+        conflict_files=["README.md", "config.yaml"],
+    )
+
+    assert "### Merge conflicts" in body
+    assert "`README.md`" in body
+    assert "Resolve the merge conflicts above" in body
+
+
 def test_format_default_pr_title_cross_repo() -> None:
     title = format_default_pr_title(
         "main",
@@ -66,6 +80,7 @@ def test_create_pull_request_calls_github_api() -> None:
     creator._request = MagicMock(
         return_value={"number": 42, "html_url": "https://github.com/org/repo/pull/42"}
     )
+    creator.ensure_delete_branch_on_merge = MagicMock()
     creator.add_labels = MagicMock()
     creator.request_reviewers = MagicMock()
     creator.enable_automerge = MagicMock()
@@ -83,6 +98,7 @@ def test_create_pull_request_calls_github_api() -> None:
 
     assert result.number == 42
     assert result.created is True
+    creator.ensure_delete_branch_on_merge.assert_called_once()
     creator.add_labels.assert_called_once()
     creator.request_reviewers.assert_called_once()
     creator.enable_automerge.assert_called_once()

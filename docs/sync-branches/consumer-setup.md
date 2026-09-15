@@ -17,10 +17,11 @@ The infra workflow should:
 4. Run the script against the infra config
 
 ```bash
+export SYNC_TOKEN="your-token"
+
 python devops-shared-resources/scripts/sync_branches.py \
   --config config/sync-branches.yaml \
-  --only kserve \
-  --token "$SYNC_TOKEN"
+  --only kserve
 ```
 
 Use `--only` with a comma-separated list of component names, or omit it to run every entry.
@@ -67,7 +68,9 @@ The native `syncs:` format from `docs/sync-branches/README.md` is still supporte
 
 ## Token requirements
 
-`SYNC_TOKEN` needs permission to:
+Set `GITHUB_TOKEN` or `SYNC_TOKEN` in the environment. The script does not accept tokens on the CLI.
+
+The token needs permission to:
 
 - read and clone target repositories
 - push branches
@@ -77,10 +80,10 @@ The native `syncs:` format from `docs/sync-branches/README.md` is still supporte
 
 ```bash
 git clone https://github.com/red-hat-data-services/devops-shared-resources.git
+export GITHUB_TOKEN="your-token"
 
 python devops-shared-resources/scripts/sync_branches.py \
   --config config/sync-branches.yaml \
   --only kserve \
-  --token "$GITHUB_TOKEN" \
   --dry-run
 ```
