@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 import requests
 
 from lib.git_utils import GitCommit, extract_repo_slug, format_commit_url, parse_github_repo
@@ -68,6 +68,17 @@ class PRCreator:
                 return pull
         return None
 
+    def ensure_delete_branch_on_merge(self, repo_url: str) -> None:
+        """Enable repository setting to delete head branches after PR merge."""
+        owner, repo = parse_github_repo(repo_url)
+        repo_data = self._request("GET", f"/repos/{owner}/{repo}")
+        if not repo_data.get("delete_branch_on_merge"):
+            self._request(
+                "PATCH",
+                f"/repos/{owner}/{repo}",
+                json={"delete_branch_on_merge": True},
+            )
+
     def create_pull_request(
         self,
         repo_url: str,
@@ -80,8 +91,11 @@ class PRCreator:
         reviewers: list[str] | None = None,
         automerge: bool = False,
         draft: bool = False,
+        delete_branch_on_merge: bool = True,
     ) -> PRResult:
         owner, repo = parse_github_repo(repo_url)
+        if delete_branch_on_merge:
+            self.ensure_delete_branch_on_merge(repo_url)
         payload = {
             "title": title,
             "body": body,
@@ -170,6 +184,7 @@ class PRCreator:
         labels: list[str] | None = None,
         reviewers: list[str] | None = None,
         automerge: bool = False,
+        delete_branch_on_merge: bool = True,
     ) -> PRResult:
         labels = list(labels or [])
         if tracking_label and tracking_label not in labels:
@@ -210,6 +225,7 @@ class PRCreator:
             labels=labels,
             reviewers=reviewers,
             automerge=automerge,
+            delete_branch_on_merge=delete_branch_on_merge,
         )
 
 
@@ -244,6 +260,7 @@ def format_default_pr_body(
     commits: list[GitCommit] | None = None,
     head_branch: str | None = None,
     automerge: bool = False,
+    conflict_files: Sequence[str] | None = None,
 ) -> str:
     sync_commits = list(commits or [])
     lines = [
@@ -294,8 +311,21 @@ def format_default_pr_body(
     else:
         lines.append("_No new commits to sync._")
 
+    if conflict_files:
+        lines.extend(["", "### Merge conflicts", ""])
+        lines.append(
+            "This pull request was opened with unresolved merge conflicts that must be "
+            "resolved before it can be merged:"
+        )
+        lines.extend(f"- `{file_path}`" for file_path in conflict_files)
+
     lines.extend(["", "### Merging", ""])
-    if automerge:
+    if conflict_files:
+        lines.append(
+            "Resolve the merge conflicts above before merging this pull request into "
+            f"`{target_branch}`."
+        )
+    elif automerge:
         lines.append(
             "GitHub automerge is enabled for this pull request once required checks pass."
         )

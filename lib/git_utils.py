@@ -114,16 +114,6 @@ def clone_repo(
     return destination
 
 
-def configure_identity(
-    repo_path: str | Path,
-    *,
-    name: str = "sync-branches-bot",
-    email: str = "sync-branches-bot@users.noreply.github.com",
-) -> None:
-    run_git(["config", "user.name", name], cwd=repo_path)
-    run_git(["config", "user.email", email], cwd=repo_path)
-
-
 def add_remote(
     repo_path: str | Path,
     name: str,

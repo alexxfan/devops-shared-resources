@@ -47,6 +47,20 @@ def test_merge_keeps_ignored_files_from_target(git_repo_factory) -> None:
     assert (repo / "config.yaml").read_text(encoding="utf-8") == "target config\n"
 
 
+def test_merge_conflict_with_allow_conflicts_commits(git_repo_factory) -> None:
+    repo = git_repo_factory("merge-conflict-pr")
+    _commit(repo, "README.md", "target\n", "target init")
+    run(["git", "branch", "stable"], cwd=repo)
+    _commit(repo, "README.md", "main\n", "main change")
+    run(["git", "checkout", "stable"], cwd=repo)
+    _commit(repo, "README.md", "stable\n", "stable change")
+
+    result = merge_branches(repo, source_ref="main", allow_conflicts=True)
+    assert result.merged is True
+    assert result.conflict_files == ("README.md",)
+    assert "<<<<<<<" in (repo / "README.md").read_text(encoding="utf-8")
+
+
 def test_merge_conflict_without_ignore_raises(git_repo_factory) -> None:
     repo = git_repo_factory("merge-conflict")
     _commit(repo, "README.md", "target\n", "target init")

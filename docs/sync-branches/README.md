@@ -13,12 +13,12 @@ Python tooling for syncing one git branch into another, with optional PR creatio
 
 ```bash
 pip install -r requirements-dev.txt
+export GITHUB_TOKEN="your-token"
 
 python scripts/sync_branches.py \
   --source-repo https://github.com/org/repo.git \
   --source-branch main \
   --target-branch stable \
-  --token "$GITHUB_TOKEN" \
   --tracking-label lake-gate
 ```
 
@@ -29,10 +29,11 @@ When `--config` is provided, per-entry sync flags must not also be passed on the
 Run a subset of configured entries:
 
 ```bash
+export GITHUB_TOKEN="your-token"
+
 python scripts/sync_branches.py \
   --config config/sync-branches.yaml \
-  --only kserve,kubeflow \
-  --token "$GITHUB_TOKEN"
+  --only kserve,kubeflow
 ```
 
 ### Native `syncs:` format

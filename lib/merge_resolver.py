@@ -16,6 +16,7 @@ class MergeResult:
     merged: bool
     already_up_to_date: bool
     message: str
+    conflict_files: tuple[str, ...] = ()
 
 
 class MergeError(RuntimeError):
@@ -90,6 +91,30 @@ def _restore_excluded_files(
     return True
 
 
+def list_unmerged_files(repo_path: str | Path) -> list[str]:
+    """Return paths with unresolved merge conflicts in the working tree."""
+    unmerged = run_git(
+        ["diff", "--name-only", "--diff-filter=U"],
+        cwd=repo_path,
+    ).stdout.splitlines()
+    return [line for line in unmerged if line.strip()]
+
+
+def _commit_conflicted_merge(
+    repo_path: Path,
+    *,
+    commit_message: str,
+) -> tuple[str, ...]:
+    conflict_files = tuple(list_unmerged_files(repo_path))
+    if not conflict_files:
+        raise MergeError("Expected merge conflicts but none were found")
+
+    for file_path in conflict_files:
+        run_git(["add", file_path], cwd=repo_path)
+    run_git(["commit", "--no-verify", "-m", commit_message], cwd=repo_path)
+    return conflict_files
+
+
 def _resolve_conflicts(repo_path: Path, ignore_files: Sequence[str]) -> None:
     unmerged = run_git(
         ["diff", "--name-only", "--diff-filter=U"],
@@ -129,6 +154,7 @@ def merge_branches(
     merge_args: Sequence[str] = (),
     commit_message: str = "Merged upstream",
     dry_run: bool = False,
+    allow_conflicts: bool = False,
 ) -> MergeResult:
     """
     Merge ``source_ref`` into the current branch of ``repo_path``.
@@ -160,8 +186,24 @@ def merge_branches(
     if merge_result.returncode != 0:
         if "CONFLICT" in output:
             if not ignore_files:
+                if allow_conflicts:
+                    conflict_files = _commit_conflicted_merge(
+                        repo,
+                        commit_message=f"{commit_message} (merge conflicts)",
+                    )
+                    return MergeResult(
+                        merged=True,
+                        already_up_to_date=False,
+                        message=output,
+                        conflict_files=conflict_files,
+                    )
                 run_git(["merge", "--abort"], cwd=repo, check=False)
-                raise MergeError("Merge conflicts detected and no ignore patterns were provided")
+                conflict_files = tuple(list_unmerged_files(repo))
+                summary = ", ".join(conflict_files) if conflict_files else "unknown files"
+                raise MergeError(
+                    "Merge conflicts detected and no ignore patterns were provided. "
+                    f"Conflicted files: {summary}"
+                )
             _resolve_conflicts(repo, ignore_files)
             run_git(["commit", "--no-verify", "--no-edit", "-m", commit_message], cwd=repo)
             _restore_excluded_files(repo, downstream_head, ignore_files)

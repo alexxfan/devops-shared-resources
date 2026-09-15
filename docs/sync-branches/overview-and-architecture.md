@@ -27,11 +27,11 @@ Reference material (inspiration only, not ported line-for-line):
 ## Example Usage
 ```bash
 pip install -r requirements-dev.txt
+export GITHUB_TOKEN="$GITHUB_TOKEN"
 python scripts/sync_branches.py \
   --source-repo https://github.com/org/repo.git \
   --source-branch main \
   --target-branch stable \
-  --token "$GITHUB_TOKEN" \
   --tracking-label lake-gate \
   --dry-run
 ```
@@ -179,7 +179,7 @@ rhods-devops-infra workflow
   → checkout infra repo (config/sync-branches.yaml)
   → checkout devops-shared-resources
   → pip install -r requirements.txt
-  → python scripts/sync_branches.py --config config/sync-branches.yaml --only kserve --token $TOKEN
+  → SYNC_TOKEN=$SYNC_TOKEN python scripts/sync_branches.py --config config/sync-branches.yaml --only kserve
 ```
 
 See `docs/sync-branches/consumer-setup.md`. The workflow YAML itself is owned by `rhods-devops-infra`.

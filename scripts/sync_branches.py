@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 import tempfile
@@ -26,7 +27,6 @@ from lib.git_utils import (
     add_remote,
     checkout_remote_branch,
     clone_repo,
-    configure_identity,
     fetch_remote,
     is_local_path,
     list_commits_between,
@@ -84,8 +84,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Files or glob patterns to keep at the target version on conflict.",
     )
-    parser.add_argument("--token", help="GitHub token for clone/push/PR operations.")
     parser.add_argument("--dry-run", action="store_true", help="Plan actions without changing remotes.")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print extra details such as merge conflict file lists.",
+    )
     parser.add_argument("--pr-branch", help="Branch name to use when opening a PR.")
     parser.add_argument("--tracking-label", help="Reuse an open PR with this label instead of creating a new one.")
     parser.add_argument("--label", dest="labels", action="append", default=[], help="Additional PR label.")
@@ -146,6 +151,26 @@ def _entry_from_args(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def resolve_github_token() -> str | None:
+    """Read a GitHub token from the environment."""
+    return os.environ.get("GITHUB_TOKEN") or os.environ.get("SYNC_TOKEN")
+
+
+def _entry_needs_github_token(entry: dict[str, Any]) -> bool:
+    if entry["sync_type"] == "pr":
+        return True
+    return not is_local_path(entry["src"]["url"]) or not is_local_path(entry["dest"]["url"])
+
+
+def _require_github_token(entry: dict[str, Any], token: str | None) -> None:
+    if not _entry_needs_github_token(entry):
+        return
+    if not token:
+        raise ConfigError(
+            "A GitHub token is required. Set the GITHUB_TOKEN or SYNC_TOKEN environment variable."
+        )
+
+
 def _default_pr_branch(entry: dict[str, Any]) -> str:
     configured = entry["pr"]["branch"]
     if configured:
@@ -165,7 +190,6 @@ def _prepare_worktree(
     source_url = normalize_repo_url(entry["src"]["url"])
     workdir = Path(tempfile.mkdtemp(prefix="sync-branches-"))
     clone_repo(target_url, workdir, token=token)
-    configure_identity(workdir)
 
     tracking_branch = None
     if entry["sync_type"] == "pr" and entry["pr"]["tracking_label"] and token:
@@ -198,11 +222,15 @@ def run_sync_entry(
     *,
     token: str | None,
     dry_run: bool = False,
+    verbose: bool = False,
 ) -> SyncOutcome:
     sync_type = entry["sync_type"]
     source = entry["src"]
     target = entry["dest"]
     pr_branch = _default_pr_branch(entry)
+
+    if not dry_run:
+        _require_github_token(entry, token)
 
     if dry_run:
         return SyncOutcome(
@@ -219,7 +247,6 @@ def run_sync_entry(
         if sync_type == "push":
             workdir = Path(tempfile.mkdtemp(prefix="sync-branches-push-"))
             clone_repo(source["url"], workdir, token=token, branch=source["branch"])
-            configure_identity(workdir)
             run_git(["checkout", "-B", target["branch"]], cwd=workdir)
             push_branch(workdir, target["branch"], force=True)
             return SyncOutcome(
@@ -239,7 +266,18 @@ def run_sync_entry(
             ignore_files=entry["ignore_files"],
             merge_args=entry["merge_args"],
             commit_message=f"Sync {source['branch']} into {target['branch']}",
+            allow_conflicts=sync_type == "pr",
         )
+
+        if merge_result.conflict_files:
+            conflict_summary = ", ".join(merge_result.conflict_files)
+            print(
+                f"warning: merge conflicts detected in: {conflict_summary}",
+                file=sys.stderr,
+            )
+            if verbose:
+                for file_path in merge_result.conflict_files:
+                    print(f"  conflict: {file_path}", file=sys.stderr)
 
         if merge_result.already_up_to_date:
             return SyncOutcome(
@@ -258,9 +296,7 @@ def run_sync_entry(
                 branch=target["branch"],
             )
 
-        if not token:
-            raise ConfigError("A GitHub token is required to create or update pull requests.")
-
+        assert token is not None
         creator = PRCreator(token)
         title = entry["pr"]["title"] or format_default_pr_title(
             source["branch"],
@@ -276,6 +312,7 @@ def run_sync_entry(
             commits=commits_to_sync,
             head_branch=work_branch if sync_type == "pr" else None,
             automerge=entry["pr"]["automerge"],
+            conflict_files=merge_result.conflict_files,
         )
         pr_result = creator.create_or_update_tracking_pr(
             target["url"],
@@ -289,9 +326,12 @@ def run_sync_entry(
             automerge=entry["pr"]["automerge"],
         )
         action = "Updated" if pr_result.updated else "Created"
+        message = f"{action} pull request #{pr_result.number}"
+        if merge_result.conflict_files:
+            message += " (contains merge conflicts)"
         return SyncOutcome(
             sync_type=sync_type,
-            message=f"{action} pull request #{pr_result.number}",
+            message=message,
             pr_url=pr_result.url,
             branch=pr_result.branch,
         )
@@ -311,9 +351,15 @@ def main(argv: list[str] | None = None) -> int:
         else:
             entries = [_entry_from_args(args)]
 
+        token = resolve_github_token()
         outcomes: list[SyncOutcome] = []
         for entry in entries:
-            outcome = run_sync_entry(entry, token=args.token, dry_run=args.dry_run)
+            outcome = run_sync_entry(
+                entry,
+                token=token,
+                dry_run=args.dry_run,
+                verbose=args.verbose,
+            )
             outcomes.append(outcome)
             print(outcome.message)
             if outcome.pr_url:
