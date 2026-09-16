@@ -93,6 +93,38 @@ def authenticated_clone_url(repo_url: str, token: str | None) -> str:
     return f"https://x-access-token:{token}@github.com/{owner}/{name}.git"
 
 
+def _git_config_value(repo_path: str | Path, key: str) -> str:
+    result = run_git(["config", key], cwd=repo_path, check=False)
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _default_git_identity_from_env() -> tuple[str, str]:
+    name = os.environ.get("GIT_AUTHOR_NAME") or os.environ.get("GITHUB_ACTOR")
+    email = os.environ.get("GIT_AUTHOR_EMAIL")
+    if not email and os.environ.get("GITHUB_ACTOR"):
+        actor = os.environ["GITHUB_ACTOR"]
+        actor_id = os.environ.get("GITHUB_ACTOR_ID")
+        if actor_id:
+            email = f"{actor_id}+{actor}@users.noreply.github.com"
+        else:
+            email = f"{actor}@users.noreply.github.com"
+    return name or "sync-branches-bot", email or "sync-branches-bot@users.noreply.github.com"
+
+
+def ensure_git_identity(repo_path: str | Path) -> None:
+    """Configure local git identity only when no effective user.name/email is set."""
+    if _git_config_value(repo_path, "user.name") and _git_config_value(repo_path, "user.email"):
+        return
+
+    name, email = _default_git_identity_from_env()
+    if not _git_config_value(repo_path, "user.name"):
+        run_git(["config", "user.name", name], cwd=repo_path)
+    if not _git_config_value(repo_path, "user.email"):
+        run_git(["config", "user.email", email], cwd=repo_path)
+
+
 def clone_repo(
     repo_url: str,
     destination: str | Path,
@@ -111,6 +143,7 @@ def clone_repo(
         args.extend(["--branch", branch])
     args.extend([clone_url, str(destination)])
     run_git(args)
+    ensure_git_identity(destination)
     return destination
 
 
