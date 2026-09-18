@@ -61,8 +61,11 @@ git:
 | `defaults.source-branch` | Source branch (default: `main`) |
 | `defaults.target-branch` | Target branch (default: `stable`) |
 | `defaults.tracking-label` | PR tracking label (default: `lake-gate`) |
+| `pr.head-strategy` / `pr-head` | `sync-branch` (default) or `source` (PR directly from source branch) |
 
-Per-entry overrides are also supported: `source-branch`, `target-branch`, `tracking-label`, `sync-type`.
+Per-entry overrides are also supported: `source-branch`, `target-branch`, `tracking-label`, `sync-type`, `pr-head`.
+
+Use `pr-head: source` when you want `main` → `stable` directly instead of a temporary sync branch. This requires the same repository and cannot be combined with `ignore-files`.
 
 The native `syncs:` format from `docs/sync-branches/README.md` is still supported.
 

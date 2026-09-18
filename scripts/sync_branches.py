@@ -92,6 +92,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print extra details such as merge conflict file lists.",
     )
     parser.add_argument("--pr-branch", help="Branch name to use when opening a PR.")
+    parser.add_argument(
+        "--pr-head",
+        choices=["sync-branch", "source"],
+        default=None,
+        help=(
+            "PR head strategy: merge into a temporary sync branch (default) or open the PR "
+            "directly from the source branch."
+        ),
+    )
     parser.add_argument("--tracking-label", help="Reuse an open PR with this label instead of creating a new one.")
     parser.add_argument("--label", dest="labels", action="append", default=[], help="Additional PR label.")
     parser.add_argument("--automerge", action="store_true", help="Enable GitHub automerge on created PRs.")
@@ -140,6 +149,7 @@ def _entry_from_args(args: argparse.Namespace) -> dict[str, Any]:
             "ignore-files": args.ignore_files or [],
             "pr": {
                 "branch": args.pr_branch,
+                "head-strategy": args.pr_head,
                 "tracking-label": args.tracking_label,
                 "labels": args.labels,
                 "automerge": args.automerge,
@@ -169,6 +179,97 @@ def _require_github_token(entry: dict[str, Any], token: str | None) -> None:
         raise ConfigError(
             "A GitHub token is required. Set the GITHUB_TOKEN or SYNC_TOKEN environment variable."
         )
+
+
+def _uses_source_pr_head(entry: dict[str, Any]) -> bool:
+    return entry["sync_type"] == "pr" and entry["pr"]["head_strategy"] == "source"
+
+
+def _validate_source_pr_head(entry: dict[str, Any]) -> None:
+    source_url = normalize_repo_url(entry["src"]["url"])
+    target_url = normalize_repo_url(entry["dest"]["url"])
+    if source_url != target_url:
+        raise ConfigError(
+            "pr head strategy 'source' requires the source and target repositories to be the same."
+        )
+    if entry["ignore_files"]:
+        raise ConfigError(
+            "pr head strategy 'source' cannot be used with ignore-files; use 'sync-branch' instead."
+        )
+
+
+def _collect_sync_commits(
+    entry: dict[str, Any],
+    *,
+    token: str | None,
+) -> tuple[Path, list]:
+    """Clone the target repo and return (workdir, commits from target..source)."""
+    target_url = normalize_repo_url(entry["dest"]["url"])
+    source_url = normalize_repo_url(entry["src"]["url"])
+    workdir = Path(tempfile.mkdtemp(prefix="sync-branches-commits-"))
+    clone_repo(target_url, workdir, token=token)
+    if source_url != target_url or not is_local_path(source_url):
+        add_remote(workdir, "source", source_url, token=token)
+        fetch_remote(workdir, "source", tags=True)
+        source_ref = f"source/{entry['src']['branch']}"
+    else:
+        fetch_remote(workdir, "origin", refspec=entry["src"]["branch"])
+        source_ref = f"origin/{entry['src']['branch']}"
+    target_ref = resolve_branch_ref(workdir, entry["dest"]["branch"])
+    commits = list_commits_between(workdir, target_ref, source_ref)
+    return workdir, commits
+
+
+def _create_or_update_pr(
+    entry: dict[str, Any],
+    *,
+    token: str,
+    head_branch: str,
+    commits_to_sync: list,
+    conflict_files: tuple[str, ...] = (),
+    delete_branch_on_merge: bool = True,
+) -> SyncOutcome:
+    source = entry["src"]
+    target = entry["dest"]
+    creator = PRCreator(token)
+    title = entry["pr"]["title"] or format_default_pr_title(
+        source["branch"],
+        target["branch"],
+        source_repo=source["url"],
+        target_repo=target["url"],
+    )
+    body = entry["pr"]["body"] or format_default_pr_body(
+        source["branch"],
+        target["branch"],
+        source_repo=source["url"],
+        target_repo=target["url"],
+        commits=commits_to_sync,
+        head_branch=head_branch,
+        automerge=entry["pr"]["automerge"],
+        conflict_files=conflict_files,
+    )
+    pr_result = creator.create_or_update_tracking_pr(
+        target["url"],
+        title=title,
+        body=body,
+        head_branch=head_branch,
+        base_branch=target["branch"],
+        tracking_label=entry["pr"]["tracking_label"],
+        labels=entry["pr"]["labels"],
+        reviewers=entry["pr"]["reviewers"],
+        automerge=entry["pr"]["automerge"],
+        delete_branch_on_merge=delete_branch_on_merge,
+    )
+    action = "Updated" if pr_result.updated else "Created"
+    message = f"{action} pull request #{pr_result.number}"
+    if conflict_files:
+        message += " (contains merge conflicts)"
+    return SyncOutcome(
+        sync_type=entry["sync_type"],
+        message=message,
+        pr_url=pr_result.url,
+        branch=pr_result.branch,
+    )
 
 
 def _default_pr_branch(entry: dict[str, Any]) -> str:
@@ -233,17 +334,41 @@ def run_sync_entry(
         _require_github_token(entry, token)
 
     if dry_run:
+        pr_head = source["branch"] if _uses_source_pr_head(entry) else pr_branch
         return SyncOutcome(
             sync_type=sync_type,
             message=(
                 f"Dry run: would sync {source['url']}:{source['branch']} "
                 f"-> {target['url']}:{target['branch']} using {sync_type}"
+                + (
+                    f" (PR head: {entry['pr']['head_strategy']})"
+                    if sync_type == "pr"
+                    else ""
+                )
             ),
-            branch=pr_branch if sync_type == "pr" else target["branch"],
+            branch=pr_head if sync_type == "pr" else target["branch"],
         )
 
     workdir: Path | None = None
     try:
+        if _uses_source_pr_head(entry):
+            _validate_source_pr_head(entry)
+            assert token is not None
+            workdir, commits_to_sync = _collect_sync_commits(entry, token=token)
+            if not commits_to_sync:
+                return SyncOutcome(
+                    sync_type=sync_type,
+                    message="Target branch is already up to date.",
+                    branch=source["branch"],
+                )
+            return _create_or_update_pr(
+                entry,
+                token=token,
+                head_branch=source["branch"],
+                commits_to_sync=commits_to_sync,
+                delete_branch_on_merge=False,
+            )
+
         if sync_type == "push":
             workdir = Path(tempfile.mkdtemp(prefix="sync-branches-push-"))
             clone_repo(source["url"], workdir, token=token, branch=source["branch"])
@@ -297,43 +422,13 @@ def run_sync_entry(
             )
 
         assert token is not None
-        creator = PRCreator(token)
-        title = entry["pr"]["title"] or format_default_pr_title(
-            source["branch"],
-            target["branch"],
-            source_repo=source["url"],
-            target_repo=target["url"],
-        )
-        body = entry["pr"]["body"] or format_default_pr_body(
-            source["branch"],
-            target["branch"],
-            source_repo=source["url"],
-            target_repo=target["url"],
-            commits=commits_to_sync,
-            head_branch=work_branch if sync_type == "pr" else None,
-            automerge=entry["pr"]["automerge"],
-            conflict_files=merge_result.conflict_files,
-        )
-        pr_result = creator.create_or_update_tracking_pr(
-            target["url"],
-            title=title,
-            body=body,
+        return _create_or_update_pr(
+            entry,
+            token=token,
             head_branch=work_branch,
-            base_branch=target["branch"],
-            tracking_label=entry["pr"]["tracking_label"],
-            labels=entry["pr"]["labels"],
-            reviewers=entry["pr"]["reviewers"],
-            automerge=entry["pr"]["automerge"],
-        )
-        action = "Updated" if pr_result.updated else "Created"
-        message = f"{action} pull request #{pr_result.number}"
-        if merge_result.conflict_files:
-            message += " (contains merge conflicts)"
-        return SyncOutcome(
-            sync_type=sync_type,
-            message=message,
-            pr_url=pr_result.url,
-            branch=pr_result.branch,
+            commits_to_sync=commits_to_sync,
+            conflict_files=merge_result.conflict_files,
+            delete_branch_on_merge=True,
         )
     finally:
         if workdir and workdir.exists():

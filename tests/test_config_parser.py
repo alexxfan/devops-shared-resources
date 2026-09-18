@@ -155,6 +155,32 @@ def test_filter_sync_entries_unknown_name_raises() -> None:
         filter_sync_entries(entries, "missing")
 
 
+def test_parse_pr_head_strategy() -> None:
+    entry = parse_sync_config(
+        {
+            "src": {"url": "https://github.com/org/repo.git", "branch": "main"},
+            "dest": {"branch": "stable"},
+            "pr": {"head-strategy": "source"},
+        }
+    )[0]
+    assert entry["pr"]["head_strategy"] == "source"
+
+
+def test_parse_git_entry_pr_head_strategy() -> None:
+    entries = parse_sync_config(
+        {
+            "defaults": {"pr-head": "source"},
+            "git": [
+                {
+                    "name": "kserve",
+                    "repo-url": "https://github.com/red-hat-data-services/kserve.git",
+                }
+            ],
+        }
+    )
+    assert entries[0]["pr"]["head_strategy"] == "source"
+
+
 def test_invalid_sync_type_raises() -> None:
     with pytest.raises(ConfigError, match="sync-type must be one of"):
         normalize_sync_entry(

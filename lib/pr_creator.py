@@ -271,10 +271,14 @@ def format_default_pr_body(
             f"`{target_branch}` branch"
         ),
     ]
-    if head_branch:
+    if head_branch and head_branch != source_branch:
         lines[-1] += (
             f" by merging `{source_branch}` into temporary branch "
             f"`{head_branch}` and opening a pull request into `{target_branch}`."
+        )
+    elif head_branch == source_branch:
+        lines[-1] += (
+            f" by opening a pull request from `{source_branch}` into `{target_branch}`."
         )
     else:
         lines[-1] += "."
@@ -298,8 +302,10 @@ def format_default_pr_body(
             f"- **Target:** `{target_repo}` @ `{target_branch}`",
         ]
     )
-    if head_branch:
+    if head_branch and head_branch != source_branch:
         lines.append(f"- **Sync branch:** `{head_branch}`")
+    elif head_branch == source_branch:
+        lines.append(f"- **PR head:** `{head_branch}`")
 
     lines.extend(["", "### Commits to be synced", ""])
     if sync_commits:

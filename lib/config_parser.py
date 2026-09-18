@@ -8,6 +8,7 @@ from typing import Any
 import yaml
 
 SYNC_TYPES = {"pr", "push", "commit-merge"}
+PR_HEAD_STRATEGIES = {"sync-branch", "source"}
 REQUIRED_SRC_FIELDS = ("url", "branch")
 REQUIRED_DEST_FIELDS = ("branch",)
 
@@ -64,10 +65,20 @@ def _normalize_sync_type(value: Any, entry_index: int) -> str:
     return sync_type
 
 
+def _normalize_pr_head_strategy(value: Any, entry_index: int) -> str:
+    strategy = (value or "sync-branch").strip().lower() if isinstance(value, str) else "sync-branch"
+    if strategy not in PR_HEAD_STRATEGIES:
+        raise ConfigError(
+            f"sync entry {entry_index}: pr head strategy must be one of {sorted(PR_HEAD_STRATEGIES)}"
+        )
+    return strategy
+
+
 def _normalize_pr_section(value: Any, entry_index: int) -> dict[str, Any]:
     if value is None:
         return {
             "branch": None,
+            "head_strategy": "sync-branch",
             "tracking_label": None,
             "labels": [],
             "automerge": False,
@@ -90,6 +101,13 @@ def _normalize_pr_section(value: Any, entry_index: int) -> dict[str, Any]:
 
     return {
         "branch": pr.get("branch"),
+        "head_strategy": _normalize_pr_head_strategy(
+            pr.get("head-strategy")
+            or pr.get("head_strategy")
+            or pr.get("pr-head")
+            or pr.get("pr_head"),
+            entry_index,
+        ),
         "tracking_label": pr.get("tracking-label") or pr.get("tracking_label"),
         "labels": [str(label) for label in labels],
         "automerge": _parse_bool(pr.get("automerge"), default=False),
@@ -147,6 +165,10 @@ def _normalize_defaults(value: Any) -> dict[str, Any]:
         "target_branch": defaults.get("target-branch") or defaults.get("target_branch") or "stable",
         "tracking_label": defaults.get("tracking-label") or defaults.get("tracking_label") or "lake-gate",
         "automerge": _parse_bool(defaults.get("automerge"), default=False),
+        "pr_head_strategy": _normalize_pr_head_strategy(
+            defaults.get("pr-head") or defaults.get("pr_head") or defaults.get("head-strategy"),
+            0,
+        ),
     }
 
 
@@ -199,6 +221,13 @@ def _git_entry_to_sync_entry(
         "pr": {
             "tracking-label": tracking_label,
             "automerge": automerge,
+            "head-strategy": (
+                entry.get("pr-head")
+                or entry.get("pr_head")
+                or entry.get("head-strategy")
+                or entry.get("head_strategy")
+                or defaults["pr_head_strategy"]
+            ),
         },
     }
 

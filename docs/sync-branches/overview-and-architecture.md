@@ -11,7 +11,7 @@ Reference material (inspiration only, not ported line-for-line):
 
 ## What Was Added
 **`scripts/sync_branches.py`** — CLI with three sync modes:
-- `pr` (default) — merge into a branch and open/update a PR
+- `pr` (default) — open/update a PR; head can be a sync branch (`--pr-head sync-branch`) or the source branch (`--pr-head source`)
 - `push` — bootstrap a target branch without a PR
 - `commit-merge` — merge directly into the target branch
 
@@ -32,9 +32,12 @@ python scripts/sync_branches.py \
   --source-repo https://github.com/org/repo.git \
   --source-branch main \
   --target-branch stable \
+  --pr-head source \
   --tracking-label lake-gate \
   --dry-run
 ```
+
+`--pr-head source` opens `main` → `stable` directly. Omit it (or use `sync-branch`) to merge into a temporary sync branch first.
 
 **Config file** — when `--config` is set, do not also pass `--source-repo`, `--source-branch`, etc.
 ```yaml

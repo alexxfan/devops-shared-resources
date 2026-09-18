@@ -62,6 +62,7 @@ def test_dry_run_does_not_touch_repos() -> None:
         "ignore_files": [],
         "pr": {
             "branch": None,
+            "head_strategy": "sync-branch",
             "tracking_label": None,
             "labels": [],
             "automerge": False,
@@ -107,6 +108,7 @@ def test_run_sync_entry_creates_pr(mock_prepare, mock_pr_creator, mock_push, git
         "ignore_files": [],
         "pr": {
             "branch": "sync-branch",
+            "head_strategy": "sync-branch",
             "tracking_label": None,
             "labels": [],
             "automerge": False,
@@ -123,6 +125,61 @@ def test_run_sync_entry_creates_pr(mock_prepare, mock_pr_creator, mock_push, git
     assert outcome.pr_url == "https://github.com/example/repo/pull/1"
     pr_instance.create_or_update_tracking_pr.assert_called_once()
     mock_push.assert_called_once()
+
+
+@patch("scripts.sync_branches._collect_sync_commits")
+@patch("scripts.sync_branches.PRCreator")
+def test_run_sync_entry_creates_source_pr(mock_pr_creator, mock_collect, git_repo_factory) -> None:
+    from lib.git_utils import GitCommit
+
+    target = git_repo_factory("target")
+    mock_collect.return_value = (
+        target,
+        [
+            GitCommit(
+                sha="abc123",
+                short_sha="abc123",
+                subject="main change",
+            )
+        ],
+    )
+
+    pr_instance = MagicMock()
+    pr_instance.create_or_update_tracking_pr.return_value = MagicMock(
+        number=2,
+        url="https://github.com/example/repo/pull/2",
+        branch="main",
+        created=True,
+        updated=False,
+    )
+    mock_pr_creator.return_value = pr_instance
+
+    entry = {
+        "sync_type": "pr",
+        "src": {"url": str(target), "branch": "main"},
+        "dest": {"url": str(target), "branch": "stable"},
+        "ignore_files": [],
+        "pr": {
+            "branch": None,
+            "head_strategy": "source",
+            "tracking_label": "lake-gate",
+            "labels": [],
+            "automerge": False,
+            "title": None,
+            "body": None,
+            "reviewers": [],
+        },
+        "merge_args": [],
+        "fetch_args": [],
+        "push_args": [],
+    }
+
+    outcome = run_sync_entry(entry, token="token", dry_run=False)
+    assert outcome.pr_url == "https://github.com/example/repo/pull/2"
+    mock_collect.assert_called_once()
+    pr_instance.create_or_update_tracking_pr.assert_called_once()
+    assert pr_instance.create_or_update_tracking_pr.call_args.kwargs["head_branch"] == "main"
+    assert pr_instance.create_or_update_tracking_pr.call_args.kwargs["delete_branch_on_merge"] is False
 
 
 def test_main_with_config_file_and_only_filter(tmp_path: Path) -> None:

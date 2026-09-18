@@ -38,6 +38,7 @@ def test_local_commit_merge_sync(git_repo_factory, tmp_path: Path) -> None:
         "ignore_files": ["keep.txt"],
         "pr": {
             "branch": None,
+            "head_strategy": "sync-branch",
             "tracking_label": None,
             "labels": [],
             "automerge": False,
