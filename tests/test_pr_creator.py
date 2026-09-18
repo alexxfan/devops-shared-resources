@@ -1,0 +1,131 @@
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+import pytest
+
+from lib.git_utils import GitCommit
+from lib.pr_creator import PRCreator, format_default_pr_body, format_default_pr_title
+
+
+def test_format_default_pr_title_same_repo() -> None:
+    title = format_default_pr_title(
+        "main",
+        "stable",
+        source_repo="https://github.com/org/repo.git",
+        target_repo="https://github.com/org/repo.git",
+    )
+    assert title == "Automated Sync from main to stable"
+
+
+def test_format_default_pr_body_includes_commit_summary() -> None:
+    body = format_default_pr_body(
+        "main",
+        "stable",
+        source_repo="https://github.com/org/repo.git",
+        target_repo="https://github.com/org/repo.git",
+        commits=[
+            GitCommit(
+                sha="abc123def456",
+                short_sha="abc123d",
+                subject="task(PROJ-1): latest change (#42)",
+            ),
+            GitCommit(
+                sha="def456abc789",
+                short_sha="def456a",
+                subject="chore(deps): bump dependency (#41)",
+            ),
+        ],
+        head_branch="sync-main-to-stable-20250101-120000",
+        automerge=True,
+    )
+
+    assert "## Automated Sync from main to stable" in body
+    assert "**Latest commit:** [`abc123d`](https://github.com/org/repo/commit/abc123def456)" in body
+    assert "**Total commits to sync:** 2" in body
+    assert "### Commits to be synced" in body
+    assert "chore(deps): bump dependency (#41)" in body
+    assert "`sync-main-to-stable-20250101-120000`" in body
+    assert "GitHub automerge is enabled" in body
+
+
+def test_format_default_pr_body_includes_conflict_files() -> None:
+    body = format_default_pr_body(
+        "main",
+        "stable",
+        source_repo="https://github.com/org/repo.git",
+        target_repo="https://github.com/org/repo.git",
+        conflict_files=["README.md", "config.yaml"],
+    )
+
+    assert "### Merge conflicts" in body
+    assert "`README.md`" in body
+    assert "Resolve the merge conflicts above" in body
+
+
+def test_format_default_pr_title_cross_repo() -> None:
+    title = format_default_pr_title(
+        "main",
+        "stable",
+        source_repo="https://github.com/org/upstream.git",
+        target_repo="https://github.com/org/downstream.git",
+    )
+    assert "upstream" in title
+    assert "downstream" in title
+
+
+def test_create_pull_request_calls_github_api() -> None:
+    creator = PRCreator("token")
+    creator.session = MagicMock()
+    creator._request = MagicMock(
+        return_value={"number": 42, "html_url": "https://github.com/org/repo/pull/42"}
+    )
+    creator.ensure_delete_branch_on_merge = MagicMock()
+    creator.add_labels = MagicMock()
+    creator.request_reviewers = MagicMock()
+    creator.enable_automerge = MagicMock()
+
+    result = creator.create_pull_request(
+        "https://github.com/org/repo.git",
+        title="Sync",
+        body="body",
+        head_branch="sync-branch",
+        base_branch="stable",
+        labels=["automation"],
+        reviewers=["alice"],
+        automerge=True,
+    )
+
+    assert result.number == 42
+    assert result.created is True
+    creator.ensure_delete_branch_on_merge.assert_called_once()
+    creator.add_labels.assert_called_once()
+    creator.request_reviewers.assert_called_once()
+    creator.enable_automerge.assert_called_once()
+
+
+def test_create_or_update_tracking_pr_updates_existing() -> None:
+    creator = PRCreator("token")
+    creator.find_open_pr_by_label = MagicMock(
+        return_value={
+            "number": 7,
+            "html_url": "https://github.com/org/repo/pull/7",
+            "head": {"ref": "sync-existing"},
+        }
+    )
+    creator.update_pull_request = MagicMock()
+    creator.add_labels = MagicMock()
+
+    result = creator.create_or_update_tracking_pr(
+        "https://github.com/org/repo.git",
+        title="Sync",
+        body="body",
+        head_branch="sync-new",
+        base_branch="stable",
+        tracking_label="lake-gate",
+        labels=["lake-gate"],
+    )
+
+    assert result.updated is True
+    assert result.branch == "sync-existing"
+    creator.update_pull_request.assert_called_once()
