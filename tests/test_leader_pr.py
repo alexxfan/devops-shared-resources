@@ -32,12 +32,8 @@ def test_dry_run_prints_gh_pr_create_dry_run(capsys: pytest.CaptureFixture[str])
         dry_run=True,
         runner=fake_runner,
     )
-    state = build_state(
-        trigger_id="gap-testtrigger001",
-        prs=[],
-        created_at="2026-09-21T12:00:00Z",
-    )
-    result = manager.create_or_update(state)
+    state = build_state(pull_requests=[])
+    result = manager.create_or_update(state, trigger_id="gap-testtrigger001")
 
     captured = capsys.readouterr().out
     assert "[dry-run] gh pr create" in captured
@@ -74,18 +70,14 @@ def test_create_leader_pr_via_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         runner=fake_runner,
     )
     state = build_state(
-        trigger_id="gap-testtrigger002",
-        prs=[
+        pull_requests=[
             {
-                "name": "kserve",
-                "repo": "rhoai-rhtap/kserve",
-                "url": "https://github.com/rhoai-rhtap/kserve/pull/2",
-                "number": 2,
+                "repo": "kserve",
+                "pr-url": "https://github.com/rhoai-rhtap/kserve/pull/2",
             }
         ],
-        created_at="2026-09-21T12:00:00Z",
     )
-    result = manager.create_or_update(state)
+    result = manager.create_or_update(state, trigger_id="gap-testtrigger002")
 
     assert result.updated is False
     assert result.pr_number == 9
@@ -127,12 +119,8 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
         repo="red-hat-data-services/gated-artifacts-promoter",
         runner=fake_runner,
     )
-    state = build_state(
-        trigger_id="gap-existing",
-        prs=[],
-        created_at="2026-09-21T12:00:00Z",
-    )
-    result = manager.create_or_update(state)
+    state = build_state(pull_requests=[])
+    result = manager.create_or_update(state, trigger_id="gap-existing")
     assert result.updated is True
     assert result.pr_number == 4
 

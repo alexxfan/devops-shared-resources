@@ -22,11 +22,11 @@ from lib.config_parser import (  # noqa: E402
 from lib.leader_pr import GAP_LABEL, LeaderPRManager, LeaderPRResult  # noqa: E402
 from lib.state_file import (  # noqa: E402
     DEFAULT_LEADER_REPO,
+    PR_STATUS_NEW,
     StateFileError,
     StatePullRequest,
     build_state,
-    parse_pr_number_from_url,
-    repo_slug_from_url,
+    short_repo_name,
 )
 from lib.trigger_id import normalize_trigger_id  # noqa: E402
 from scripts.sync_branches import SyncOutcome, resolve_github_token, run_sync_entry  # noqa: E402
@@ -98,13 +98,16 @@ def outcome_to_state_pr(
     entry: dict[str, Any],
     outcome: SyncOutcome,
 ) -> StatePullRequest | None:
-    """Convert a successful sync PR outcome into a state.json PR record."""
+    """Convert a successful sync PR outcome into a Stage 1 state.json PR record."""
     if not outcome.pr_url:
         return None
-    name = str(entry.get("name") or repo_slug_from_url(entry["dest"]["url"]).split("/")[-1])
-    repo = repo_slug_from_url(entry["dest"]["url"])
-    number = parse_pr_number_from_url(outcome.pr_url)
-    return StatePullRequest(name=name, repo=repo, url=outcome.pr_url, number=number)
+    repo = short_repo_name(str(entry.get("name") or entry["dest"]["url"]))
+    return StatePullRequest(
+        repo=repo,
+        pr_url=outcome.pr_url,
+        pr_status=PR_STATUS_NEW,
+        builds=(),
+    )
 
 
 def run_promoter(
@@ -141,14 +144,10 @@ def run_promoter(
         if state_pr is not None:
             state_prs.append(state_pr)
 
-    state = build_state(
-        trigger_id=resolved_trigger,
-        prs=state_prs,
-        leader_repo=leader_repo,
-    )
+    state = build_state(pull_requests=state_prs)
 
     manager = leader_manager or LeaderPRManager(repo=leader_repo, dry_run=dry_run)
-    leader_result = manager.create_or_update(state)
+    leader_result = manager.create_or_update(state, trigger_id=resolved_trigger)
 
     return PromoterRunResult(
         trigger_id=resolved_trigger,

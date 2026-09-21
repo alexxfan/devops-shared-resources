@@ -1,16 +1,30 @@
-"""Build and validate Gated Artifacts Promoter state.json files."""
+"""Build and validate Gated Artifacts Promoter state.json files (RHOAIENG-93564)."""
 
 from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-SCHEMA_VERSION = 1
 DEFAULT_LEADER_REPO = "red-hat-data-services/gated-artifacts-promoter"
+
+# Stage 1 initial status written by the PR sync workflow (RHOAIENG-93524).
+PR_STATUS_NEW = "new"
+
+PR_STATUSES = frozenset(
+    {
+        "new",
+        "merge-failure",
+        "build-pending",
+        "build-success",
+        "build-failure",
+        "test-pending",
+        "test-failure",
+        "success",
+    }
+)
 
 
 class StateFileError(ValueError):
@@ -18,81 +32,99 @@ class StateFileError(ValueError):
 
 
 @dataclass(frozen=True)
-class StatePullRequest:
-    name: str
-    repo: str
-    url: str
-    number: int
+class StateBuild:
+    component: str
+    image: str
 
     @classmethod
-    def from_mapping(cls, data: dict[str, Any], *, index: int) -> "StatePullRequest":
-        for key in ("name", "repo", "url", "number"):
-            if key not in data:
-                raise StateFileError(f"prs[{index}].{key} is required")
-        number = data["number"]
-        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
-            raise StateFileError(f"prs[{index}].number must be a positive integer")
-        name = str(data["name"]).strip()
-        repo = str(data["repo"]).strip()
-        url = str(data["url"]).strip()
-        if not name:
-            raise StateFileError(f"prs[{index}].name must be non-empty")
-        if "/" not in repo:
-            raise StateFileError(f"prs[{index}].repo must be owner/name")
-        if not _looks_like_pr_url(url):
-            raise StateFileError(
-                f"prs[{index}].url must be https://github.com/<owner>/<repo>/pull/<n>"
-            )
-        return cls(name=name, repo=repo, url=url, number=number)
+    def from_mapping(cls, data: dict[str, Any], *, path: str) -> "StateBuild":
+        if not isinstance(data, dict):
+            raise StateFileError(f"{path} must be a mapping")
+        component = str(data.get("component") or "").strip()
+        image = str(data.get("image") or "").strip()
+        if not component:
+            raise StateFileError(f"{path}.component is required")
+        if not image:
+            raise StateFileError(f"{path}.image is required")
+        return cls(component=component, image=image)
+
+    def to_dict(self) -> dict[str, str]:
+        return {"component": self.component, "image": self.image}
 
 
 @dataclass(frozen=True)
-class StateLeader:
-    repo: str
-    path: str
+class StatePullRequest:
+    """One child sync PR entry in state.json (RHOAIENG-93564)."""
+
+    repo: str  # short slug only, e.g. "odh-dashboard"
+    pr_url: str
+    pr_status: str = PR_STATUS_NEW
+    builds: tuple[StateBuild, ...] = ()
 
     @classmethod
-    def from_mapping(cls, data: dict[str, Any]) -> "StateLeader":
+    def from_mapping(cls, data: dict[str, Any], *, index: int) -> "StatePullRequest":
+        path = f"pull-requests[{index}]"
         if not isinstance(data, dict):
-            raise StateFileError("leader must be a mapping")
+            raise StateFileError(f"{path} must be a mapping")
+
         repo = str(data.get("repo") or "").strip()
-        path = str(data.get("path") or "").strip()
-        if not repo or "/" not in repo:
-            raise StateFileError("leader.repo must be owner/name")
-        if not path:
-            raise StateFileError("leader.path must be non-empty")
-        return cls(repo=repo, path=path)
+        pr_url = str(data.get("pr-url") or data.get("pr_url") or "").strip()
+        pr_status = str(data.get("pr-status") or data.get("pr_status") or "").strip()
+        raw_builds = data.get("builds")
+
+        if not repo:
+            raise StateFileError(f"{path}.repo is required")
+        if "/" in repo:
+            raise StateFileError(
+                f"{path}.repo must be a short slug (e.g. 'odh-dashboard'), not '{repo}'"
+            )
+        if not pr_url or not _looks_like_pr_url(pr_url):
+            raise StateFileError(
+                f"{path}.pr-url must be https://github.com/<owner>/<repo>/pull/<n>"
+            )
+        if pr_status not in PR_STATUSES:
+            raise StateFileError(
+                f"{path}.pr-status must be one of {sorted(PR_STATUSES)}, got {pr_status!r}"
+            )
+        if raw_builds is None:
+            builds: tuple[StateBuild, ...] = ()
+        elif not isinstance(raw_builds, list):
+            raise StateFileError(f"{path}.builds must be a list")
+        else:
+            builds = tuple(
+                StateBuild.from_mapping(item, path=f"{path}.builds[{i}]")
+                if isinstance(item, dict)
+                else (_raise_build_type(f"{path}.builds[{i}]"))
+                for i, item in enumerate(raw_builds)
+            )
+
+        return cls(repo=repo, pr_url=pr_url, pr_status=pr_status, builds=builds)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "repo": self.repo,
+            "pr-url": self.pr_url,
+            "pr-status": self.pr_status,
+            "builds": [build.to_dict() for build in self.builds],
+        }
 
 
 @dataclass
 class PromoterState:
-    trigger_id: str
-    prs: list[StatePullRequest] = field(default_factory=list)
-    created_at: str = ""
-    schema_version: int = SCHEMA_VERSION
-    leader: StateLeader | None = None
+    """Leader PR state.json root object (RHOAIENG-93564)."""
 
-    def __post_init__(self) -> None:
-        if not self.created_at:
-            self.created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        if self.leader is None:
-            self.leader = StateLeader(
-                repo=DEFAULT_LEADER_REPO,
-                path=f"{self.trigger_id}/state.json",
-            )
+    pull_requests: list[StatePullRequest] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        assert self.leader is not None
-        return {
-            "schema_version": self.schema_version,
-            "trigger_id": self.trigger_id,
-            "created_at": self.created_at,
-            "leader": asdict(self.leader),
-            "prs": [asdict(pr) for pr in self.prs],
-        }
+        return {"pull-requests": [pr.to_dict() for pr in self.pull_requests]}
 
     def to_json(self, *, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, sort_keys=False) + "\n"
+
+    # Back-compat alias used by leader PR body formatting.
+    @property
+    def prs(self) -> list[StatePullRequest]:
+        return self.pull_requests
 
 
 def state_path_for_trigger(trigger_id: str) -> str:
@@ -102,27 +134,35 @@ def state_path_for_trigger(trigger_id: str) -> str:
 
 def build_state(
     *,
-    trigger_id: str,
-    prs: list[StatePullRequest] | list[dict[str, Any]],
-    leader_repo: str = DEFAULT_LEADER_REPO,
-    created_at: str | None = None,
+    pull_requests: list[StatePullRequest] | list[dict[str, Any]] | None = None,
+    prs: list[StatePullRequest] | list[dict[str, Any]] | None = None,
 ) -> PromoterState:
-    """Build a validated PromoterState from PR records."""
-    normalized_prs: list[StatePullRequest] = []
-    for index, item in enumerate(prs):
-        if isinstance(item, StatePullRequest):
-            normalized_prs.append(item)
-        elif isinstance(item, dict):
-            normalized_prs.append(StatePullRequest.from_mapping(item, index=index))
-        else:
-            raise StateFileError(f"prs[{index}] must be a mapping")
+    """Build a validated PromoterState from PR records.
 
-    state = PromoterState(
-        trigger_id=trigger_id,
-        prs=normalized_prs,
-        created_at=created_at or "",
-        leader=StateLeader(repo=leader_repo, path=state_path_for_trigger(trigger_id)),
-    )
+    Stage 1 (RHOAIENG-93524): each entry should use pr-status ``new`` and empty builds.
+    """
+    raw = pull_requests if pull_requests is not None else (prs or [])
+    normalized: list[StatePullRequest] = []
+    for index, item in enumerate(raw):
+        if isinstance(item, StatePullRequest):
+            normalized.append(item)
+        elif isinstance(item, dict):
+            # Default Stage 1 fields when callers only supply repo + pr-url.
+            payload = {
+                "repo": item.get("repo"),
+                "pr-url": item.get("pr-url") or item.get("pr_url") or item.get("url"),
+                "pr-status": item.get("pr-status") or item.get("pr_status") or PR_STATUS_NEW,
+                "builds": item.get("builds") if "builds" in item else [],
+            }
+            # Accept owner/name and reduce to short slug.
+            repo = str(payload["repo"] or "").strip()
+            if "/" in repo:
+                payload["repo"] = repo.rsplit("/", 1)[-1]
+            normalized.append(StatePullRequest.from_mapping(payload, index=index))
+        else:
+            raise StateFileError(f"pull-requests[{index}] must be a mapping")
+
+    state = PromoterState(pull_requests=normalized)
     validate_state(state.to_dict())
     return state
 
@@ -132,30 +172,13 @@ def validate_state(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise StateFileError("state must be a JSON object")
 
-    schema_version = data.get("schema_version")
-    if schema_version != SCHEMA_VERSION:
+    raw_prs = data.get("pull-requests")
+    if raw_prs is None and "prs" in data:
         raise StateFileError(
-            f"schema_version must be {SCHEMA_VERSION}, got {schema_version!r}"
+            "state uses obsolete key 'prs'; expected 'pull-requests' (RHOAIENG-93564)"
         )
-
-    trigger_id = str(data.get("trigger_id") or "").strip()
-    if not trigger_id:
-        raise StateFileError("trigger_id is required")
-
-    created_at = str(data.get("created_at") or "").strip()
-    if not created_at:
-        raise StateFileError("created_at is required")
-
-    leader = StateLeader.from_mapping(data.get("leader") or {})
-    expected_path = state_path_for_trigger(trigger_id)
-    if leader.path != expected_path:
-        raise StateFileError(
-            f"leader.path must be '{expected_path}', got '{leader.path}'"
-        )
-
-    raw_prs = data.get("prs")
     if not isinstance(raw_prs, list):
-        raise StateFileError("prs must be a list")
+        raise StateFileError("pull-requests must be a list")
 
     prs = [
         StatePullRequest.from_mapping(item, index=index)
@@ -163,18 +186,11 @@ def validate_state(data: Any) -> dict[str, Any]:
         else (_raise_pr_type(index))
         for index, item in enumerate(raw_prs)
     ]
-
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "trigger_id": trigger_id,
-        "created_at": created_at,
-        "leader": asdict(leader),
-        "prs": [asdict(pr) for pr in prs],
-    }
+    return {"pull-requests": [pr.to_dict() for pr in prs]}
 
 
 def write_state_file(path: str | Path, state: PromoterState | dict[str, Any]) -> Path:
-    """Write state.json to path after validation."""
+    """Write pretty-printed state.json to path after validation."""
     payload = state.to_dict() if isinstance(state, PromoterState) else validate_state(state)
     validate_state(payload)
     out = Path(path)
@@ -213,9 +229,15 @@ def repo_slug_from_url(repo_url: str) -> str:
     if text.startswith("http://") or text.startswith("https://"):
         path = urlparse(text).path.lstrip("/")
         return path.removesuffix(".git")
-    if "/" in text:
+    if "/" in text or text:
         return text
     raise StateFileError(f"cannot derive repo slug from '{repo_url}'")
+
+
+def short_repo_name(repo_url_or_slug: str) -> str:
+    """Return the short repo slug (last path segment), e.g. odh-dashboard."""
+    slug = repo_slug_from_url(repo_url_or_slug)
+    return slug.rsplit("/", 1)[-1] if slug else slug
 
 
 def _looks_like_pr_url(url: str) -> bool:
@@ -227,4 +249,8 @@ def _looks_like_pr_url(url: str) -> bool:
 
 
 def _raise_pr_type(index: int) -> StatePullRequest:
-    raise StateFileError(f"prs[{index}] must be a mapping")
+    raise StateFileError(f"pull-requests[{index}] must be a mapping")
+
+
+def _raise_build_type(path: str) -> StateBuild:
+    raise StateFileError(f"{path} must be a mapping")

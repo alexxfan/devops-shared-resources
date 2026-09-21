@@ -191,15 +191,15 @@ class LeaderPRManager:
         self,
         state: PromoterState,
         *,
+        trigger_id: str,
         title: str | None = None,
         body: str | None = None,
     ) -> LeaderPRResult:
         """Write state.json and open or update the Leader PR for the trigger."""
-        trigger_id = state.trigger_id
         branch = self.leader_branch(trigger_id)
         state_rel = state_path_for_trigger(trigger_id)
         pr_title = title or f"GAP leader: {trigger_id}"
-        pr_body = body or self._default_body(state)
+        pr_body = body or self._default_body(state, trigger_id=trigger_id)
         labels = [trigger_id, GAP_LABEL]
         self.ensure_labels(labels)
 
@@ -363,21 +363,23 @@ class LeaderPRManager:
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
-    def _default_body(self, state: PromoterState) -> str:
+    def _default_body(self, state: PromoterState, *, trigger_id: str) -> str:
         lines = [
-            f"## Gated Artifacts Promoter leader",
+            "## Gated Artifacts Promoter leader",
             "",
-            f"- Trigger ID: `{state.trigger_id}`",
-            f"- State file: `{state_path_for_trigger(state.trigger_id)}`",
+            f"- Trigger ID: `{trigger_id}`",
+            f"- State file: `{state_path_for_trigger(trigger_id)}`",
             "",
             "### Child PRs",
             "",
         ]
-        if not state.prs:
+        if not state.pull_requests:
             lines.append("_No child PRs were created (targets already up to date)._")
         else:
-            for pr in state.prs:
-                lines.append(f"- [{pr.name}]({pr.url}) (`{pr.repo}` #{pr.number})")
+            for pr in state.pull_requests:
+                lines.append(
+                    f"- [{pr.repo}]({pr.pr_url}) (`{pr.pr_status}`)"
+                )
         lines.append("")
         return "\n".join(lines)
 

@@ -6,81 +6,114 @@ from pathlib import Path
 import pytest
 
 from lib.state_file import (
-    SCHEMA_VERSION,
+    PR_STATUS_NEW,
     StateFileError,
     StatePullRequest,
     build_state,
     load_state_file,
-    parse_pr_number_from_url,
-    repo_slug_from_url,
+    short_repo_name,
     validate_state,
     write_state_file,
 )
 
 
-def test_build_and_validate_state() -> None:
+def test_build_and_validate_stage1_state() -> None:
     state = build_state(
-        trigger_id="gap-abc123",
-        prs=[
+        pull_requests=[
             {
-                "name": "kserve",
-                "repo": "rhoai-rhtap/kserve",
-                "url": "https://github.com/rhoai-rhtap/kserve/pull/2",
-                "number": 2,
+                "repo": "kserve",
+                "pr-url": "https://github.com/rhoai-rhtap/kserve/pull/2",
             }
         ],
-        leader_repo="red-hat-data-services/gated-artifacts-promoter",
-        created_at="2026-09-21T10:00:00Z",
     )
     payload = state.to_dict()
-    assert payload["schema_version"] == SCHEMA_VERSION
-    assert payload["trigger_id"] == "gap-abc123"
-    assert payload["leader"]["path"] == "gap-abc123/state.json"
-    assert payload["prs"][0]["name"] == "kserve"
-    assert validate_state(payload)["prs"][0]["number"] == 2
+    assert list(payload.keys()) == ["pull-requests"]
+    entry = payload["pull-requests"][0]
+    assert entry == {
+        "repo": "kserve",
+        "pr-url": "https://github.com/rhoai-rhtap/kserve/pull/2",
+        "pr-status": "new",
+        "builds": [],
+    }
+    assert validate_state(payload)["pull-requests"][0]["pr-status"] == PR_STATUS_NEW
+
+
+def test_build_state_reduces_owner_repo_to_slug() -> None:
+    state = build_state(
+        pull_requests=[
+            {
+                "repo": "rhoai-rhtap/kubeflow",
+                "pr-url": "https://github.com/rhoai-rhtap/kubeflow/pull/81",
+            }
+        ]
+    )
+    assert state.pull_requests[0].repo == "kubeflow"
 
 
 def test_write_and_load_state_file(tmp_path: Path) -> None:
     state = build_state(
-        trigger_id="gap-deadbeef",
-        prs=[
+        pull_requests=[
             StatePullRequest(
-                name="kubeflow",
-                repo="rhoai-rhtap/kubeflow",
-                url="https://github.com/rhoai-rhtap/kubeflow/pull/81",
-                number=81,
+                repo="kubeflow",
+                pr_url="https://github.com/rhoai-rhtap/kubeflow/pull/81",
+                pr_status="new",
+                builds=(),
             )
         ],
-        created_at="2026-09-21T11:00:00Z",
     )
     path = write_state_file(tmp_path / "gap-deadbeef" / "state.json", state)
     loaded = load_state_file(path)
-    assert loaded["prs"][0]["url"].endswith("/pull/81")
-    assert json.loads(path.read_text(encoding="utf-8"))["trigger_id"] == "gap-deadbeef"
+    assert loaded["pull-requests"][0]["pr-url"].endswith("/pull/81")
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "pull-requests": [
+            {
+                "repo": "kubeflow",
+                "pr-url": "https://github.com/rhoai-rhtap/kubeflow/pull/81",
+                "pr-status": "new",
+                "builds": [],
+            }
+        ]
+    }
 
 
-def test_validate_state_rejects_bad_schema() -> None:
-    with pytest.raises(StateFileError, match="schema_version"):
-        validate_state({"schema_version": 99, "trigger_id": "x", "created_at": "t", "leader": {}, "prs": []})
+def test_validate_state_rejects_legacy_prs_key() -> None:
+    with pytest.raises(StateFileError, match="obsolete key 'prs'"):
+        validate_state({"prs": []})
 
 
-def test_validate_state_rejects_path_mismatch() -> None:
-    with pytest.raises(StateFileError, match="leader.path"):
+def test_validate_state_rejects_owner_repo_slug() -> None:
+    with pytest.raises(StateFileError, match="short slug"):
         validate_state(
             {
-                "schema_version": 1,
-                "trigger_id": "gap-1",
-                "created_at": "2026-01-01T00:00:00Z",
-                "leader": {
-                    "repo": "red-hat-data-services/gated-artifacts-promoter",
-                    "path": "wrong/state.json",
-                },
-                "prs": [],
+                "pull-requests": [
+                    {
+                        "repo": "rhoai-rhtap/kserve",
+                        "pr-url": "https://github.com/rhoai-rhtap/kserve/pull/1",
+                        "pr-status": "new",
+                        "builds": [],
+                    }
+                ]
             }
         )
 
 
-def test_repo_slug_and_pr_number_helpers() -> None:
-    assert repo_slug_from_url("https://github.com/org/repo.git") == "org/repo"
-    assert repo_slug_from_url("git@github.com:org/repo.git") == "org/repo"
-    assert parse_pr_number_from_url("https://github.com/org/repo/pull/12") == 12
+def test_validate_state_rejects_bad_status() -> None:
+    with pytest.raises(StateFileError, match="pr-status"):
+        validate_state(
+            {
+                "pull-requests": [
+                    {
+                        "repo": "kserve",
+                        "pr-url": "https://github.com/rhoai-rhtap/kserve/pull/1",
+                        "pr-status": "nope",
+                        "builds": [],
+                    }
+                ]
+            }
+        )
+
+
+def test_short_repo_name() -> None:
+    assert short_repo_name("https://github.com/org/repo.git") == "repo"
+    assert short_repo_name("org/repo") == "repo"
+    assert short_repo_name("repo") == "repo"

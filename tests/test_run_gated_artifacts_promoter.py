@@ -3,11 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
 import yaml
 
 from lib.leader_pr import GAP_LABEL, LeaderPRResult
-from lib.state_file import StatePullRequest
+from lib.state_file import PR_STATUS_NEW, StatePullRequest
 from scripts.run_gated_artifacts_promoter import (
     outcome_to_state_pr,
     prepare_entry_for_trigger,
@@ -40,7 +39,6 @@ def test_prepare_entry_for_trigger_injects_labels() -> None:
     prepared = prepare_entry_for_trigger(entry, "gap-triggerxyz")
     assert prepared["pr"]["tracking_label"] == "gap-triggerxyz"
     assert prepared["pr"]["labels"] == ["existing", "gap-triggerxyz", GAP_LABEL]
-    # Original entry untouched.
     assert entry["pr"]["tracking_label"] == "lake-gate"
 
 
@@ -56,10 +54,10 @@ def test_outcome_to_state_pr() -> None:
     )
     state_pr = outcome_to_state_pr(entry, outcome)
     assert state_pr == StatePullRequest(
-        name="kserve",
-        repo="rhoai-rhtap/kserve",
-        url="https://github.com/rhoai-rhtap/kserve/pull/2",
-        number=2,
+        repo="kserve",
+        pr_url="https://github.com/rhoai-rhtap/kserve/pull/2",
+        pr_status=PR_STATUS_NEW,
+        builds=(),
     )
 
 
@@ -118,6 +116,8 @@ def test_run_promoter_dry_run(tmp_path: Path) -> None:
     assert GAP_LABEL in sync_calls[0]["pr"]["labels"]
     assert result.state_prs == []
     leader.create_or_update.assert_called_once()
+    _, kwargs = leader.create_or_update.call_args
+    assert kwargs["trigger_id"] == "gap-fixed"
 
 
 def test_run_promoter_collects_prs(tmp_path: Path) -> None:
@@ -161,7 +161,17 @@ def test_run_promoter_collects_prs(tmp_path: Path) -> None:
         token="tok",
     )
     assert len(result.state_prs) == 1
-    assert result.state_prs[0].number == 2
+    assert result.state_prs[0].repo == "kserve"
+    assert result.state_prs[0].pr_status == PR_STATUS_NEW
     state_arg = leader.create_or_update.call_args.args[0]
-    assert state_arg.trigger_id == "gap-live"
-    assert state_arg.prs[0].url.endswith("/pull/2")
+    assert state_arg.pull_requests[0].pr_url.endswith("/pull/2")
+    assert state_arg.to_dict() == {
+        "pull-requests": [
+            {
+                "repo": "kserve",
+                "pr-url": "https://github.com/rhoai-rhtap/kserve/pull/2",
+                "pr-status": "new",
+                "builds": [],
+            }
+        ]
+    }

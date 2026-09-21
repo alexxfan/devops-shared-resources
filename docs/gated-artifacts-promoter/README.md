@@ -58,6 +58,21 @@ Stdout includes:
 
 Leader PR path: `<trigger_id>/state.json`
 
+Stage 1 `state.json` shape ([RHOAIENG-93564](https://redhat.atlassian.net/browse/RHOAIENG-93564)):
+
+```json
+{
+  "pull-requests": [
+    {
+      "repo": "kserve",
+      "pr-url": "https://github.com/org/kserve/pull/1",
+      "pr-status": "new",
+      "builds": []
+    }
+  ]
+}
+```
+
 ## Consumer workflow
 
 The GitHub Actions workflow lives in `rhods-devops-infra`:
