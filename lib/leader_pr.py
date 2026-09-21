@@ -1,0 +1,368 @@
+"""Create or update the Gated Artifacts Promoter Leader PR via the gh CLI."""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Sequence
+
+from lib.state_file import (
+    DEFAULT_LEADER_REPO,
+    PromoterState,
+    state_path_for_trigger,
+    write_state_file,
+)
+
+GAP_LABEL = "gated-artifacts-promoter"
+
+
+class GhCommandError(RuntimeError):
+    """Raised when a gh CLI command fails."""
+
+    def __init__(self, command: Sequence[str], returncode: int, output: str) -> None:
+        self.command = list(command)
+        self.returncode = returncode
+        self.output = output
+        super().__init__(
+            f"gh command failed ({returncode}): {' '.join(self.command)}\n{output}"
+        )
+
+
+@dataclass(frozen=True)
+class LeaderPRResult:
+    trigger_id: str
+    repo: str
+    branch: str
+    state_path: str
+    pr_url: str | None
+    pr_number: int | None
+    updated: bool
+    dry_run: bool
+
+
+class LeaderPRManager:
+    """Manage the Leader PR that tracks child sync PRs for a trigger ID."""
+
+    def __init__(
+        self,
+        *,
+        repo: str = DEFAULT_LEADER_REPO,
+        runner: Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]]
+        | None = None,
+        dry_run: bool = False,
+        base_branch: str = "main",
+    ) -> None:
+        self.repo = repo
+        self.dry_run = dry_run
+        self.base_branch = base_branch
+        self._runner = runner or self._default_runner
+
+    def _default_runner(
+        self,
+        command: Sequence[str],
+        cwd: Path | None,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            list(command),
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+    def run_gh(
+        self,
+        gh_args: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        mutate: bool = False,
+    ) -> str:
+        command = ["gh", *gh_args]
+        if self.dry_run and mutate:
+            print(f"[dry-run] {' '.join(command)}")
+            return ""
+
+        if self.dry_run:
+            print(f"[dry-run] {' '.join(command)}")
+
+        result = self._runner(command, cwd)
+        if result.returncode != 0:
+            output = (result.stdout or "") + (result.stderr or "")
+            raise GhCommandError(command, result.returncode, output)
+        return (result.stdout or "").strip()
+
+    def run_git(
+        self,
+        git_args: Sequence[str],
+        *,
+        cwd: Path,
+        mutate: bool = False,
+    ) -> str:
+        command = ["git", *git_args]
+        if self.dry_run and mutate:
+            print(f"[dry-run] {' '.join(command)}")
+            return ""
+
+        result = self._runner(command, cwd)
+        if result.returncode != 0:
+            output = (result.stdout or "") + (result.stderr or "")
+            raise RuntimeError(
+                f"git command failed ({result.returncode}): {' '.join(command)}\n{output}"
+            )
+        return (result.stdout or "").strip()
+
+    def leader_branch(self, trigger_id: str) -> str:
+        return f"gap-leader/{trigger_id}"
+
+    def ensure_labels(self, labels: Sequence[str]) -> None:
+        """Create labels on the Leader repo when they are missing."""
+        for label in labels:
+            # gh label create fails if the label already exists; ignore that case.
+            command = [
+                "gh",
+                "label",
+                "create",
+                label,
+                "--repo",
+                self.repo,
+                "--force",
+            ]
+            if self.dry_run:
+                print(f"[dry-run] {' '.join(command)}")
+                continue
+            result = self._runner(command, None)
+            if result.returncode != 0:
+                output = (result.stdout or "") + (result.stderr or "")
+                # --force should upsert; still surface unexpected failures.
+                if "already exists" not in output.lower():
+                    raise GhCommandError(command, result.returncode, output)
+
+    def find_open_pr_by_label(self, label: str) -> dict | None:
+        """Return the first open PR with the given label, or None."""
+        output = self.run_gh(
+            [
+                "pr",
+                "list",
+                "--repo",
+                self.repo,
+                "--state",
+                "open",
+                "--label",
+                label,
+                "--json",
+                "number,url,headRefName,title",
+                "--limit",
+                "20",
+            ],
+            mutate=False,
+        )
+        if self.dry_run and not output:
+            return None
+        items = json.loads(output or "[]")
+        if not isinstance(items, list) or not items:
+            return None
+        return items[0]
+
+    def create_or_update(
+        self,
+        state: PromoterState,
+        *,
+        title: str | None = None,
+        body: str | None = None,
+    ) -> LeaderPRResult:
+        """Write state.json and open or update the Leader PR for the trigger."""
+        trigger_id = state.trigger_id
+        branch = self.leader_branch(trigger_id)
+        state_rel = state_path_for_trigger(trigger_id)
+        pr_title = title or f"GAP leader: {trigger_id}"
+        pr_body = body or self._default_body(state)
+        labels = [trigger_id, GAP_LABEL]
+        self.ensure_labels(labels)
+
+        existing = self.find_open_pr_by_label(trigger_id)
+
+        if self.dry_run:
+            # Show the mutating gh commands operators would run locally.
+            self.run_gh(
+                [
+                    "pr",
+                    "create",
+                    "--repo",
+                    self.repo,
+                    "--base",
+                    self.base_branch,
+                    "--head",
+                    branch,
+                    "--title",
+                    pr_title,
+                    "--body",
+                    pr_body,
+                    "--label",
+                    labels[0],
+                    "--label",
+                    labels[1],
+                    "--dry-run",
+                ],
+                mutate=True,
+            )
+            return LeaderPRResult(
+                trigger_id=trigger_id,
+                repo=self.repo,
+                branch=branch,
+                state_path=state_rel,
+                pr_url=None,
+                pr_number=None,
+                updated=existing is not None,
+                dry_run=True,
+            )
+
+        workdir = Path(tempfile.mkdtemp(prefix="gap-leader-"))
+        try:
+            self.run_gh(
+                [
+                    "repo",
+                    "clone",
+                    self.repo,
+                    str(workdir),
+                    "--",
+                    "--branch",
+                    self.base_branch,
+                    "--single-branch",
+                ],
+                mutate=True,
+            )
+
+            if existing:
+                head = existing.get("headRefName") or branch
+                # Clone is single-branch (main); explicitly fetch the Leader head.
+                self.run_git(
+                    ["fetch", "origin", f"+refs/heads/{head}:refs/remotes/origin/{head}"],
+                    cwd=workdir,
+                    mutate=True,
+                )
+                self.run_git(
+                    ["checkout", "-B", head, f"origin/{head}"],
+                    cwd=workdir,
+                    mutate=True,
+                )
+                branch = head
+            else:
+                self.run_git(["checkout", "-B", branch], cwd=workdir, mutate=True)
+
+            write_state_file(workdir / state_rel, state)
+            self.run_git(["add", "--", state_rel], cwd=workdir, mutate=True)
+            # Commit only when there is something to commit.
+            status = self.run_git(["status", "--porcelain"], cwd=workdir, mutate=False)
+            if status:
+                self.run_git(
+                    [
+                        "-c",
+                        "user.name=Openshift-AI DevOps",
+                        "-c",
+                        "user.email=openshift-ai-devops@redhat.com",
+                        "commit",
+                        "-m",
+                        f"Update GAP state for {trigger_id}",
+                    ],
+                    cwd=workdir,
+                    mutate=True,
+                )
+                self.run_git(
+                    ["push", "-u", "origin", "HEAD"],
+                    cwd=workdir,
+                    mutate=True,
+                )
+
+            if existing:
+                number = int(existing["number"])
+                # Prefer REST via `gh api` — `gh pr edit` GraphQL needs read:org.
+                self.run_gh(
+                    [
+                        "api",
+                        "--method",
+                        "PATCH",
+                        f"repos/{self.repo}/pulls/{number}",
+                        "-f",
+                        f"title={pr_title}",
+                        "-f",
+                        f"body={pr_body}",
+                    ],
+                    mutate=True,
+                )
+                return LeaderPRResult(
+                    trigger_id=trigger_id,
+                    repo=self.repo,
+                    branch=branch,
+                    state_path=state_rel,
+                    pr_url=existing.get("url"),
+                    pr_number=number,
+                    updated=True,
+                    dry_run=False,
+                )
+
+            create_out = self.run_gh(
+                [
+                    "pr",
+                    "create",
+                    "--repo",
+                    self.repo,
+                    "--base",
+                    self.base_branch,
+                    "--head",
+                    branch,
+                    "--title",
+                    pr_title,
+                    "--body",
+                    pr_body,
+                    "--label",
+                    labels[0],
+                    "--label",
+                    labels[1],
+                ],
+                mutate=True,
+            )
+            pr_url = create_out.strip().splitlines()[-1] if create_out else None
+            pr_number = _parse_pr_number(pr_url) if pr_url else None
+            return LeaderPRResult(
+                trigger_id=trigger_id,
+                repo=self.repo,
+                branch=branch,
+                state_path=state_rel,
+                pr_url=pr_url,
+                pr_number=pr_number,
+                updated=False,
+                dry_run=False,
+            )
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    def _default_body(self, state: PromoterState) -> str:
+        lines = [
+            f"## Gated Artifacts Promoter leader",
+            "",
+            f"- Trigger ID: `{state.trigger_id}`",
+            f"- State file: `{state_path_for_trigger(state.trigger_id)}`",
+            "",
+            "### Child PRs",
+            "",
+        ]
+        if not state.prs:
+            lines.append("_No child PRs were created (targets already up to date)._")
+        else:
+            for pr in state.prs:
+                lines.append(f"- [{pr.name}]({pr.url}) (`{pr.repo}` #{pr.number})")
+        lines.append("")
+        return "\n".join(lines)
+
+
+def _parse_pr_number(url: str) -> int | None:
+    try:
+        return int(url.rstrip("/").rsplit("/", 1)[-1])
+    except (TypeError, ValueError):
+        return None

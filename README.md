@@ -11,6 +11,15 @@ Python libraries and a CLI for syncing one git branch into another, with optiona
 - `docs/sync-branches/consumer-setup.md` — infra-repo config format (`git:` source map) and CI integration notes
 - `tests/` — unit and local end-to-end tests (CI: `.github/workflows/sync-branches-tests.yml`, pytest only)
 
+## Gated Artifacts Promoter orchestrator (RHOAIENG-93524)
+
+Runs configured branch syncs with a shared trigger ID, then opens a Leader PR that tracks child PRs.
+
+- `scripts/run_gated_artifacts_promoter.py` — CLI orchestrator
+- `lib/trigger_id.py`, `lib/state_file.py`, `lib/leader_pr.py` — reusable libraries
+- `docs/gated-artifacts-promoter/README.md` — usage
+- `docs/gated-artifacts-promoter/consumer-setup.md` — infra workflow contract
+
 ## PR status updater (GAP)
 
 Posts GitHub commit statuses for Gated Artifacts Promoter collaborator PRs (RHOAIENG-93330).

@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Orchestrate Gated Artifacts Promoter sync runs and the Leader PR."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from lib.config_parser import (  # noqa: E402
+    ConfigError,
+    filter_sync_entries,
+    load_sync_config,
+)
+from lib.leader_pr import GAP_LABEL, LeaderPRManager, LeaderPRResult  # noqa: E402
+from lib.state_file import (  # noqa: E402
+    DEFAULT_LEADER_REPO,
+    StateFileError,
+    StatePullRequest,
+    build_state,
+    parse_pr_number_from_url,
+    repo_slug_from_url,
+)
+from lib.trigger_id import normalize_trigger_id  # noqa: E402
+from scripts.sync_branches import SyncOutcome, resolve_github_token, run_sync_entry  # noqa: E402
+
+
+@dataclass
+class PromoterRunResult:
+    trigger_id: str
+    outcomes: list[tuple[dict[str, Any], SyncOutcome]]
+    state_prs: list[StatePullRequest]
+    leader: LeaderPRResult | None
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run branch syncs for the Gated Artifacts Promoter and open a Leader PR "
+            "tracking all child PRs."
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Path to sync config YAML (infra git: map or native syncs: format).",
+    )
+    parser.add_argument(
+        "--trigger-id",
+        default=None,
+        help="Optional trigger ID used as the tracking label. Generated when omitted.",
+    )
+    parser.add_argument(
+        "--only",
+        default=None,
+        help="Comma-separated sync entry names to run.",
+    )
+    parser.add_argument(
+        "--leader-repo",
+        default=DEFAULT_LEADER_REPO,
+        help=f"Leader repository (default: {DEFAULT_LEADER_REPO}).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan actions without creating PRs or writing the Leader state.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Pass verbose through to sync_branches merge conflict details.",
+    )
+    return parser
+
+
+def prepare_entry_for_trigger(entry: dict[str, Any], trigger_id: str) -> dict[str, Any]:
+    """Return a deep copy of entry with GAP tracking label and labels injected."""
+    prepared = copy.deepcopy(entry)
+    pr = prepared.setdefault("pr", {})
+    pr["tracking_label"] = trigger_id
+    labels = list(pr.get("labels") or [])
+    for label in (trigger_id, GAP_LABEL):
+        if label not in labels:
+            labels.append(label)
+    pr["labels"] = labels
+    return prepared
+
+
+def outcome_to_state_pr(
+    entry: dict[str, Any],
+    outcome: SyncOutcome,
+) -> StatePullRequest | None:
+    """Convert a successful sync PR outcome into a state.json PR record."""
+    if not outcome.pr_url:
+        return None
+    name = str(entry.get("name") or repo_slug_from_url(entry["dest"]["url"]).split("/")[-1])
+    repo = repo_slug_from_url(entry["dest"]["url"])
+    number = parse_pr_number_from_url(outcome.pr_url)
+    return StatePullRequest(name=name, repo=repo, url=outcome.pr_url, number=number)
+
+
+def run_promoter(
+    *,
+    config_path: str | Path,
+    trigger_id: str | None = None,
+    only: str | None = None,
+    leader_repo: str = DEFAULT_LEADER_REPO,
+    dry_run: bool = False,
+    verbose: bool = False,
+    token: str | None = None,
+    sync_runner: Callable[..., SyncOutcome] | None = None,
+    leader_manager: LeaderPRManager | None = None,
+) -> PromoterRunResult:
+    """Execute sync entries and create/update the Leader PR."""
+    resolved_trigger = normalize_trigger_id(trigger_id)
+    entries = filter_sync_entries(load_sync_config(config_path), only)
+    resolved_token = token if token is not None else resolve_github_token()
+    runner = sync_runner or run_sync_entry
+
+    outcomes: list[tuple[dict[str, Any], SyncOutcome]] = []
+    state_prs: list[StatePullRequest] = []
+
+    for entry in entries:
+        prepared = prepare_entry_for_trigger(entry, resolved_trigger)
+        outcome = runner(
+            prepared,
+            token=resolved_token,
+            dry_run=dry_run,
+            verbose=verbose,
+        )
+        outcomes.append((prepared, outcome))
+        state_pr = outcome_to_state_pr(prepared, outcome)
+        if state_pr is not None:
+            state_prs.append(state_pr)
+
+    state = build_state(
+        trigger_id=resolved_trigger,
+        prs=state_prs,
+        leader_repo=leader_repo,
+    )
+
+    manager = leader_manager or LeaderPRManager(repo=leader_repo, dry_run=dry_run)
+    leader_result = manager.create_or_update(state)
+
+    return PromoterRunResult(
+        trigger_id=resolved_trigger,
+        outcomes=outcomes,
+        state_prs=state_prs,
+        leader=leader_result,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        result = run_promoter(
+            config_path=args.config,
+            trigger_id=args.trigger_id,
+            only=args.only,
+            leader_repo=args.leader_repo,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+        )
+    except (ConfigError, StateFileError, ValueError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"trigger_id={result.trigger_id}")
+    for entry, outcome in result.outcomes:
+        name = entry.get("name") or entry["dest"]["url"]
+        print(f"[{name}] {outcome.message}")
+        if outcome.pr_url:
+            print(outcome.pr_url)
+
+    if result.leader:
+        action = "Updated" if result.leader.updated else "Created"
+        if result.leader.dry_run:
+            print(
+                f"Leader PR dry-run for {result.leader.repo} "
+                f"(branch {result.leader.branch}, state {result.leader.state_path})"
+            )
+        elif result.leader.pr_url:
+            print(f"{action} leader pull request: {result.leader.pr_url}")
+        else:
+            print(f"{action} leader pull request for {result.leader.repo}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

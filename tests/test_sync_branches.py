@@ -88,7 +88,7 @@ def test_run_sync_entry_creates_pr(mock_prepare, mock_pr_creator, mock_push, git
     _commit(target, "README.md", "main\n", "main change")
     run(["git", "checkout", "stable"], cwd=target)
 
-    mock_prepare.return_value = (target, "main")
+    mock_prepare.return_value = (target, "main", "sync-branch")
 
     pr_instance = MagicMock()
     pr_instance.find_open_pr_by_label.return_value = None
