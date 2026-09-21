@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
+from lib.git_utils import authenticated_clone_url
 from lib.state_file import (
     DEFAULT_LEADER_REPO,
     PromoterState,
@@ -120,6 +121,23 @@ class LeaderPRManager:
     def leader_branch(self, trigger_id: str) -> str:
         return f"gap-leader/{trigger_id}"
 
+    def _resolve_token(self) -> str:
+        token = (
+            os.environ.get("GITHUB_TOKEN")
+            or os.environ.get("GH_TOKEN")
+            or os.environ.get("SYNC_TOKEN")
+        )
+        if not token:
+            raise RuntimeError(
+                "GITHUB_TOKEN, GH_TOKEN, or SYNC_TOKEN is required to create the Leader PR"
+            )
+        return token
+
+    def _configure_origin_auth(self, workdir: Path, token: str) -> None:
+        """Point origin at an authenticated HTTPS URL so git push/fetch work in CI."""
+        auth_url = authenticated_clone_url(f"https://github.com/{self.repo}.git", token)
+        self.run_git(["remote", "set-url", "origin", auth_url], cwd=workdir, mutate=True)
+
     def ensure_labels(self, labels: Sequence[str]) -> None:
         """Create labels on the Leader repo when they are missing."""
         for label in labels:
@@ -224,6 +242,7 @@ class LeaderPRManager:
 
         workdir = Path(tempfile.mkdtemp(prefix="gap-leader-"))
         try:
+            token = self._resolve_token()
             self.run_gh(
                 [
                     "repo",
@@ -237,6 +256,8 @@ class LeaderPRManager:
                 ],
                 mutate=True,
             )
+            # gh clone leaves a plain https remote; git push needs the token.
+            self._configure_origin_auth(workdir, token)
 
             if existing:
                 head = existing.get("headRefName") or branch

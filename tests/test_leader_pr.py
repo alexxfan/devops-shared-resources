@@ -49,6 +49,7 @@ def test_dry_run_prints_gh_pr_create_dry_run(capsys: pytest.CaptureFixture[str])
 
 
 def test_create_leader_pr_via_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     calls: list[tuple[list[str], str | None]] = []
 
     def fake_runner(command: list[str], cwd: Path | None) -> MagicMock:
@@ -96,7 +97,9 @@ def test_create_leader_pr_via_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert GAP_LABEL in create_cmd
 
 
-def test_update_existing_leader_pr() -> None:
+def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+
     def fake_runner(command: list[str], cwd: Path | None) -> MagicMock:
         if command[:3] == ["gh", "pr", "list"]:
             return _completed(
