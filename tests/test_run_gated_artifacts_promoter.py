@@ -23,8 +23,8 @@ def test_prepare_entry_for_trigger_injects_labels() -> None:
         "dest": {"url": "https://github.com/org/kserve.git", "branch": "stable"},
         "ignore_files": [".tekton/*"],
         "pr": {
-            "branch": None,
-            "head_strategy": "source",
+            "branch": "old-sync",
+            "head_strategy": "sync-branch",
             "tracking_label": "lake-gate",
             "labels": ["existing"],
             "automerge": False,
@@ -38,12 +38,12 @@ def test_prepare_entry_for_trigger_injects_labels() -> None:
     }
     prepared = prepare_entry_for_trigger(entry, "gap-triggerxyz")
     assert prepared["pr"]["tracking_label"] == GAP_LABEL
-    assert prepared["pr"]["head_strategy"] == "sync-branch"
-    assert prepared["pr"]["branch"] == GAP_LABEL
+    assert prepared["pr"]["head_strategy"] == "source"
+    assert prepared["pr"]["branch"] is None
     assert prepared["ignore_files"] == [".tekton/*"]
     assert prepared["pr"]["labels"] == ["existing", GAP_LABEL, "gap-triggerxyz"]
     assert entry["pr"]["tracking_label"] == "lake-gate"
-    assert entry["pr"]["head_strategy"] == "source"
+    assert entry["pr"]["head_strategy"] == "sync-branch"
 
 
 def test_outcome_to_state_pr() -> None:
@@ -117,8 +117,8 @@ def test_run_promoter_dry_run(tmp_path: Path) -> None:
     assert result.trigger_id == "gap-fixed"
     assert len(sync_calls) == 1
     assert sync_calls[0]["pr"]["tracking_label"] == GAP_LABEL
-    assert sync_calls[0]["pr"]["head_strategy"] == "sync-branch"
-    assert sync_calls[0]["pr"]["branch"] == GAP_LABEL
+    assert sync_calls[0]["pr"]["head_strategy"] == "source"
+    assert sync_calls[0]["pr"]["branch"] is None
     assert GAP_LABEL in sync_calls[0]["pr"]["labels"]
     assert "gap-fixed" in sync_calls[0]["pr"]["labels"]
     assert result.state_prs == []

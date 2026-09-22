@@ -29,16 +29,18 @@ an extra PR label). Child sync PRs and the Leader PR are **tracked** by the
 shared `gated-artifacts-promoter` label, so re-runs update existing open PRs
 instead of opening new ones.
 
-Child syncs always use `pr-head: sync-branch` with a fixed head branch named
-`gated-artifacts-promoter`. That is required so `ignore-files` (e.g. `.tekton/*`)
-can keep the target branch versions — a pure `main`→`stable` PR cannot exclude
-those paths.
+Child syncs use `pr-head: source` so GitHub PRs are literally
+`main`/`master` → `stable`. `ignore-files` (e.g. `.tekton/*`) means: do not
+open a PR when only ignored paths differ. If non-ignored paths also differ,
+those ignored paths may still appear in the GitHub diff (head is the real
+source branch). Landing on `stable` without updating `.tekton` is a merge-time
+concern, same idea as main→release.
 
 ## Config
 
 Uses the same formats as branch sync (`git:` infra map or native `syncs:`). The
-orchestrator overrides tracking label / head strategy / branch name and always
-adds the `gated-artifacts-promoter` label (plus the trigger ID label).
+orchestrator overrides tracking label / head strategy and always adds the
+`gated-artifacts-promoter` label (plus the trigger ID label).
 
 Example infra config:
 
@@ -46,7 +48,7 @@ Example infra config:
 defaults:
   source-branch: main
   target-branch: stable
-  pr-head: sync-branch
+  pr-head: source
 
 git:
   - name: kserve

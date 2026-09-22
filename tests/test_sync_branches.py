@@ -182,6 +182,49 @@ def test_run_sync_entry_creates_source_pr(mock_pr_creator, mock_collect, git_rep
     assert pr_instance.create_or_update_tracking_pr.call_args.kwargs["delete_branch_on_merge"] is False
 
 
+@patch("scripts.sync_branches.resolve_branch_ref", return_value="origin/stable")
+@patch("scripts.sync_branches._non_ignored_changed_files", return_value=[])
+@patch("scripts.sync_branches._collect_sync_commits")
+@patch("scripts.sync_branches.PRCreator")
+def test_source_pr_skips_when_only_ignored_paths_differ(
+    mock_pr_creator, mock_collect, _mock_remaining, _mock_resolve, git_repo_factory
+) -> None:
+    from lib.git_utils import GitCommit
+
+    target = git_repo_factory("target")
+    mock_collect.return_value = (
+        target,
+        [
+            GitCommit(sha="abc123", short_sha="abc123", subject="tekton only"),
+        ],
+    )
+
+    entry = {
+        "sync_type": "pr",
+        "src": {"url": str(target), "branch": "main"},
+        "dest": {"url": str(target), "branch": "stable"},
+        "ignore_files": [".tekton/*"],
+        "pr": {
+            "branch": None,
+            "head_strategy": "source",
+            "tracking_label": "lake-gate",
+            "labels": [],
+            "automerge": False,
+            "title": None,
+            "body": None,
+            "reviewers": [],
+        },
+        "merge_args": [],
+        "fetch_args": [],
+        "push_args": [],
+    }
+
+    outcome = run_sync_entry(entry, token="token", dry_run=False)
+    assert outcome.pr_url is None
+    assert "only ignored paths differ" in outcome.message
+    mock_pr_creator.assert_not_called()
+
+
 def test_main_with_config_file_and_only_filter(tmp_path: Path) -> None:
     config = tmp_path / "sync.yaml"
     config.write_text(

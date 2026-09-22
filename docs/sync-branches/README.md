@@ -86,7 +86,7 @@ git:
   - name: kserve
     automerge: "yes"
     repo-url: https://github.com/red-hat-data-services/kserve.git
-    ignore-files: .tekton/*   # requires pr-head: sync-branch
+    ignore-files: .tekton/*   # with pr-head: source, skip PR if only these differ
   - name: odh-dashboard
     automerge: "yes"
     repo-url: https://github.com/red-hat-data-services/odh-dashboard.git
@@ -100,7 +100,7 @@ See `docs/sync-branches/consumer-setup.md` for infra-repo config format and how 
 When using `sync-type: pr`, choose how the pull request is opened:
 
 - `sync-branch` (default): merge the source branch into a temporary branch, push it, and open a PR into the target branch. Supports `ignore-files` and pre-resolved merge conflicts.
-- `source`: open the PR directly from the source branch into the target branch (e.g. `main` → `stable`). Requires the same repository and does not support `ignore-files`.
+- `source`: open the PR directly from the source branch into the target branch (e.g. `main` → `stable`). Requires the same repository. With `ignore-files`, skips opening when only ignored paths differ; does not rewrite the source branch tree.
 
 CLI:
 
