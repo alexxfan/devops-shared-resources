@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -106,12 +106,92 @@ def test_create_pull_request_calls_github_api() -> None:
 
 def test_create_or_update_tracking_pr_updates_existing() -> None:
     creator = PRCreator("token")
+    with (
+        patch.object(creator, "find_open_pr_by_head", return_value=None),
+        patch.object(
+            creator,
+            "find_open_pr_by_label",
+            return_value={
+                "number": 7,
+                "html_url": "https://github.com/org/repo/pull/7",
+                "head": {"ref": "sync-existing"},
+            },
+        ),
+        patch.object(creator, "update_pull_request") as mock_update,
+        patch.object(creator, "add_labels"),
+    ):
+        result = creator.create_or_update_tracking_pr(
+            "https://github.com/org/repo.git",
+            title="Sync",
+            body="body",
+            head_branch="sync-new",
+            base_branch="stable",
+            tracking_label="lake-gate",
+            labels=["lake-gate"],
+        )
+
+    assert result.updated is True
+    assert result.branch == "sync-existing"
+    mock_update.assert_called_once()
+
+
+def test_create_or_update_prefers_existing_head_base_pr() -> None:
+    """Source-headed syncs must reuse master→stable even without tracking label."""
+    creator = PRCreator("token")
+    creator.find_open_pr_by_head = MagicMock(
+        return_value={
+            "number": 81,
+            "html_url": "https://github.com/org/repo/pull/81",
+            "head": {"ref": "master"},
+        }
+    )
     creator.find_open_pr_by_label = MagicMock(
         return_value={
-            "number": 7,
-            "html_url": "https://github.com/org/repo/pull/7",
-            "head": {"ref": "sync-existing"},
+            "number": 84,
+            "html_url": "https://github.com/org/repo/pull/84",
+            "head": {"ref": "sync-old"},
         }
+    )
+    creator.update_pull_request = MagicMock()
+    creator.add_labels = MagicMock()
+    creator.create_pull_request = MagicMock()
+
+    result = creator.create_or_update_tracking_pr(
+        "https://github.com/org/repo.git",
+        title="Sync",
+        body="body",
+        head_branch="master",
+        base_branch="stable",
+        tracking_label="gated-artifacts-promoter",
+        labels=["gated-artifacts-promoter"],
+    )
+
+    assert result.updated is True
+    assert result.number == 81
+    assert result.branch == "master"
+    creator.find_open_pr_by_label.assert_not_called()
+    creator.create_pull_request.assert_not_called()
+    creator.add_labels.assert_called_once()
+
+
+def test_create_or_update_recovers_from_422_already_exists() -> None:
+    creator = PRCreator("token")
+    creator.find_open_pr_by_head = MagicMock(
+        side_effect=[
+            None,
+            {
+                "number": 81,
+                "html_url": "https://github.com/org/repo/pull/81",
+                "head": {"ref": "master"},
+            },
+        ]
+    )
+    creator.find_open_pr_by_label = MagicMock(return_value=None)
+    creator.create_pull_request = MagicMock(
+        side_effect=RuntimeError(
+            'GitHub API POST /repos/org/repo/pulls failed (422): '
+            '{"message":"Validation Failed","errors":[{"message":"A pull request already exists for org:master."}]}'
+        )
     )
     creator.update_pull_request = MagicMock()
     creator.add_labels = MagicMock()
@@ -120,12 +200,12 @@ def test_create_or_update_tracking_pr_updates_existing() -> None:
         "https://github.com/org/repo.git",
         title="Sync",
         body="body",
-        head_branch="sync-new",
+        head_branch="master",
         base_branch="stable",
-        tracking_label="lake-gate",
-        labels=["lake-gate"],
+        tracking_label="gated-artifacts-promoter",
+        labels=["gated-artifacts-promoter"],
     )
 
     assert result.updated is True
-    assert result.branch == "sync-existing"
+    assert result.number == 81
     creator.update_pull_request.assert_called_once()
