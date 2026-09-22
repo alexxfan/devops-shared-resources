@@ -43,5 +43,6 @@ python devops-shared-resources/scripts/run_gated_artifacts_promoter.py \
   --dry-run
 ```
 
-Use the same `--trigger-id` printed in the failed workflow logs to reproduce an update
-to an existing Leader / child PR set.
+Use the same `--trigger-id` printed in the failed workflow logs when correlating
+a run to its Leader `state.json` path. Child sync PRs are reused via the
+`gated-artifacts-promoter` tracking label (re-runs update open PRs).

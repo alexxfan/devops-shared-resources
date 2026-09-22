@@ -37,8 +37,8 @@ def test_prepare_entry_for_trigger_injects_labels() -> None:
         "push_args": [],
     }
     prepared = prepare_entry_for_trigger(entry, "gap-triggerxyz")
-    assert prepared["pr"]["tracking_label"] == "gap-triggerxyz"
-    assert prepared["pr"]["labels"] == ["existing", "gap-triggerxyz", GAP_LABEL]
+    assert prepared["pr"]["tracking_label"] == GAP_LABEL
+    assert prepared["pr"]["labels"] == ["existing", GAP_LABEL, "gap-triggerxyz"]
     assert entry["pr"]["tracking_label"] == "lake-gate"
 
 
@@ -112,8 +112,9 @@ def test_run_promoter_dry_run(tmp_path: Path) -> None:
 
     assert result.trigger_id == "gap-fixed"
     assert len(sync_calls) == 1
-    assert sync_calls[0]["pr"]["tracking_label"] == "gap-fixed"
+    assert sync_calls[0]["pr"]["tracking_label"] == GAP_LABEL
     assert GAP_LABEL in sync_calls[0]["pr"]["labels"]
+    assert "gap-fixed" in sync_calls[0]["pr"]["labels"]
     assert result.state_prs == []
     leader.create_or_update.assert_called_once()
     _, kwargs = leader.create_or_update.call_args

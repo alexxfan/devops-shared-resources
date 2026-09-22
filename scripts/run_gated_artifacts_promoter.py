@@ -55,7 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trigger-id",
         default=None,
-        help="Optional trigger ID used as the tracking label. Generated when omitted.",
+        help=(
+            "Optional trigger ID for Leader state.json path and PR labels. "
+            "Generated when omitted. Child sync PRs are tracked by the "
+            f"{GAP_LABEL!r} label (re-runs update existing open PRs)."
+        ),
     )
     parser.add_argument(
         "--only",
@@ -82,12 +86,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def prepare_entry_for_trigger(entry: dict[str, Any], trigger_id: str) -> dict[str, Any]:
-    """Return a deep copy of entry with GAP tracking label and labels injected."""
+    """Return a deep copy of entry with GAP tracking label and labels injected.
+
+    Tracking label is always ``gated-artifacts-promoter`` so re-runs update the
+    existing open sync PR. The trigger ID is kept as an extra label for
+    correlation with the Leader ``state.json`` path.
+    """
     prepared = copy.deepcopy(entry)
     pr = prepared.setdefault("pr", {})
-    pr["tracking_label"] = trigger_id
+    pr["tracking_label"] = GAP_LABEL
     labels = list(pr.get("labels") or [])
-    for label in (trigger_id, GAP_LABEL):
+    for label in (GAP_LABEL, trigger_id):
         if label not in labels:
             labels.append(label)
     pr["labels"] = labels

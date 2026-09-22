@@ -100,7 +100,7 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
                         {
                             "number": 4,
                             "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/4",
-                            "headRefName": "gap-leader/gap-existing",
+                            "headRefName": "gap-leader",
                             "title": "old",
                         }
                     ]
@@ -123,6 +123,7 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     result = manager.create_or_update(state, trigger_id="gap-existing")
     assert result.updated is True
     assert result.pr_number == 4
+    assert result.branch == "gap-leader"
 
 
 def test_gh_failure_raises() -> None:

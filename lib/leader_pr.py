@@ -119,7 +119,9 @@ class LeaderPRManager:
         return (result.stdout or "").strip()
 
     def leader_branch(self, trigger_id: str) -> str:
-        return f"gap-leader/{trigger_id}"
+        # Stable branch name so re-runs reuse one Leader PR head.
+        _ = trigger_id
+        return "gap-leader"
 
     def _resolve_token(self) -> str:
         token = (
@@ -200,10 +202,11 @@ class LeaderPRManager:
         state_rel = state_path_for_trigger(trigger_id)
         pr_title = title or f"GAP leader: {trigger_id}"
         pr_body = body or self._default_body(state, trigger_id=trigger_id)
-        labels = [trigger_id, GAP_LABEL]
+        # Track/reuse Leader PRs by the shared GAP label (not per-trigger).
+        labels = [GAP_LABEL, trigger_id]
         self.ensure_labels(labels)
 
-        existing = self.find_open_pr_by_label(trigger_id)
+        existing = self.find_open_pr_by_label(GAP_LABEL)
 
         if self.dry_run:
             # Show the mutating gh commands operators would run locally.

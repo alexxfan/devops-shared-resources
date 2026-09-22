@@ -24,8 +24,10 @@ python scripts/run_gated_artifacts_promoter.py \
   --dry-run
 ```
 
-Omit `--trigger-id` to generate one. Re-run with the same trigger ID to force-update
-existing child PRs (tracking label) and the Leader PR.
+Omit `--trigger-id` to generate one (used for `<trigger_id>/state.json` and as
+an extra PR label). Child sync PRs and the Leader PR are **tracked** by the
+shared `gated-artifacts-promoter` label, so re-runs update existing open PRs
+instead of opening new ones.
 
 ## Config
 
