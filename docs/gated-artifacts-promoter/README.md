@@ -24,8 +24,8 @@ python scripts/run_gated_artifacts_promoter.py \
   --dry-run
 ```
 
-Omit `--trigger-id` to generate one (used for `state/<trigger_id>/state.json` and as
-an extra PR label). Child sync PRs and the Leader PR are **tracked** by the
+Omit `--trigger-id` to generate one (used for `GAP Leaders/<trigger_id>/state.json`
+and as an extra PR label). Child sync PRs and the Leader PR are **tracked** by the
 shared `gated-artifacts-promoter` label, so re-runs update existing open PRs
 instead of opening new ones.
 
@@ -53,7 +53,7 @@ Stdout includes:
 - Per-entry sync messages and child PR URLs
 - Leader PR URL (or dry-run summary)
 
-Leader PR path: `state/<trigger_id>/state.json`
+Leader PR path: `GAP Leaders/<trigger_id>/state.json`
 
 Stage 1 `state.json` shape ([RHOAIENG-93564](https://redhat.atlassian.net/browse/RHOAIENG-93564)):
 

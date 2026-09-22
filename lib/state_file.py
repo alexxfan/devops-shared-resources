@@ -127,9 +127,13 @@ class PromoterState:
         return self.pull_requests
 
 
+# Leader-repo directory that holds per-trigger state.json files.
+STATE_ROOT_DIR = "GAP Leaders"
+
+
 def state_path_for_trigger(trigger_id: str) -> str:
     """Return the Leader-repo relative path for a trigger's state.json."""
-    return f"state/{trigger_id}/state.json"
+    return f"{STATE_ROOT_DIR}/{trigger_id}/state.json"
 
 
 def build_state(
