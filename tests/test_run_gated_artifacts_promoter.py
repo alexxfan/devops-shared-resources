@@ -21,10 +21,10 @@ def test_prepare_entry_for_trigger_injects_labels() -> None:
         "sync_type": "pr",
         "src": {"url": "https://github.com/org/kserve.git", "branch": "main"},
         "dest": {"url": "https://github.com/org/kserve.git", "branch": "stable"},
-        "ignore_files": [],
+        "ignore_files": [".tekton/*"],
         "pr": {
             "branch": None,
-            "head_strategy": "sync-branch",
+            "head_strategy": "source",
             "tracking_label": "lake-gate",
             "labels": ["existing"],
             "automerge": False,
@@ -38,8 +38,12 @@ def test_prepare_entry_for_trigger_injects_labels() -> None:
     }
     prepared = prepare_entry_for_trigger(entry, "gap-triggerxyz")
     assert prepared["pr"]["tracking_label"] == GAP_LABEL
+    assert prepared["pr"]["head_strategy"] == "sync-branch"
+    assert prepared["pr"]["branch"] == GAP_LABEL
+    assert prepared["ignore_files"] == [".tekton/*"]
     assert prepared["pr"]["labels"] == ["existing", GAP_LABEL, "gap-triggerxyz"]
     assert entry["pr"]["tracking_label"] == "lake-gate"
+    assert entry["pr"]["head_strategy"] == "source"
 
 
 def test_outcome_to_state_pr() -> None:
@@ -94,7 +98,7 @@ def test_run_promoter_dry_run(tmp_path: Path) -> None:
         trigger_id="gap-fixed",
         repo="red-hat-data-services/gated-artifacts-promoter",
         branch="gap-leader/gap-fixed",
-        state_path="gap-fixed/state.json",
+        state_path="state/gap-fixed/state.json",
         pr_url=None,
         pr_number=None,
         updated=False,
@@ -113,6 +117,8 @@ def test_run_promoter_dry_run(tmp_path: Path) -> None:
     assert result.trigger_id == "gap-fixed"
     assert len(sync_calls) == 1
     assert sync_calls[0]["pr"]["tracking_label"] == GAP_LABEL
+    assert sync_calls[0]["pr"]["head_strategy"] == "sync-branch"
+    assert sync_calls[0]["pr"]["branch"] == GAP_LABEL
     assert GAP_LABEL in sync_calls[0]["pr"]["labels"]
     assert "gap-fixed" in sync_calls[0]["pr"]["labels"]
     assert result.state_prs == []
@@ -146,7 +152,7 @@ def test_run_promoter_collects_prs(tmp_path: Path) -> None:
         trigger_id="gap-live",
         repo="red-hat-data-services/gated-artifacts-promoter",
         branch="gap-leader/gap-live",
-        state_path="gap-live/state.json",
+        state_path="state/gap-live/state.json",
         pr_url="https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/1",
         pr_number=1,
         updated=False,

@@ -40,7 +40,7 @@ def test_dry_run_prints_gh_pr_create_dry_run(capsys: pytest.CaptureFixture[str])
     assert "--dry-run" in captured
     assert result.dry_run is True
     assert result.pr_url is None
-    assert result.state_path == "gap-testtrigger001/state.json"
+    assert result.state_path == "state/gap-testtrigger001/state.json"
     assert any(cmd[:3] == ["gh", "pr", "list"] for cmd in calls)
 
 
@@ -58,7 +58,7 @@ def test_create_leader_pr_via_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
             (dest / ".git").mkdir(exist_ok=True)
             return _completed("")
         if command[0] == "git" and command[1] == "status":
-            return _completed("A  gap-testtrigger002/state.json\n")
+            return _completed("A  state/gap-testtrigger002/state.json\n")
         if command[:3] == ["gh", "pr", "create"]:
             return _completed(
                 "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/9\n"
@@ -112,7 +112,7 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
             (dest / ".git").mkdir(exist_ok=True)
             return _completed("")
         if command[0] == "git" and command[1] == "status":
-            return _completed("M  gap-existing/state.json\n")
+            return _completed("M  state/gap-existing/state.json\n")
         return _completed("")
 
     manager = LeaderPRManager(

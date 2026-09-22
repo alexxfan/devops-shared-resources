@@ -129,7 +129,7 @@ class PromoterState:
 
 def state_path_for_trigger(trigger_id: str) -> str:
     """Return the Leader-repo relative path for a trigger's state.json."""
-    return f"{trigger_id}/state.json"
+    return f"state/{trigger_id}/state.json"
 
 
 def build_state(

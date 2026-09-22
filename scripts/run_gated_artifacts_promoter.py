@@ -91,10 +91,16 @@ def prepare_entry_for_trigger(entry: dict[str, Any], trigger_id: str) -> dict[st
     Tracking label is always ``gated-artifacts-promoter`` so re-runs update the
     existing open sync PR. The trigger ID is kept as an extra label for
     correlation with the Leader ``state.json`` path.
+
+    Child PRs use ``sync-branch`` (not ``source``) so ``ignore-files`` can keep
+    target ``.tekton`` content. The sync head branch is a fixed reusable name
+    (not a per-run temp branch).
     """
     prepared = copy.deepcopy(entry)
     pr = prepared.setdefault("pr", {})
     pr["tracking_label"] = GAP_LABEL
+    pr["head_strategy"] = "sync-branch"
+    pr["branch"] = GAP_LABEL
     labels = list(pr.get("labels") or [])
     for label in (GAP_LABEL, trigger_id):
         if label not in labels:

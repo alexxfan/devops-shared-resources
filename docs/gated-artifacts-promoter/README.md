@@ -24,16 +24,21 @@ python scripts/run_gated_artifacts_promoter.py \
   --dry-run
 ```
 
-Omit `--trigger-id` to generate one (used for `<trigger_id>/state.json` and as
+Omit `--trigger-id` to generate one (used for `state/<trigger_id>/state.json` and as
 an extra PR label). Child sync PRs and the Leader PR are **tracked** by the
 shared `gated-artifacts-promoter` label, so re-runs update existing open PRs
 instead of opening new ones.
 
+Child syncs always use `pr-head: sync-branch` with a fixed head branch named
+`gated-artifacts-promoter`. That is required so `ignore-files` (e.g. `.tekton/*`)
+can keep the target branch versions — a pure `main`→`stable` PR cannot exclude
+those paths.
+
 ## Config
 
 Uses the same formats as branch sync (`git:` infra map or native `syncs:`). The
-orchestrator **overrides** each entry's tracking label with the trigger ID and always
-adds the `gated-artifacts-promoter` label.
+orchestrator overrides tracking label / head strategy / branch name and always
+adds the `gated-artifacts-promoter` label (plus the trigger ID label).
 
 Example infra config:
 
@@ -58,7 +63,7 @@ Stdout includes:
 - Per-entry sync messages and child PR URLs
 - Leader PR URL (or dry-run summary)
 
-Leader PR path: `<trigger_id>/state.json`
+Leader PR path: `state/<trigger_id>/state.json`
 
 Stage 1 `state.json` shape ([RHOAIENG-93564](https://redhat.atlassian.net/browse/RHOAIENG-93564)):
 
