@@ -179,6 +179,11 @@ class LeaderPRManager:
 
     def find_open_pr_by_label(self, label: str) -> dict | None:
         """Return the first open PR with the given label, or None."""
+        items = self.list_open_prs_by_label(label)
+        return items[0] if items else None
+
+    def list_open_prs_by_label(self, label: str) -> list[dict]:
+        """Return all open PRs with the given label."""
         output = self.run_gh(
             [
                 "pr",
@@ -192,16 +197,46 @@ class LeaderPRManager:
                 "--json",
                 "number,url,headRefName,title",
                 "--limit",
-                "20",
+                "50",
             ],
             mutate=False,
         )
         if self.dry_run and not output:
-            return None
+            return []
         items = json.loads(output or "[]")
-        if not isinstance(items, list) or not items:
-            return None
-        return items[0]
+        if not isinstance(items, list):
+            return []
+        return items
+
+    def close_pr(self, number: int, *, comment: str | None = None) -> None:
+        """Close an open pull request."""
+        command = [
+            "pr",
+            "close",
+            str(number),
+            "--repo",
+            self.repo,
+        ]
+        if comment:
+            command.extend(["--comment", comment])
+        self.run_gh(command, mutate=True)
+
+    def close_previous_leader_prs(self, *, keep_number: int, trigger_id: str) -> list[int]:
+        """Close other open GAP Leader PRs, keeping the current run's PR open."""
+        closed: list[int] = []
+        for pull in self.list_open_prs_by_label(GAP_LABEL):
+            number = int(pull["number"])
+            if number == keep_number:
+                continue
+            self.close_pr(
+                number,
+                comment=(
+                    f"Superseded by Leader PR for trigger `{trigger_id}` "
+                    f"(#{keep_number})."
+                ),
+            )
+            closed.append(number)
+        return closed
 
     def create_or_update(
         self,
@@ -248,6 +283,12 @@ class LeaderPRManager:
                 ],
                 mutate=True,
             )
+            if existing is None:
+                for pull in self.list_open_prs_by_label(GAP_LABEL):
+                    print(
+                        f"[dry-run] would close superseded Leader PR "
+                        f"#{pull['number']} ({pull.get('url')})"
+                    )
             return LeaderPRResult(
                 trigger_id=trigger_id,
                 repo=self.repo,
@@ -337,6 +378,7 @@ class LeaderPRManager:
                 )
                 # Create path passes --label; update path must add them explicitly.
                 self.add_labels_to_pr(number, labels)
+                self.close_previous_leader_prs(keep_number=number, trigger_id=trigger_id)
                 return LeaderPRResult(
                     trigger_id=trigger_id,
                     repo=self.repo,
@@ -371,6 +413,10 @@ class LeaderPRManager:
             )
             pr_url = create_out.strip().splitlines()[-1] if create_out else None
             pr_number = _parse_pr_number(pr_url) if pr_url else None
+            if pr_number is not None:
+                self.close_previous_leader_prs(
+                    keep_number=pr_number, trigger_id=trigger_id
+                )
             return LeaderPRResult(
                 trigger_id=trigger_id,
                 repo=self.repo,

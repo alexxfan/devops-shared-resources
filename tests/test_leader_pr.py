@@ -96,9 +96,21 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_runner(command: list[str], cwd: Path | None) -> MagicMock:
         calls.append(list(command))
         if command[:3] == ["gh", "pr", "list"]:
-            # Lookup is by trigger_id label, not the shared GAP label.
-            assert "--label" in command
-            assert "gap-existing" in command
+            idx = command.index("--label")
+            label = command[idx + 1]
+            if label == "gap-existing":
+                return _completed(
+                    json.dumps(
+                        [
+                            {
+                                "number": 4,
+                                "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/4",
+                                "headRefName": "gap-leader/gap-existing",
+                                "title": "old",
+                            }
+                        ]
+                    )
+                )
             return _completed(
                 json.dumps(
                     [
@@ -143,13 +155,30 @@ def test_new_trigger_opens_new_leader_pr(monkeypatch: pytest.MonkeyPatch) -> Non
     """A new trigger ID must not reuse another run's Leader PR."""
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     listed_labels: list[str] = []
+    close_calls: list[list[str]] = []
 
     def fake_runner(command: list[str], cwd: Path | None) -> MagicMock:
         if command[:3] == ["gh", "pr", "list"]:
-            # No open PR for this trigger_id.
             idx = command.index("--label")
-            listed_labels.append(command[idx + 1])
+            label = command[idx + 1]
+            listed_labels.append(label)
+            if label == GAP_LABEL:
+                return _completed(
+                    json.dumps(
+                        [
+                            {
+                                "number": 5,
+                                "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/5",
+                                "headRefName": "gap-leader/gap-old",
+                                "title": "old leader",
+                            }
+                        ]
+                    )
+                )
             return _completed("[]\n")
+        if command[:3] == ["gh", "pr", "close"]:
+            close_calls.append(list(command))
+            return _completed("")
         if command[:3] == ["gh", "repo", "clone"]:
             dest = Path(command[4])
             dest.mkdir(parents=True, exist_ok=True)
@@ -168,10 +197,74 @@ def test_new_trigger_opens_new_leader_pr(monkeypatch: pytest.MonkeyPatch) -> Non
         runner=fake_runner,
     )
     result = manager.create_or_update(build_state(pull_requests=[]), trigger_id="gap-newrun")
-    assert listed_labels == ["gap-newrun"]
+    assert listed_labels[0] == "gap-newrun"
+    assert GAP_LABEL in listed_labels
     assert result.updated is False
     assert result.pr_number == 12
     assert result.branch == "gap-leader/gap-newrun"
+    assert any(cmd[3] == "5" for cmd in close_calls)
+    assert all("--comment" in cmd for cmd in close_calls)
+
+
+def test_update_existing_closes_other_open_leaders(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    close_calls: list[list[str]] = []
+
+    def fake_runner(command: list[str], cwd: Path | None) -> MagicMock:
+        if command[:3] == ["gh", "pr", "list"]:
+            idx = command.index("--label")
+            label = command[idx + 1]
+            if label == "gap-existing":
+                return _completed(
+                    json.dumps(
+                        [
+                            {
+                                "number": 4,
+                                "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/4",
+                                "headRefName": "gap-leader/gap-existing",
+                                "title": "current",
+                            }
+                        ]
+                    )
+                )
+            # Shared GAP label lists current + an older open Leader.
+            return _completed(
+                json.dumps(
+                    [
+                        {
+                            "number": 4,
+                            "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/4",
+                            "headRefName": "gap-leader/gap-existing",
+                            "title": "current",
+                        },
+                        {
+                            "number": 3,
+                            "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/3",
+                            "headRefName": "gap-leader/gap-older",
+                            "title": "older",
+                        },
+                    ]
+                )
+            )
+        if command[:3] == ["gh", "pr", "close"]:
+            close_calls.append(list(command))
+            return _completed("")
+        if command[:3] == ["gh", "repo", "clone"]:
+            dest = Path(command[4])
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / ".git").mkdir(exist_ok=True)
+            return _completed("")
+        if command[0] == "git" and command[1] == "status":
+            return _completed("M  GAP Leaders/gap-existing/state.json\n")
+        return _completed("")
+
+    manager = LeaderPRManager(
+        repo="red-hat-data-services/gated-artifacts-promoter",
+        runner=fake_runner,
+    )
+    result = manager.create_or_update(build_state(pull_requests=[]), trigger_id="gap-existing")
+    assert result.pr_number == 4
+    assert [cmd[3] for cmd in close_calls] == ["3"]
 
 
 def test_gh_failure_raises() -> None:
