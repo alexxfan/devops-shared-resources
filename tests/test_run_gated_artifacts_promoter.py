@@ -38,25 +38,24 @@ def test_prepare_entry_for_trigger_injects_labels() -> None:
     }
     prepared = prepare_entry_for_trigger(entry, "gap-triggerxyz")
     assert prepared["pr"]["tracking_label"] == GAP_LABEL
-    assert prepared["pr"]["head_strategy"] == "source"
-    assert prepared["pr"]["branch"] is None
-    assert prepared["ignore_files"] == [".tekton/*"]
+    # Explicit sync-branch is preserved along with ignore-files.
+    assert prepared["pr"]["head_strategy"] == "sync-branch"
+    assert prepared["ignore_files"] == ["README.md"]
     assert prepared["pr"]["labels"] == ["existing", GAP_LABEL, "gap-triggerxyz"]
     assert entry["pr"]["tracking_label"] == "lake-gate"
-    assert entry["pr"]["head_strategy"] == "sync-branch"
-    assert entry["ignore_files"] == ["README.md"]
 
 
-def test_prepare_entry_always_ignores_tekton() -> None:
+def test_prepare_entry_defaults_to_source_without_ignore_files() -> None:
     entry = {
         "name": "kserve",
-        "ignore_files": [],
-        "pr": {"head_strategy": "sync-branch", "labels": []},
+        "ignore_files": [".tekton/*"],
+        "pr": {"head_strategy": "source", "labels": []},
         "src": {"url": "https://github.com/org/kserve.git", "branch": "main"},
         "dest": {"url": "https://github.com/org/kserve.git", "branch": "stable"},
     }
     prepared = prepare_entry_for_trigger(entry, "gap-abc")
-    assert prepared["ignore_files"] == [".tekton/*"]
+    assert prepared["pr"]["head_strategy"] == "source"
+    assert prepared["ignore_files"] == []
 
 
 def test_outcome_to_state_pr() -> None:
@@ -83,7 +82,7 @@ def test_run_promoter_dry_run(tmp_path: Path) -> None:
         "defaults": {
             "source-branch": "main",
             "target-branch": "stable",
-            "pr-head": "sync-branch",
+            "pr-head": "source",
         },
         "git": [
             {
@@ -103,7 +102,7 @@ def test_run_promoter_dry_run(tmp_path: Path) -> None:
         return SyncOutcome(
             sync_type="pr",
             message="Dry run: would sync",
-            branch="sync-main-to-stable",
+            branch="main",
         )
 
     leader = MagicMock()
@@ -132,7 +131,7 @@ def test_run_promoter_dry_run(tmp_path: Path) -> None:
     assert sync_calls[0]["pr"]["tracking_label"] == GAP_LABEL
     assert sync_calls[0]["pr"]["head_strategy"] == "source"
     assert sync_calls[0]["pr"]["branch"] is None
-    assert sync_calls[0]["ignore_files"] == [".tekton/*"]
+    assert sync_calls[0]["ignore_files"] == []
     assert GAP_LABEL in sync_calls[0]["pr"]["labels"]
     assert "gap-fixed" in sync_calls[0]["pr"]["labels"]
     assert result.state_prs == []

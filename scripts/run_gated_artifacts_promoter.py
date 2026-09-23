@@ -31,9 +31,6 @@ from lib.state_file import (  # noqa: E402
 from lib.trigger_id import normalize_trigger_id  # noqa: E402
 from scripts.sync_branches import SyncOutcome, resolve_github_token, run_sync_entry  # noqa: E402
 
-# Always exclude Konflux pipelines from main→stable promotion (not a config knob).
-DEFAULT_IGNORE_FILES = (".tekton/*",)
-
 
 @dataclass
 class PromoterRunResult:
@@ -93,15 +90,18 @@ def prepare_entry_for_trigger(entry: dict[str, Any], trigger_id: str) -> dict[st
 
     - Tracking label: ``gated-artifacts-promoter`` (re-runs update open PRs)
     - Extra labels: GAP label + trigger ID
-    - PR head: source branch → stable (no sync branch)
-    - ignore-files: always ``.tekton/*`` (not taken from config)
+    - Default PR head: source branch → stable (main→stable, no ignore-files)
+    - ``ignore-files`` only kept when ``pr-head: sync-branch`` is set
     """
     prepared = copy.deepcopy(entry)
-    prepared["ignore_files"] = list(DEFAULT_IGNORE_FILES)
     pr = prepared.setdefault("pr", {})
     pr["tracking_label"] = GAP_LABEL
-    pr["head_strategy"] = "source"
-    pr["branch"] = None
+    head = pr.get("head_strategy") or "source"
+    if head != "sync-branch":
+        head = "source"
+        prepared["ignore_files"] = []
+        pr["branch"] = None
+    pr["head_strategy"] = head
     labels = list(pr.get("labels") or [])
     for label in (GAP_LABEL, trigger_id):
         if label not in labels:

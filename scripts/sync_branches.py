@@ -11,7 +11,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -31,7 +31,6 @@ from lib.git_utils import (
     is_local_path,
     list_commits_between,
     normalize_repo_url,
-    paths_matching_patterns,
     resolve_branch_ref,
     push_branch,
     run_git,
@@ -193,25 +192,11 @@ def _validate_source_pr_head(entry: dict[str, Any]) -> None:
         raise ConfigError(
             "pr head strategy 'source' requires the source and target repositories to be the same."
         )
-
-
-def _non_ignored_changed_files(
-    workdir: Path,
-    *,
-    base_ref: str,
-    head_ref: str,
-    ignore_files: Sequence[str],
-) -> list[str]:
-    """Return paths that differ between refs after applying ignore-files patterns."""
-    result = run_git(
-        ["diff", "--name-only", f"{base_ref}...{head_ref}"],
-        cwd=workdir,
-    )
-    changed = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if not ignore_files:
-        return changed
-    ignored = paths_matching_patterns(changed, ignore_files)
-    return [path for path in changed if path not in ignored]
+    if entry["ignore_files"]:
+        raise ConfigError(
+            "pr head strategy 'source' cannot be used with ignore-files; "
+            "use 'sync-branch' when you need ignore-files."
+        )
 
 
 def _collect_sync_commits(
@@ -377,33 +362,6 @@ def run_sync_entry(
                     message="Target branch is already up to date.",
                     branch=source["branch"],
                 )
-            # With ignore-files, skip opening a main→stable PR when the only
-            # deltas are excluded paths (e.g. .tekton/*). The PR head remains
-            # the source branch; GitHub cannot strip ignored paths from the
-            # diff when those paths also differ.
-            if entry["ignore_files"]:
-                target_ref = resolve_branch_ref(workdir, target["branch"])
-                source_url = normalize_repo_url(source["url"])
-                target_url = normalize_repo_url(target["url"])
-                if source_url != target_url or not is_local_path(source_url):
-                    source_ref = f"source/{source['branch']}"
-                else:
-                    source_ref = f"origin/{source['branch']}"
-                remaining = _non_ignored_changed_files(
-                    workdir,
-                    base_ref=target_ref,
-                    head_ref=source_ref,
-                    ignore_files=entry["ignore_files"],
-                )
-                if not remaining:
-                    return SyncOutcome(
-                        sync_type=sync_type,
-                        message=(
-                            "Target branch is already up to date "
-                            "(only ignored paths differ)."
-                        ),
-                        branch=source["branch"],
-                    )
             return _create_or_update_pr(
                 entry,
                 token=token,

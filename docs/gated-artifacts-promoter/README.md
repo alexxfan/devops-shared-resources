@@ -28,20 +28,32 @@ Omit `--trigger-id` to generate one (used for `GAP Leaders/<trigger_id>/state.js
 and as a PR label). Each new trigger ID opens a **new Leader PR**. Child sync PRs
 are reused via the shared `gated-artifacts-promoter` tracking label.
 
-The orchestrator always sets `pr-head: source` (main/master → stable) and always
-ignores `.tekton/*` — neither is a config parameter.
+The orchestrator defaults to `pr-head: source` (main/master → stable) with **no**
+`ignore-files`. Set `pr-head: sync-branch` on an entry when you need
+`ignore-files` (e.g. `.tekton/*`).
 
 ## Config
 
-Infra config is only the component list (repo + branches). Example:
+Infra config is the component list. Example:
 
 ```yaml
+defaults:
+  target-branch: stable
+  pr-head: source
+
 git:
   - name: kserve
     automerge: "no"
     repo-url: https://github.com/rhoai-rhtap/kserve.git
     source-branch: main
     target-branch: stable
+  - name: needs-tekton-ignore
+    automerge: "no"
+    repo-url: https://github.com/rhoai-rhtap/example.git
+    source-branch: main
+    target-branch: stable
+    pr-head: sync-branch
+    ignore-files: .tekton/*
 ```
 
 ## Outputs

@@ -13,8 +13,8 @@ Python orchestrator and libraries.
 ## Workflow contract
 
 The infra workflow stays dumb: checkout, token, install deps, run one script.
-All GAP defaults (`.tekton/*` ignore, source→stable, tracking labels) live in
-the orchestrator.
+GAP defaults live in the orchestrator / config (`pr-head: source` by default;
+`ignore-files` only with `pr-head: sync-branch`).
 
 ```bash
 export GITHUB_TOKEN="<token>"
