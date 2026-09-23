@@ -60,8 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional trigger ID for Leader state.json path and PR labels. "
-            "Generated when omitted. Child sync PRs are tracked by the "
-            f"{GAP_LABEL!r} label (re-runs update existing open PRs)."
+            "Generated when omitted. Each new trigger ID opens a new Leader PR; "
+            f"child sync PRs are tracked by the {GAP_LABEL!r} label."
         ),
     )
     parser.add_argument(

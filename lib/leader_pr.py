@@ -119,9 +119,8 @@ class LeaderPRManager:
         return (result.stdout or "").strip()
 
     def leader_branch(self, trigger_id: str) -> str:
-        # Stable branch name so re-runs reuse one Leader PR head.
-        _ = trigger_id
-        return "gap-leader"
+        # One Leader PR (and head branch) per trigger ID / workflow run.
+        return f"gap-leader/{trigger_id}"
 
     def _resolve_token(self) -> str:
         token = (
@@ -163,6 +162,21 @@ class LeaderPRManager:
                 if "already exists" not in output.lower():
                     raise GhCommandError(command, result.returncode, output)
 
+    def add_labels_to_pr(self, number: int, labels: Sequence[str]) -> None:
+        """Add labels to an existing Leader PR (idempotent)."""
+        if not labels:
+            return
+        # Prefer REST — same constraint as title/body edit (avoid GraphQL org scopes).
+        command: list[str] = [
+            "api",
+            "--method",
+            "POST",
+            f"repos/{self.repo}/issues/{number}/labels",
+        ]
+        for label in labels:
+            command.extend(["-f", f"labels[]={label}"])
+        self.run_gh(command, mutate=True)
+
     def find_open_pr_by_label(self, label: str) -> dict | None:
         """Return the first open PR with the given label, or None."""
         output = self.run_gh(
@@ -202,11 +216,13 @@ class LeaderPRManager:
         state_rel = state_path_for_trigger(trigger_id)
         pr_title = title or f"GAP leader: {trigger_id}"
         pr_body = body or self._default_body(state, trigger_id=trigger_id)
-        # Track/reuse Leader PRs by the shared GAP label (not per-trigger).
+        # Labels: shared GAP marker + this run's trigger ID.
+        # Lookup by trigger ID so each run opens a new Leader PR; only a re-run
+        # with the same --trigger-id updates an existing one.
         labels = [GAP_LABEL, trigger_id]
         self.ensure_labels(labels)
 
-        existing = self.find_open_pr_by_label(GAP_LABEL)
+        existing = self.find_open_pr_by_label(trigger_id)
 
         if self.dry_run:
             # Show the mutating gh commands operators would run locally.
@@ -319,6 +335,8 @@ class LeaderPRManager:
                     ],
                     mutate=True,
                 )
+                # Create path passes --label; update path must add them explicitly.
+                self.add_labels_to_pr(number, labels)
                 return LeaderPRResult(
                     trigger_id=trigger_id,
                     repo=self.repo,

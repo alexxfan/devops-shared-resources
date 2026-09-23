@@ -25,9 +25,8 @@ python scripts/run_gated_artifacts_promoter.py \
 ```
 
 Omit `--trigger-id` to generate one (used for `GAP Leaders/<trigger_id>/state.json`
-and as an extra PR label). Child sync PRs and the Leader PR are **tracked** by the
-shared `gated-artifacts-promoter` label, so re-runs update existing open PRs
-instead of opening new ones.
+and as a PR label). Each new trigger ID opens a **new Leader PR**. Child sync PRs
+are reused via the shared `gated-artifacts-promoter` tracking label.
 
 The orchestrator always sets `pr-head: source` (main/master → stable) and always
 ignores `.tekton/*` — neither is a config parameter.

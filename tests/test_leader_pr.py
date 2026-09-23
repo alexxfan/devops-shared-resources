@@ -91,16 +91,21 @@ def test_create_leader_pr_via_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
 def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    calls: list[list[str]] = []
 
     def fake_runner(command: list[str], cwd: Path | None) -> MagicMock:
+        calls.append(list(command))
         if command[:3] == ["gh", "pr", "list"]:
+            # Lookup is by trigger_id label, not the shared GAP label.
+            assert "--label" in command
+            assert "gap-existing" in command
             return _completed(
                 json.dumps(
                     [
                         {
                             "number": 4,
                             "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/4",
-                            "headRefName": "gap-leader",
+                            "headRefName": "gap-leader/gap-existing",
                             "title": "old",
                         }
                     ]
@@ -123,7 +128,50 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     result = manager.create_or_update(state, trigger_id="gap-existing")
     assert result.updated is True
     assert result.pr_number == 4
-    assert result.branch == "gap-leader"
+    assert result.branch == "gap-leader/gap-existing"
+
+    label_cmd = next(
+        cmd
+        for cmd in calls
+        if cmd[:2] == ["gh", "api"] and "issues/4/labels" in "/".join(cmd)
+    )
+    assert "labels[]=gap-existing" in label_cmd
+    assert f"labels[]={GAP_LABEL}" in label_cmd
+
+
+def test_new_trigger_opens_new_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A new trigger ID must not reuse another run's Leader PR."""
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    listed_labels: list[str] = []
+
+    def fake_runner(command: list[str], cwd: Path | None) -> MagicMock:
+        if command[:3] == ["gh", "pr", "list"]:
+            # No open PR for this trigger_id.
+            idx = command.index("--label")
+            listed_labels.append(command[idx + 1])
+            return _completed("[]\n")
+        if command[:3] == ["gh", "repo", "clone"]:
+            dest = Path(command[4])
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / ".git").mkdir(exist_ok=True)
+            return _completed("")
+        if command[0] == "git" and command[1] == "status":
+            return _completed("A  GAP Leaders/gap-newrun/state.json\n")
+        if command[:3] == ["gh", "pr", "create"]:
+            return _completed(
+                "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/12\n"
+            )
+        return _completed("")
+
+    manager = LeaderPRManager(
+        repo="red-hat-data-services/gated-artifacts-promoter",
+        runner=fake_runner,
+    )
+    result = manager.create_or_update(build_state(pull_requests=[]), trigger_id="gap-newrun")
+    assert listed_labels == ["gap-newrun"]
+    assert result.updated is False
+    assert result.pr_number == 12
+    assert result.branch == "gap-leader/gap-newrun"
 
 
 def test_gh_failure_raises() -> None:
