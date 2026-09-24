@@ -151,11 +151,11 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     assert f"labels[]={GAP_LABEL}" in label_cmd
 
 
-def test_new_trigger_opens_new_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A new trigger ID must not reuse another run's Leader PR."""
+def test_new_trigger_merges_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A new trigger merges prior open Leader PRs, then opens a new one."""
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     listed_labels: list[str] = []
-    close_calls: list[list[str]] = []
+    merge_calls: list[list[str]] = []
 
     def fake_runner(command: list[str], cwd: Path | None) -> MagicMock:
         if command[:3] == ["gh", "pr", "list"]:
@@ -176,8 +176,10 @@ def test_new_trigger_opens_new_leader_pr(monkeypatch: pytest.MonkeyPatch) -> Non
                     )
                 )
             return _completed("[]\n")
-        if command[:3] == ["gh", "pr", "close"]:
-            close_calls.append(list(command))
+        if command[:3] == ["gh", "pr", "comment"]:
+            return _completed("")
+        if command[:3] == ["gh", "pr", "merge"]:
+            merge_calls.append(list(command))
             return _completed("")
         if command[:3] == ["gh", "repo", "clone"]:
             dest = Path(command[4])
@@ -202,32 +204,17 @@ def test_new_trigger_opens_new_leader_pr(monkeypatch: pytest.MonkeyPatch) -> Non
     assert result.updated is False
     assert result.pr_number == 12
     assert result.branch == "gap-leader/gap-newrun"
-    assert any(cmd[3] == "5" for cmd in close_calls)
-    assert all("--comment" in cmd for cmd in close_calls)
+    assert any(cmd[3] == "5" and "--merge" in cmd for cmd in merge_calls)
 
 
-def test_update_existing_closes_other_open_leaders(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_update_existing_does_not_merge_current_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
-    close_calls: list[list[str]] = []
+    merge_calls: list[list[str]] = []
 
     def fake_runner(command: list[str], cwd: Path | None) -> MagicMock:
         if command[:3] == ["gh", "pr", "list"]:
-            idx = command.index("--label")
-            label = command[idx + 1]
-            if label == "gap-existing":
-                return _completed(
-                    json.dumps(
-                        [
-                            {
-                                "number": 4,
-                                "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/4",
-                                "headRefName": "gap-leader/gap-existing",
-                                "title": "current",
-                            }
-                        ]
-                    )
-                )
-            # Shared GAP label lists current + an older open Leader.
             return _completed(
                 json.dumps(
                     [
@@ -236,18 +223,12 @@ def test_update_existing_closes_other_open_leaders(monkeypatch: pytest.MonkeyPat
                             "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/4",
                             "headRefName": "gap-leader/gap-existing",
                             "title": "current",
-                        },
-                        {
-                            "number": 3,
-                            "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/3",
-                            "headRefName": "gap-leader/gap-older",
-                            "title": "older",
-                        },
+                        }
                     ]
                 )
             )
-        if command[:3] == ["gh", "pr", "close"]:
-            close_calls.append(list(command))
+        if command[:3] == ["gh", "pr", "merge"]:
+            merge_calls.append(list(command))
             return _completed("")
         if command[:3] == ["gh", "repo", "clone"]:
             dest = Path(command[4])
@@ -264,7 +245,7 @@ def test_update_existing_closes_other_open_leaders(monkeypatch: pytest.MonkeyPat
     )
     result = manager.create_or_update(build_state(pull_requests=[]), trigger_id="gap-existing")
     assert result.pr_number == 4
-    assert [cmd[3] for cmd in close_calls] == ["3"]
+    assert merge_calls == []
 
 
 def test_gh_failure_raises() -> None:

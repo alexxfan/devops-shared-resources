@@ -25,9 +25,10 @@ python scripts/run_gated_artifacts_promoter.py \
 ```
 
 Omit `--trigger-id` to generate one (used for `GAP Leaders/<trigger_id>/state.json`
-and as a PR label). Each new trigger ID opens a **new Leader PR** and closes any
-previously open Leader PR labeled `gated-artifacts-promoter`. Child sync PRs are
-reused via that same shared tracking label.
+and as a PR label). Each new trigger ID **merges** any previously open Leader PR
+(so its state folder lands on the default branch), then opens a **new Leader PR**
+with a new per-run `state.json`. Child sync PRs are reused via the shared
+`gated-artifacts-promoter` tracking label.
 
 The orchestrator defaults to `pr-head: source` (main/master → stable) with **no**
 `ignore-files`. Set `pr-head: sync-branch` on an entry when you need

@@ -208,35 +208,55 @@ class LeaderPRManager:
             return []
         return items
 
-    def close_pr(self, number: int, *, comment: str | None = None) -> None:
-        """Close an open pull request."""
-        command = [
-            "pr",
-            "close",
-            str(number),
-            "--repo",
-            self.repo,
-        ]
+    def merge_pr(self, number: int, *, comment: str | None = None) -> None:
+        """Merge an open Leader PR into the base branch."""
         if comment:
-            command.extend(["--comment", comment])
-        self.run_gh(command, mutate=True)
+            self.run_gh(
+                [
+                    "pr",
+                    "comment",
+                    str(number),
+                    "--repo",
+                    self.repo,
+                    "--body",
+                    comment,
+                ],
+                mutate=True,
+            )
+        self.run_gh(
+            [
+                "pr",
+                "merge",
+                str(number),
+                "--repo",
+                self.repo,
+                "--merge",
+                "--delete-branch",
+            ],
+            mutate=True,
+        )
 
-    def close_previous_leader_prs(self, *, keep_number: int, trigger_id: str) -> list[int]:
-        """Close other open GAP Leader PRs, keeping the current run's PR open."""
-        closed: list[int] = []
+    def merge_previous_leader_prs(self, *, keep_number: int | None = None) -> list[int]:
+        """Merge open GAP Leader PRs into main so per-run state.json lands on the default branch.
+
+        ``keep_number``, when set, is left open (the current run's Leader PR).
+        """
+        merged: list[int] = []
         for pull in self.list_open_prs_by_label(GAP_LABEL):
             number = int(pull["number"])
-            if number == keep_number:
+            if keep_number is not None and number == keep_number:
                 continue
-            self.close_pr(
+            self.merge_pr(
                 number,
                 comment=(
-                    f"Superseded by Leader PR for trigger `{trigger_id}` "
-                    f"(#{keep_number})."
+                    "Merging this Leader PR so its `GAP Leaders/*/state.json` "
+                    "is retained on the default branch before the next GAP run "
+                    "opens a new Leader PR."
                 ),
             )
-            closed.append(number)
-        return closed
+            merged.append(number)
+            print(f"Merged previous Leader PR #{number} ({pull.get('url')})")
+        return merged
 
     def create_or_update(
         self,
@@ -260,6 +280,12 @@ class LeaderPRManager:
         existing = self.find_open_pr_by_label(trigger_id)
 
         if self.dry_run:
+            if existing is None:
+                for pull in self.list_open_prs_by_label(GAP_LABEL):
+                    print(
+                        f"[dry-run] would merge previous Leader PR "
+                        f"#{pull['number']} ({pull.get('url')})"
+                    )
             # Show the mutating gh commands operators would run locally.
             self.run_gh(
                 [
@@ -283,12 +309,6 @@ class LeaderPRManager:
                 ],
                 mutate=True,
             )
-            if existing is None:
-                for pull in self.list_open_prs_by_label(GAP_LABEL):
-                    print(
-                        f"[dry-run] would close superseded Leader PR "
-                        f"#{pull['number']} ({pull.get('url')})"
-                    )
             return LeaderPRResult(
                 trigger_id=trigger_id,
                 repo=self.repo,
@@ -299,6 +319,11 @@ class LeaderPRManager:
                 updated=existing is not None,
                 dry_run=True,
             )
+
+        # New run: merge prior open Leader PRs first so their state.json
+        # folders are retained on the default branch (#2 + #3).
+        if existing is None:
+            self.merge_previous_leader_prs()
 
         workdir = Path(tempfile.mkdtemp(prefix="gap-leader-"))
         try:
@@ -378,7 +403,6 @@ class LeaderPRManager:
                 )
                 # Create path passes --label; update path must add them explicitly.
                 self.add_labels_to_pr(number, labels)
-                self.close_previous_leader_prs(keep_number=number, trigger_id=trigger_id)
                 return LeaderPRResult(
                     trigger_id=trigger_id,
                     repo=self.repo,
@@ -413,10 +437,6 @@ class LeaderPRManager:
             )
             pr_url = create_out.strip().splitlines()[-1] if create_out else None
             pr_number = _parse_pr_number(pr_url) if pr_url else None
-            if pr_number is not None:
-                self.close_previous_leader_prs(
-                    keep_number=pr_number, trigger_id=trigger_id
-                )
             return LeaderPRResult(
                 trigger_id=trigger_id,
                 repo=self.repo,
