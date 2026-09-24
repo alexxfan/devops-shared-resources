@@ -15,11 +15,15 @@ from lib.git_utils import authenticated_clone_url
 from lib.state_file import (
     DEFAULT_LEADER_REPO,
     PromoterState,
+    find_existing_state_path,
     state_path_for_trigger,
     write_state_file,
 )
 
 GAP_LABEL = "gated-artifacts-promoter"
+# Stable Leader head branch. Prior PR is merged with --delete-branch, then this
+# name is recreated from main for the next run.
+LEADER_BRANCH = "new-gap-leader"
 
 
 class GhCommandError(RuntimeError):
@@ -119,8 +123,9 @@ class LeaderPRManager:
         return (result.stdout or "").strip()
 
     def leader_branch(self, trigger_id: str) -> str:
-        # One Leader PR (and head branch) per trigger ID / workflow run.
-        return f"gap-leader/{trigger_id}"
+        # One reusable head branch; recreated after each merge (--delete-branch).
+        _ = trigger_id
+        return LEADER_BRANCH
 
     def _resolve_token(self) -> str:
         token = (
@@ -268,9 +273,7 @@ class LeaderPRManager:
     ) -> LeaderPRResult:
         """Write state.json and open or update the Leader PR for the trigger."""
         branch = self.leader_branch(trigger_id)
-        state_rel = state_path_for_trigger(trigger_id)
         pr_title = title or f"GAP leader: {trigger_id}"
-        pr_body = body or self._default_body(state, trigger_id=trigger_id)
         # Labels: shared GAP marker + this run's trigger ID.
         # Lookup by trigger ID so each run opens a new Leader PR; only a re-run
         # with the same --trigger-id updates an existing one.
@@ -278,6 +281,7 @@ class LeaderPRManager:
         self.ensure_labels(labels)
 
         existing = self.find_open_pr_by_label(trigger_id)
+        preview_state_rel = state_path_for_trigger(trigger_id)
 
         if self.dry_run:
             if existing is None:
@@ -286,7 +290,9 @@ class LeaderPRManager:
                         f"[dry-run] would merge previous Leader PR "
                         f"#{pull['number']} ({pull.get('url')})"
                     )
-            # Show the mutating gh commands operators would run locally.
+            pr_body = body or self._default_body(
+                state, trigger_id=trigger_id, state_path=preview_state_rel
+            )
             self.run_gh(
                 [
                     "pr",
@@ -313,7 +319,7 @@ class LeaderPRManager:
                 trigger_id=trigger_id,
                 repo=self.repo,
                 branch=branch,
-                state_path=state_rel,
+                state_path=preview_state_rel,
                 pr_url=None,
                 pr_number=None,
                 updated=existing is not None,
@@ -321,7 +327,8 @@ class LeaderPRManager:
             )
 
         # New run: merge prior open Leader PRs first so their state.json
-        # folders are retained on the default branch (#2 + #3).
+        # folders are retained on the default branch. Merge uses
+        # --delete-branch so ``new-gap-leader`` can be recreated from main.
         if existing is None:
             self.merge_previous_leader_prs()
 
@@ -341,12 +348,10 @@ class LeaderPRManager:
                 ],
                 mutate=True,
             )
-            # gh clone leaves a plain https remote; git push needs the token.
             self._configure_origin_auth(workdir, token)
 
             if existing:
                 head = existing.get("headRefName") or branch
-                # Clone is single-branch (main); explicitly fetch the Leader head.
                 self.run_git(
                     ["fetch", "origin", f"+refs/heads/{head}:refs/remotes/origin/{head}"],
                     cwd=workdir,
@@ -358,12 +363,20 @@ class LeaderPRManager:
                     mutate=True,
                 )
                 branch = head
+                state_rel = (
+                    find_existing_state_path(workdir, trigger_id)
+                    or state_path_for_trigger(trigger_id)
+                )
             else:
                 self.run_git(["checkout", "-B", branch], cwd=workdir, mutate=True)
+                state_rel = state_path_for_trigger(trigger_id)
+
+            pr_body = body or self._default_body(
+                state, trigger_id=trigger_id, state_path=state_rel
+            )
 
             write_state_file(workdir / state_rel, state)
             self.run_git(["add", "--", state_rel], cwd=workdir, mutate=True)
-            # Commit only when there is something to commit.
             status = self.run_git(["status", "--porcelain"], cwd=workdir, mutate=False)
             if status:
                 self.run_git(
@@ -387,7 +400,6 @@ class LeaderPRManager:
 
             if existing:
                 number = int(existing["number"])
-                # Prefer REST via `gh api` — `gh pr edit` GraphQL needs read:org.
                 self.run_gh(
                     [
                         "api",
@@ -401,7 +413,6 @@ class LeaderPRManager:
                     ],
                     mutate=True,
                 )
-                # Create path passes --label; update path must add them explicitly.
                 self.add_labels_to_pr(number, labels)
                 return LeaderPRResult(
                     trigger_id=trigger_id,
@@ -450,12 +461,18 @@ class LeaderPRManager:
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
-    def _default_body(self, state: PromoterState, *, trigger_id: str) -> str:
+    def _default_body(
+        self,
+        state: PromoterState,
+        *,
+        trigger_id: str,
+        state_path: str,
+    ) -> str:
         lines = [
             "## Gated Artifacts Promoter leader",
             "",
             f"- Trigger ID: `{trigger_id}`",
-            f"- State file: `{state_path_for_trigger(trigger_id)}`",
+            f"- State file: `{state_path}`",
             "",
             "### Child PRs",
             "",

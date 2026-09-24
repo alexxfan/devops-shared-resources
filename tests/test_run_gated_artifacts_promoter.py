@@ -109,8 +109,8 @@ def test_run_promoter_dry_run(tmp_path: Path) -> None:
     leader.create_or_update.return_value = LeaderPRResult(
         trigger_id="gap-fixed",
         repo="red-hat-data-services/gated-artifacts-promoter",
-        branch="gap-leader/gap-fixed",
-        state_path="GAP Leaders/gap-fixed/state.json",
+        branch="new-gap-leader",
+        state_path="GAP Leaders/2026-09-24T120000Z_gap-fixed/state.json",
         pr_url=None,
         pr_number=None,
         updated=False,
@@ -164,8 +164,8 @@ def test_run_promoter_collects_prs(tmp_path: Path) -> None:
     leader.create_or_update.return_value = LeaderPRResult(
         trigger_id="gap-live",
         repo="red-hat-data-services/gated-artifacts-promoter",
-        branch="gap-leader/gap-live",
-        state_path="GAP Leaders/gap-live/state.json",
+        branch="new-gap-leader",
+        state_path="GAP Leaders/2026-09-24T120000Z_gap-live/state.json",
         pr_url="https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/1",
         pr_number=1,
         updated=False,

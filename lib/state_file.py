@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -127,13 +128,35 @@ class PromoterState:
         return self.pull_requests
 
 
-# Leader-repo directory that holds per-trigger state.json files.
+# Leader-repo directory that holds per-run state.json files.
 STATE_ROOT_DIR = "GAP Leaders"
 
 
-def state_path_for_trigger(trigger_id: str) -> str:
-    """Return the Leader-repo relative path for a trigger's state.json."""
-    return f"{STATE_ROOT_DIR}/{trigger_id}/state.json"
+def state_path_for_trigger(
+    trigger_id: str,
+    *,
+    when: datetime | None = None,
+) -> str:
+    """Return Leader-repo relative path: ``GAP Leaders/<UTC-timestamp>_<trigger-id>/state.json``."""
+    moment = when or datetime.now(timezone.utc)
+    stamp = moment.strftime("%Y-%m-%dT%H%M%SZ")
+    return f"{STATE_ROOT_DIR}/{stamp}_{trigger_id}/state.json"
+
+
+def find_existing_state_path(repo_root: str | Path, trigger_id: str) -> str | None:
+    """Reuse an existing timestamped folder for this trigger ID if present."""
+    root = Path(repo_root) / STATE_ROOT_DIR
+    if not root.is_dir():
+        return None
+    suffix = f"_{trigger_id}"
+    matches = sorted(
+        child.name
+        for child in root.iterdir()
+        if child.is_dir() and child.name.endswith(suffix)
+    )
+    if not matches:
+        return None
+    return f"{STATE_ROOT_DIR}/{matches[-1]}/state.json"
 
 
 def build_state(

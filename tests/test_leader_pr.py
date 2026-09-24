@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-from lib.leader_pr import GAP_LABEL, GhCommandError, LeaderPRManager
+from lib.leader_pr import GAP_LABEL, LEADER_BRANCH, GhCommandError, LeaderPRManager
 from lib.state_file import build_state
 
 
@@ -16,6 +17,13 @@ def _completed(stdout: str = "", returncode: int = 0) -> MagicMock:
     result.stdout = stdout
     result.stderr = ""
     return result
+
+
+def _assert_timestamped_state_path(path: str, trigger_id: str) -> None:
+    assert re.fullmatch(
+        rf"GAP Leaders/\d{{4}}-\d{{2}}-\d{{2}}T\d{{6}}Z_{re.escape(trigger_id)}/state\.json",
+        path,
+    )
 
 
 def test_dry_run_prints_gh_pr_create_dry_run(capsys: pytest.CaptureFixture[str]) -> None:
@@ -40,7 +48,8 @@ def test_dry_run_prints_gh_pr_create_dry_run(capsys: pytest.CaptureFixture[str])
     assert "--dry-run" in captured
     assert result.dry_run is True
     assert result.pr_url is None
-    assert result.state_path == "GAP Leaders/gap-testtrigger001/state.json"
+    assert result.branch == LEADER_BRANCH
+    _assert_timestamped_state_path(result.state_path, "gap-testtrigger001")
     assert any(cmd[:3] == ["gh", "pr", "list"] for cmd in calls)
 
 
@@ -58,7 +67,7 @@ def test_create_leader_pr_via_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
             (dest / ".git").mkdir(exist_ok=True)
             return _completed("")
         if command[0] == "git" and command[1] == "status":
-            return _completed("A  GAP Leaders/gap-testtrigger002/state.json\n")
+            return _completed("A  GAP Leaders/20260924T120000Z_gap-testtrigger002/state.json\n")
         if command[:3] == ["gh", "pr", "create"]:
             return _completed(
                 "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/9\n"
@@ -82,42 +91,30 @@ def test_create_leader_pr_via_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert result.updated is False
     assert result.pr_number == 9
     assert result.pr_url.endswith("/pull/9")
+    assert result.branch == LEADER_BRANCH
+    _assert_timestamped_state_path(result.state_path, "gap-testtrigger002")
 
     create_cmd = next(cmd for cmd, _ in calls if cmd[:3] == ["gh", "pr", "create"])
     assert "--label" in create_cmd
     assert "gap-testtrigger002" in create_cmd
     assert GAP_LABEL in create_cmd
+    assert LEADER_BRANCH in create_cmd
 
 
-def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     calls: list[list[str]] = []
 
     def fake_runner(command: list[str], cwd: Path | None) -> MagicMock:
         calls.append(list(command))
         if command[:3] == ["gh", "pr", "list"]:
-            idx = command.index("--label")
-            label = command[idx + 1]
-            if label == "gap-existing":
-                return _completed(
-                    json.dumps(
-                        [
-                            {
-                                "number": 4,
-                                "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/4",
-                                "headRefName": "gap-leader/gap-existing",
-                                "title": "old",
-                            }
-                        ]
-                    )
-                )
             return _completed(
                 json.dumps(
                     [
                         {
                             "number": 4,
                             "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/4",
-                            "headRefName": "gap-leader/gap-existing",
+                            "headRefName": LEADER_BRANCH,
                             "title": "old",
                         }
                     ]
@@ -128,8 +125,19 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
             dest.mkdir(parents=True, exist_ok=True)
             (dest / ".git").mkdir(exist_ok=True)
             return _completed("")
+        if command[0] == "git" and command[1] == "checkout" and "-B" in command:
+            # Simulate existing timestamped folder on the Leader branch.
+            assert cwd is not None
+            existing = (
+                Path(cwd)
+                / "GAP Leaders"
+                / "20260920T100000Z_gap-existing"
+            )
+            existing.mkdir(parents=True, exist_ok=True)
+            (existing / "state.json").write_text("{}", encoding="utf-8")
+            return _completed("")
         if command[0] == "git" and command[1] == "status":
-            return _completed("M  GAP Leaders/gap-existing/state.json\n")
+            return _completed("M  GAP Leaders/20260920T100000Z_gap-existing/state.json\n")
         return _completed("")
 
     manager = LeaderPRManager(
@@ -140,7 +148,8 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     result = manager.create_or_update(state, trigger_id="gap-existing")
     assert result.updated is True
     assert result.pr_number == 4
-    assert result.branch == "gap-leader/gap-existing"
+    assert result.branch == LEADER_BRANCH
+    assert result.state_path == "GAP Leaders/20260920T100000Z_gap-existing/state.json"
 
     label_cmd = next(
         cmd
@@ -169,7 +178,7 @@ def test_new_trigger_merges_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) 
                             {
                                 "number": 5,
                                 "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/5",
-                                "headRefName": "gap-leader/gap-old",
+                                "headRefName": LEADER_BRANCH,
                                 "title": "old leader",
                             }
                         ]
@@ -180,6 +189,7 @@ def test_new_trigger_merges_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) 
             return _completed("")
         if command[:3] == ["gh", "pr", "merge"]:
             merge_calls.append(list(command))
+            assert "--delete-branch" in command
             return _completed("")
         if command[:3] == ["gh", "repo", "clone"]:
             dest = Path(command[4])
@@ -187,8 +197,9 @@ def test_new_trigger_merges_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) 
             (dest / ".git").mkdir(exist_ok=True)
             return _completed("")
         if command[0] == "git" and command[1] == "status":
-            return _completed("A  GAP Leaders/gap-newrun/state.json\n")
+            return _completed("A  GAP Leaders/new/state.json\n")
         if command[:3] == ["gh", "pr", "create"]:
+            assert LEADER_BRANCH in command
             return _completed(
                 "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/12\n"
             )
@@ -203,7 +214,8 @@ def test_new_trigger_merges_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) 
     assert GAP_LABEL in listed_labels
     assert result.updated is False
     assert result.pr_number == 12
-    assert result.branch == "gap-leader/gap-newrun"
+    assert result.branch == LEADER_BRANCH
+    _assert_timestamped_state_path(result.state_path, "gap-newrun")
     assert any(cmd[3] == "5" and "--merge" in cmd for cmd in merge_calls)
 
 
@@ -221,7 +233,7 @@ def test_update_existing_does_not_merge_current_leader(
                         {
                             "number": 4,
                             "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/4",
-                            "headRefName": "gap-leader/gap-existing",
+                            "headRefName": LEADER_BRANCH,
                             "title": "current",
                         }
                     ]
@@ -235,8 +247,14 @@ def test_update_existing_does_not_merge_current_leader(
             dest.mkdir(parents=True, exist_ok=True)
             (dest / ".git").mkdir(exist_ok=True)
             return _completed("")
+        if command[0] == "git" and command[1] == "checkout" and "-B" in command:
+            assert cwd is not None
+            existing = Path(cwd) / "GAP Leaders" / "20260920T100000Z_gap-existing"
+            existing.mkdir(parents=True, exist_ok=True)
+            (existing / "state.json").write_text("{}", encoding="utf-8")
+            return _completed("")
         if command[0] == "git" and command[1] == "status":
-            return _completed("M  GAP Leaders/gap-existing/state.json\n")
+            return _completed("M  GAP Leaders/20260920T100000Z_gap-existing/state.json\n")
         return _completed("")
 
     manager = LeaderPRManager(
