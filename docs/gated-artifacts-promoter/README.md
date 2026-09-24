@@ -67,7 +67,8 @@ Stdout includes:
 - Per-entry sync messages and child PR URLs
 - Leader PR URL (or dry-run summary)
 
-Leader PR path: `GAP Leaders/<trigger_id>/state.json`
+Leader PR path: `GAP Leaders/<UTC-timestamp>_<trigger-id>/state.json`
+(head branch: `new-gap-leader`)
 
 Stage 1 `state.json` shape ([RHOAIENG-93564](https://redhat.atlassian.net/browse/RHOAIENG-93564)):
 
