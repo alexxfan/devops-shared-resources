@@ -19,7 +19,7 @@ export GITHUB_TOKEN="your-token"   # or SYNC_TOKEN
 export GH_TOKEN="$GITHUB_TOKEN"    # required for Leader PR (gh CLI)
 
 python scripts/run_gated_artifacts_promoter.py \
-  --config /path/to/gated-artifacts-promoter.yaml \
+  --config /path/to/main-stable-source-map.yaml \
   --only kserve \
   --dry-run
 ```
@@ -38,26 +38,24 @@ The orchestrator defaults to `pr-head: source` (main/master → stable) with **n
 
 ## Config
 
-Infra config is the component list. Example:
+Infra config is `src/config/main-stable-source-map.yaml` (mirrors
+`main-release-source-map.yaml`, target `stable`). Example:
 
 ```yaml
 defaults:
+  source-branch: main
   target-branch: stable
   pr-head: source
 
 git:
   - name: kserve
     automerge: "no"
-    repo-url: https://github.com/rhoai-rhtap/kserve.git
-    source-branch: main
-    target-branch: stable
-  - name: needs-tekton-ignore
-    automerge: "no"
-    repo-url: https://github.com/rhoai-rhtap/example.git
-    source-branch: main
-    target-branch: stable
+    repo-url: https://github.com/red-hat-data-services/kserve.git
+    ignore-files: '.tekton/*'
     pr-head: sync-branch
-    ignore-files: .tekton/*
+  - name: odh-dashboard
+    automerge: "no"
+    repo-url: https://github.com/red-hat-data-services/odh-dashboard.git
 ```
 
 ## Outputs

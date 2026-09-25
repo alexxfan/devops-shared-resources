@@ -7,8 +7,8 @@ Python orchestrator and libraries.
 
 | rhods-devops-infra | devops-shared-resources |
 |--------------------|-------------------------|
-| `.github/workflows/gated-artifacts-promoter.yaml` | `scripts/run_gated_artifacts_promoter.py` |
-| `src/config/gated-artifacts-promoter.yaml` | `lib/trigger_id.py`, `lib/state_file.py`, `lib/leader_pr.py` |
+| `.github/workflows/main-stable-pr-creator.yaml` | `scripts/run_gated_artifacts_promoter.py` |
+| `src/config/main-stable-source-map.yaml` | `lib/trigger_id.py`, `lib/state_file.py`, `lib/leader_pr.py` |
 
 ## Workflow contract
 
@@ -21,7 +21,7 @@ export GITHUB_TOKEN="<token>"
 export GH_TOKEN="$GITHUB_TOKEN"
 
 python devops-shared-resources/scripts/run_gated_artifacts_promoter.py \
-  --config src/config/gated-artifacts-promoter.yaml \
+  --config src/config/main-stable-source-map.yaml \
   [--trigger-id "$TRIGGER_ID"] \
   [--only "$ONLY"] \
   [--dry-run]
