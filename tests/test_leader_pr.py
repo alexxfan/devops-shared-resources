@@ -99,6 +99,8 @@ def test_create_leader_pr_via_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert "gap-testtrigger002" in create_cmd
     assert GAP_LABEL in create_cmd
     assert LEADER_BRANCH in create_cmd
+    push_cmd = next(cmd for cmd, _ in calls if cmd[:2] == ["git", "push"])
+    assert "--force" in push_cmd
 
 
 def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -158,6 +160,8 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     )
     assert "labels[]=gap-existing" in label_cmd
     assert f"labels[]={GAP_LABEL}" in label_cmd
+    push_cmd = next(cmd for cmd in calls if cmd[:2] == ["git", "push"])
+    assert "--force" not in push_cmd
 
 
 def test_new_trigger_merges_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -165,8 +169,10 @@ def test_new_trigger_merges_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     listed_labels: list[str] = []
     merge_calls: list[list[str]] = []
+    calls: list[list[str]] = []
 
     def fake_runner(command: list[str], cwd: Path | None) -> MagicMock:
+        calls.append(list(command))
         if command[:3] == ["gh", "pr", "list"]:
             idx = command.index("--label")
             label = command[idx + 1]
@@ -217,6 +223,8 @@ def test_new_trigger_merges_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) 
     assert result.branch == LEADER_BRANCH
     _assert_dated_state_path(result.state_path, "gap-newrun")
     assert any(cmd[3] == "5" and "--merge" in cmd for cmd in merge_calls)
+    push_cmd = next(cmd for cmd in calls if cmd[:2] == ["git", "push"])
+    assert "--force" in push_cmd
 
 
 def test_update_existing_does_not_merge_current_leader(

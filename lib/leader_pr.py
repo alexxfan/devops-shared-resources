@@ -21,8 +21,8 @@ from lib.state_file import (
 )
 
 GAP_LABEL = "gated-artifacts-promoter"
-# Stable Leader head branch. Prior PR is merged with --delete-branch, then this
-# name is recreated from main for the next run.
+# Stable Leader head branch. Recreated from main for each new run (force-push),
+# including when a prior Leader PR was closed without --delete-branch.
 LEADER_BRANCH = "new-gap-leader"
 
 
@@ -328,7 +328,8 @@ class LeaderPRManager:
 
         # New run: merge prior open Leader PRs first so their state.json
         # folders are retained on the default branch. Merge uses
-        # --delete-branch so ``new-gap-leader`` can be recreated from main.
+        # --delete-branch; if the prior PR was only closed, force-push below
+        # still recreates ``new-gap-leader`` from main.
         if existing is None:
             self.merge_previous_leader_prs()
 
@@ -392,11 +393,13 @@ class LeaderPRManager:
                     cwd=workdir,
                     mutate=True,
                 )
-                self.run_git(
-                    ["push", "-u", "origin", "HEAD"],
-                    cwd=workdir,
-                    mutate=True,
-                )
+                # Force-push when opening a new Leader so a leftover
+                # ``new-gap-leader`` (closed PR without branch delete) does not
+                # reject a non-fast-forward push.
+                push_cmd = ["push", "-u", "origin", "HEAD"]
+                if existing is None:
+                    push_cmd.insert(1, "--force")
+                self.run_git(push_cmd, cwd=workdir, mutate=True)
 
             if existing:
                 number = int(existing["number"])
