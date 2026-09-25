@@ -51,8 +51,6 @@ git:
   - name: kserve
     automerge: "no"
     repo-url: https://github.com/red-hat-data-services/kserve.git
-    ignore-files: '.tekton/*'
-    pr-head: sync-branch
   - name: odh-dashboard
     automerge: "no"
     repo-url: https://github.com/red-hat-data-services/odh-dashboard.git
