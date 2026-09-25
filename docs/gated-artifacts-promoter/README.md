@@ -28,7 +28,7 @@ Omit `--trigger-id` to generate one (used in the state path and as a PR label).
 Each new trigger ID **merges** any previously open Leader PR (with
 `--delete-branch`), then recreates the stable head branch `new-gap-leader`
 and opens a **new Leader PR** with a dated state file at
-`GAP Leaders/<UTC-timestamp>_<trigger-id>/state.json`. Child sync PRs are
+`GAP Leaders/<UTC-date>_<trigger-id>/state.json`. Child sync PRs are
 reused via the shared `gated-artifacts-promoter` tracking label.
 
 The orchestrator defaults to `pr-head: source` (main/master → stable) with **no**
@@ -67,7 +67,7 @@ Stdout includes:
 - Per-entry sync messages and child PR URLs
 - Leader PR URL (or dry-run summary)
 
-Leader PR path: `GAP Leaders/<UTC-timestamp>_<trigger-id>/state.json`
+Leader PR path: `GAP Leaders/<UTC-date>_<trigger-id>/state.json`
 (head branch: `new-gap-leader`)
 
 Stage 1 `state.json` shape ([RHOAIENG-93564](https://redhat.atlassian.net/browse/RHOAIENG-93564)):

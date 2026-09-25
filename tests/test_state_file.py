@@ -119,26 +119,26 @@ def test_short_repo_name() -> None:
     assert short_repo_name("repo") == "repo"
 
 
-def test_state_path_for_trigger_is_timestamped() -> None:
+def test_state_path_for_trigger_is_dated() -> None:
     from datetime import datetime, timezone
 
-    from lib.state_file import find_existing_state_path, state_path_for_trigger
+    from lib.state_file import state_path_for_trigger
 
     when = datetime(2026, 9, 24, 14, 55, 32, tzinfo=timezone.utc)
     assert (
         state_path_for_trigger("gap-abc123", when=when)
-        == "GAP Leaders/2026-09-24T145532Z_gap-abc123/state.json"
+        == "GAP Leaders/2026-09-24_gap-abc123/state.json"
     )
 
 
 def test_find_existing_state_path(tmp_path: Path) -> None:
     from lib.state_file import find_existing_state_path
 
-    folder = tmp_path / "GAP Leaders" / "2026-09-20T100000Z_gap-abc123"
+    folder = tmp_path / "GAP Leaders" / "2026-09-20_gap-abc123"
     folder.mkdir(parents=True)
     (folder / "state.json").write_text("{}", encoding="utf-8")
     assert (
         find_existing_state_path(tmp_path, "gap-abc123")
-        == "GAP Leaders/2026-09-20T100000Z_gap-abc123/state.json"
+        == "GAP Leaders/2026-09-20_gap-abc123/state.json"
     )
     assert find_existing_state_path(tmp_path, "gap-other") is None

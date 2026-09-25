@@ -137,14 +137,14 @@ def state_path_for_trigger(
     *,
     when: datetime | None = None,
 ) -> str:
-    """Return Leader-repo relative path: ``GAP Leaders/<UTC-timestamp>_<trigger-id>/state.json``."""
+    """Return Leader-repo relative path: ``GAP Leaders/<UTC-date>_<trigger-id>/state.json``."""
     moment = when or datetime.now(timezone.utc)
-    stamp = moment.strftime("%Y-%m-%dT%H%M%SZ")
+    stamp = moment.strftime("%Y-%m-%d")
     return f"{STATE_ROOT_DIR}/{stamp}_{trigger_id}/state.json"
 
 
 def find_existing_state_path(repo_root: str | Path, trigger_id: str) -> str | None:
-    """Reuse an existing timestamped folder for this trigger ID if present."""
+    """Reuse an existing dated folder for this trigger ID if present."""
     root = Path(repo_root) / STATE_ROOT_DIR
     if not root.is_dir():
         return None

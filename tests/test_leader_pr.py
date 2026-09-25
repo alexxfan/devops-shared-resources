@@ -19,9 +19,9 @@ def _completed(stdout: str = "", returncode: int = 0) -> MagicMock:
     return result
 
 
-def _assert_timestamped_state_path(path: str, trigger_id: str) -> None:
+def _assert_dated_state_path(path: str, trigger_id: str) -> None:
     assert re.fullmatch(
-        rf"GAP Leaders/\d{{4}}-\d{{2}}-\d{{2}}T\d{{6}}Z_{re.escape(trigger_id)}/state\.json",
+        rf"GAP Leaders/\d{{4}}-\d{{2}}-\d{{2}}_{re.escape(trigger_id)}/state\.json",
         path,
     )
 
@@ -49,7 +49,7 @@ def test_dry_run_prints_gh_pr_create_dry_run(capsys: pytest.CaptureFixture[str])
     assert result.dry_run is True
     assert result.pr_url is None
     assert result.branch == LEADER_BRANCH
-    _assert_timestamped_state_path(result.state_path, "gap-testtrigger001")
+    _assert_dated_state_path(result.state_path, "gap-testtrigger001")
     assert any(cmd[:3] == ["gh", "pr", "list"] for cmd in calls)
 
 
@@ -67,7 +67,7 @@ def test_create_leader_pr_via_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
             (dest / ".git").mkdir(exist_ok=True)
             return _completed("")
         if command[0] == "git" and command[1] == "status":
-            return _completed("A  GAP Leaders/20260924T120000Z_gap-testtrigger002/state.json\n")
+            return _completed("A  GAP Leaders/2026-09-24_gap-testtrigger002/state.json\n")
         if command[:3] == ["gh", "pr", "create"]:
             return _completed(
                 "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/9\n"
@@ -92,7 +92,7 @@ def test_create_leader_pr_via_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert result.pr_number == 9
     assert result.pr_url.endswith("/pull/9")
     assert result.branch == LEADER_BRANCH
-    _assert_timestamped_state_path(result.state_path, "gap-testtrigger002")
+    _assert_dated_state_path(result.state_path, "gap-testtrigger002")
 
     create_cmd = next(cmd for cmd, _ in calls if cmd[:3] == ["gh", "pr", "create"])
     assert "--label" in create_cmd
@@ -126,18 +126,18 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
             (dest / ".git").mkdir(exist_ok=True)
             return _completed("")
         if command[0] == "git" and command[1] == "checkout" and "-B" in command:
-            # Simulate existing timestamped folder on the Leader branch.
+            # Simulate existing dated folder on the Leader branch.
             assert cwd is not None
             existing = (
                 Path(cwd)
                 / "GAP Leaders"
-                / "20260920T100000Z_gap-existing"
+                / "2026-09-20_gap-existing"
             )
             existing.mkdir(parents=True, exist_ok=True)
             (existing / "state.json").write_text("{}", encoding="utf-8")
             return _completed("")
         if command[0] == "git" and command[1] == "status":
-            return _completed("M  GAP Leaders/20260920T100000Z_gap-existing/state.json\n")
+            return _completed("M  GAP Leaders/2026-09-20_gap-existing/state.json\n")
         return _completed("")
 
     manager = LeaderPRManager(
@@ -149,7 +149,7 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     assert result.updated is True
     assert result.pr_number == 4
     assert result.branch == LEADER_BRANCH
-    assert result.state_path == "GAP Leaders/20260920T100000Z_gap-existing/state.json"
+    assert result.state_path == "GAP Leaders/2026-09-20_gap-existing/state.json"
 
     label_cmd = next(
         cmd
@@ -215,7 +215,7 @@ def test_new_trigger_merges_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) 
     assert result.updated is False
     assert result.pr_number == 12
     assert result.branch == LEADER_BRANCH
-    _assert_timestamped_state_path(result.state_path, "gap-newrun")
+    _assert_dated_state_path(result.state_path, "gap-newrun")
     assert any(cmd[3] == "5" and "--merge" in cmd for cmd in merge_calls)
 
 
@@ -249,12 +249,12 @@ def test_update_existing_does_not_merge_current_leader(
             return _completed("")
         if command[0] == "git" and command[1] == "checkout" and "-B" in command:
             assert cwd is not None
-            existing = Path(cwd) / "GAP Leaders" / "20260920T100000Z_gap-existing"
+            existing = Path(cwd) / "GAP Leaders" / "2026-09-20_gap-existing"
             existing.mkdir(parents=True, exist_ok=True)
             (existing / "state.json").write_text("{}", encoding="utf-8")
             return _completed("")
         if command[0] == "git" and command[1] == "status":
-            return _completed("M  GAP Leaders/20260920T100000Z_gap-existing/state.json\n")
+            return _completed("M  GAP Leaders/2026-09-20_gap-existing/state.json\n")
         return _completed("")
 
     manager = LeaderPRManager(
