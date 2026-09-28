@@ -68,6 +68,42 @@ class PRCreator:
                 return pull
         return None
 
+    def find_open_pr_by_head(
+        self,
+        repo_url: str,
+        *,
+        head_branch: str,
+        base_branch: str,
+    ) -> dict[str, Any] | None:
+        """Return the open PR for this head→base pair, if any.
+
+        GitHub allows only one open PR per head branch in a repo, so a
+        main→stable sync must update that PR instead of creating another.
+        """
+        owner, repo = parse_github_repo(repo_url)
+        pulls = self._request(
+            "GET",
+            f"/repos/{owner}/{repo}/pulls",
+            params={
+                "state": "open",
+                "base": base_branch,
+                "head": f"{owner}:{head_branch}",
+                "per_page": 10,
+            },
+        )
+        if pulls:
+            return pulls[0]
+        # Fallback without owner prefix (some API contexts).
+        pulls = self._request(
+            "GET",
+            f"/repos/{owner}/{repo}/pulls",
+            params={"state": "open", "base": base_branch, "per_page": 100},
+        )
+        for pull in pulls:
+            if pull.get("head", {}).get("ref") == head_branch:
+                return pull
+        return None
+
     def ensure_delete_branch_on_merge(self, repo_url: str) -> None:
         """Enable repository setting to delete head branches after PR merge."""
         owner, repo = parse_github_repo(repo_url)
@@ -190,8 +226,14 @@ class PRCreator:
         if tracking_label and tracking_label not in labels:
             labels.append(tracking_label)
 
-        existing = None
-        if tracking_label:
+        # Prefer an existing PR with the same head→base (e.g. master→stable).
+        # GitHub rejects a second open PR from the same head (422).
+        existing = self.find_open_pr_by_head(
+            repo_url,
+            head_branch=head_branch,
+            base_branch=base_branch,
+        )
+        if existing is None and tracking_label:
             existing = self.find_open_pr_by_label(
                 repo_url,
                 base_branch=base_branch,
@@ -216,17 +258,44 @@ class PRCreator:
                 updated=True,
             )
 
-        return self.create_pull_request(
-            repo_url,
-            title=title,
-            body=body,
-            head_branch=head_branch,
-            base_branch=base_branch,
-            labels=labels,
-            reviewers=reviewers,
-            automerge=automerge,
-            delete_branch_on_merge=delete_branch_on_merge,
-        )
+        try:
+            return self.create_pull_request(
+                repo_url,
+                title=title,
+                body=body,
+                head_branch=head_branch,
+                base_branch=base_branch,
+                labels=labels,
+                reviewers=reviewers,
+                automerge=automerge,
+                delete_branch_on_merge=delete_branch_on_merge,
+            )
+        except RuntimeError as exc:
+            # Race or missed lookup: reuse the open head→base PR.
+            if "422" not in str(exc) or "already exists" not in str(exc).lower():
+                raise
+            existing = self.find_open_pr_by_head(
+                repo_url,
+                head_branch=head_branch,
+                base_branch=base_branch,
+            )
+            if existing is None:
+                raise
+            number = existing["number"]
+            self.update_pull_request(repo_url, number=number, title=title, body=body)
+            if labels:
+                self.add_labels(repo_url, number=number, labels=labels)
+            if reviewers:
+                self.request_reviewers(repo_url, number=number, reviewers=reviewers)
+            if automerge:
+                self.enable_automerge(repo_url, number=number)
+            return PRResult(
+                number=number,
+                url=existing["html_url"],
+                branch=existing["head"]["ref"],
+                created=False,
+                updated=True,
+            )
 
 
 def format_default_pr_title(
