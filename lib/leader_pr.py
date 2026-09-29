@@ -21,9 +21,7 @@ from lib.state_file import (
 )
 
 GAP_LABEL = "gated-artifacts-promoter"
-# Stable Leader head branch. Recreated from main for each new run (force-push),
-# including when a prior Leader PR was closed without --delete-branch.
-LEADER_BRANCH = "new-gap-leader"
+LEADER_BRANCH_PREFIX = "gap-leader"
 
 
 class GhCommandError(RuntimeError):
@@ -123,9 +121,7 @@ class LeaderPRManager:
         return (result.stdout or "").strip()
 
     def leader_branch(self, trigger_id: str) -> str:
-        # One reusable head branch; recreated after each merge (--delete-branch).
-        _ = trigger_id
-        return LEADER_BRANCH
+        return f"{LEADER_BRANCH_PREFIX}/{trigger_id}"
 
     def _resolve_token(self) -> str:
         token = (
@@ -213,8 +209,8 @@ class LeaderPRManager:
             return []
         return items
 
-    def merge_pr(self, number: int, *, comment: str | None = None) -> None:
-        """Merge an open Leader PR into the base branch."""
+    def close_pr(self, number: int, *, comment: str | None = None) -> None:
+        """Close an open Leader PR and delete its head branch."""
         if comment:
             self.run_gh(
                 [
@@ -231,37 +227,35 @@ class LeaderPRManager:
         self.run_gh(
             [
                 "pr",
-                "merge",
+                "close",
                 str(number),
                 "--repo",
                 self.repo,
-                "--merge",
                 "--delete-branch",
             ],
             mutate=True,
         )
 
-    def merge_previous_leader_prs(self, *, keep_number: int | None = None) -> list[int]:
-        """Merge open GAP Leader PRs into main so per-run state.json lands on the default branch.
+    def close_previous_leader_prs(self, *, keep_number: int | None = None) -> list[int]:
+        """Close superseded GAP Leader PRs.
 
         ``keep_number``, when set, is left open (the current run's Leader PR).
         """
-        merged: list[int] = []
+        closed: list[int] = []
         for pull in self.list_open_prs_by_label(GAP_LABEL):
             number = int(pull["number"])
             if keep_number is not None and number == keep_number:
                 continue
-            self.merge_pr(
+            self.close_pr(
                 number,
                 comment=(
-                    "Merging this Leader PR so its `GAP Leaders/*/state.json` "
-                    "is retained on the default branch before the next GAP run "
-                    "opens a new Leader PR."
+                    "Closing this Leader PR because a newer Gated Artifacts "
+                    "Promoter run is opening a replacement."
                 ),
             )
-            merged.append(number)
-            print(f"Merged previous Leader PR #{number} ({pull.get('url')})")
-        return merged
+            closed.append(number)
+            print(f"Closed previous Leader PR #{number} ({pull.get('url')})")
+        return closed
 
     def create_or_update(
         self,
@@ -287,7 +281,7 @@ class LeaderPRManager:
             if existing is None:
                 for pull in self.list_open_prs_by_label(GAP_LABEL):
                     print(
-                        f"[dry-run] would merge previous Leader PR "
+                        f"[dry-run] would close previous Leader PR "
                         f"#{pull['number']} ({pull.get('url')})"
                     )
             pr_body = body or self._default_body(
@@ -326,12 +320,11 @@ class LeaderPRManager:
                 dry_run=True,
             )
 
-        # New run: merge prior open Leader PRs first so their state.json
-        # folders are retained on the default branch. Merge uses
-        # --delete-branch; if the prior PR was only closed, force-push below
-        # still recreates ``new-gap-leader`` from main.
+        # New run: close prior open Leader PRs before opening the replacement.
+        # Each trigger has a unique head branch, so deleting a prior branch
+        # cannot affect this PR.
         if existing is None:
-            self.merge_previous_leader_prs()
+            self.close_previous_leader_prs()
 
         workdir = Path(tempfile.mkdtemp(prefix="gap-leader-"))
         try:
@@ -393,9 +386,8 @@ class LeaderPRManager:
                     cwd=workdir,
                     mutate=True,
                 )
-                # Force-push when opening a new Leader so a leftover
-                # ``new-gap-leader`` (closed PR without branch delete) does not
-                # reject a non-fast-forward push.
+                # Force-push when opening in case a closed PR left this
+                # trigger's branch behind with stale history.
                 push_cmd = ["push", "-u", "origin", "HEAD"]
                 if existing is None:
                     push_cmd.insert(1, "--force")

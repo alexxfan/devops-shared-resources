@@ -109,13 +109,14 @@ def test_run_promoter_dry_run(tmp_path: Path) -> None:
     leader.create_or_update.return_value = LeaderPRResult(
         trigger_id="gap-fixed",
         repo="red-hat-data-services/gated-artifacts-promoter",
-        branch="new-gap-leader",
+        branch="gap-leader/gap-fixed",
         state_path="GAP Leaders/2026-09-24_gap-fixed/state.json",
         pr_url=None,
         pr_number=None,
         updated=False,
         dry_run=True,
     )
+    progress_messages: list[str] = []
 
     result = run_promoter(
         config_path=config_path,
@@ -124,11 +125,13 @@ def test_run_promoter_dry_run(tmp_path: Path) -> None:
         sync_runner=fake_sync,
         leader_manager=leader,
         token="unused",
+        progress=progress_messages.append,
     )
 
     assert result.trigger_id == "gap-fixed"
     assert len(sync_calls) == 1
     assert sync_calls[0]["pr"]["tracking_label"] == GAP_LABEL
+    assert sync_calls[0]["pr"]["merge_when_ready"] is True
     assert sync_calls[0]["pr"]["head_strategy"] == "source"
     assert sync_calls[0]["pr"]["branch"] is None
     assert sync_calls[0]["ignore_files"] == []
@@ -138,6 +141,19 @@ def test_run_promoter_dry_run(tmp_path: Path) -> None:
     leader.create_or_update.assert_called_once()
     _, kwargs = leader.create_or_update.call_args
     assert kwargs["trigger_id"] == "gap-fixed"
+    assert progress_messages == [
+        "[promoter] Starting trigger gap-fixed: 1 sync entry (dry run)",
+        "[1/1] Processing kserve: "
+        "https://github.com/rhoai-rhtap/kserve.git:main -> "
+        "https://github.com/rhoai-rhtap/kserve.git:stable "
+        "(pr, head=source, automerge=off)",
+        "[1/1] Completed kserve: Dry run: would sync",
+        "[leader] Processing red-hat-data-services/gated-artifacts-promoter "
+        "with 0 child pull requests",
+        "[leader] Completed red-hat-data-services/gated-artifacts-promoter: "
+        "GAP Leaders/2026-09-24_gap-fixed/state.json",
+        "[promoter] Completed trigger gap-fixed: 1 sync entry, 0 child pull requests",
+    ]
 
 
 def test_run_promoter_collects_prs(tmp_path: Path) -> None:
@@ -164,7 +180,7 @@ def test_run_promoter_collects_prs(tmp_path: Path) -> None:
     leader.create_or_update.return_value = LeaderPRResult(
         trigger_id="gap-live",
         repo="red-hat-data-services/gated-artifacts-promoter",
-        branch="new-gap-leader",
+        branch="gap-leader/gap-live",
         state_path="GAP Leaders/2026-09-24_gap-live/state.json",
         pr_url="https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/1",
         pr_number=1,
