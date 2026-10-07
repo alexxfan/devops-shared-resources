@@ -1,9 +1,38 @@
-# GAP PR monitor (RHOAIENG-93565)
+# GAP PR monitor (RHOAIENG-93565, RHOAIENG-97054)
 
-Stage-1 script: read leader `state.json`, classify each child PR, post commit
-statuses via `PRStatusUpdater`, update `pr-status`, write the file back.
+Read leader `state.json`, evaluate each child PR, post commit statuses via
+`PRStatusUpdater`, update `pr-status`, and write the file back.
 
-When every child is Stage-1 terminal, the monitor also sets `overall-status`
+Stage 2 requires two gates before a repository PR can pass:
+
+- every component build selected from that repository's `.tekton` PipelineRuns
+- every job in the main-to-release feasibility workflow
+
+Both gates use the same check-run retrieval and conclusion rules. A missing
+check, a query error, or any completed conclusion other than `success` does
+not pass. Unresolved checks fail six hours after the head commit's committer
+timestamp. A new commit starts a new window; reruns of the same commit do not.
+The build producer defaults to the `konflux-internal-p02` GitHub App
+(`GAP_BUILD_CHECK_APP_SLUG` / `GAP_BUILD_CHECK_APP_ID` select another
+environment). PipelineRun names come from the repository configuration,
+including `{{pull_request_number}}` and component labels that differ from the
+check name.
+
+| Repository PR condition | `pr-status` | Commit status |
+|-------------------------|-------------|---------------|
+| Merge conflict | `merge-failure` | `failure` |
+| Feasibility check failed or timed out | `merge-failure` | `failure` |
+| Any expected component build failed, skipped, or timed out | `build-failure` | `failure` |
+| A required check is queued, running, or missing | `build-pending` | `pending` |
+| No component build is triggered, and feasibility succeeded | `success` | `success` |
+| All expected builds and feasibility jobs succeeded | `success` | `success` |
+| Already merged | `success` | skip post |
+
+A failed repository gate posts a failing promoter status on that PR. Merging
+the leader PR to keep run history does not mark the repository PR successful.
+`builds[].image` is left unchanged; image URIs are not required for the gate.
+
+When every child has a final gate status, the monitor also sets `overall-status`
 and (optionally) posts a green `gated artifacts promoter` status on the
 **Leader PR itself** so auto-merge can preserve run history on `main`
 (RHOAIENG-97052).
@@ -23,29 +52,21 @@ gh pr view <number> -R <owner>/<repo> --json state,mergeable,mergeStateStatus,ur
 
 If `mergeable` is `UNKNOWN` / null (GitHub still computing), the script waits briefly and re-queries once.
 
-## Stage-1 outcomes
-
-| Child PR condition | `pr-status` | Commit status |
-|--------------------|-------------|---------------|
-| Merge conflict (`CONFLICTING` / `DIRTY`) | `merge-failure` | `failure` |
-| Otherwise mergeable | `success` | `success` (dummy green gate) |
-| Already merged | `success` | skip post |
-
-### Overall status (RHOAIENG-97052)
+## Overall status (RHOAIENG-97052)
 
 The monitor **writes** `overall-status` into `state.json` only when **every**
-component PR has reached a Stage-1 final status (`success` or `merge-failure`).
+component PR has a final gate status (`success`, `merge-failure`, or
+`build-failure`). `build-pending` and `new` stay in progress.
 
 | Children | `overall-status` written | Leader auto-merge signal |
 |----------|--------------------------|---------------------------|
-| Any still `new` / non-final | omitted | no |
-| All final, any `merge-failure` | `failure` | no (Stage-1: keep Leader open) |
+| Any still `new` or `build-pending` | omitted | no |
+| All final, any `merge-failure` or `build-failure` | `failure` | no (keep Leader open) |
 | All `success` | `success` | yes — green check on Leader |
 
-For Stage 1, the Leader is auto-merged only when every component PR is a
-**success**.
+The Leader is auto-merged only when every component PR is a **success**.
 
-With `--publish-state`, ordering is: classify children → write `state.json` →
+With `--publish-state`, ordering is: evaluate children → write `state.json` →
 commit/push → then (only if `overall-status` is `success` and a Leader PR URL
 is set via `GAP_LEADER_PR_URL` / `--leader-pr-url`) post
 `gated artifacts promoter` = **success** on the **published** Leader head SHA
@@ -111,10 +132,10 @@ The script resolves `state.json`, updates it, publishes the commit (when
 
 When Actions sets `GITHUB_EVENT_NAME=schedule` (or you pass `--schedule`), the
 **same** script discovers every **open** Leader PR labeled
-`gated-artifacts-promoter`, checks out each head branch, runs
-publish-then-signal for each, and continues on per-Leader errors. The thin
-workflow schedules this hourly (`0 * * * *`). Existing `pull_request` and
-`workflow_dispatch` behavior is unchanged.
+`gated-artifacts-promoter`, checks out each head branch, runs the build and
+feasibility monitor, then publish-then-signal, and continues on per-Leader
+errors. The thin workflow schedules this hourly (`0 * * * *`). Existing
+`pull_request` and `workflow_dispatch` behavior is unchanged.
 
 ```bash
 python scripts/gap_pr_monitor.py --schedule --leader-repo org/gap --dry-run
