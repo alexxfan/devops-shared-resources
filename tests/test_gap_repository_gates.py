@@ -112,6 +112,36 @@ def test_component_label_is_not_used_as_the_check_name() -> None:
     assert checks[0].name_suffix != "odh-core-bff-on-pull-request-2646"
 
 
+REVISION_FALLBACK_PIPELINE = """\
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: odh-praxis-extproc-on-pull-request-{{pull_request_number}}
+  labels:
+    appstudio.openshift.io/component: pull-request-pipelines-odh-praxis-extproc
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[pull_request]"
+    pipelinesascode.tekton.dev/on-target-branch: "[{{target_branch}}]"
+spec:
+  pipelineRef:
+    params:
+    - name: revision
+      value: '{{ cel: pac.target_branch.matches("^rhoai-\\d+\\.\\d+(-ea\\.\\d+)?$") ? pac.target_branch : "main" }}'
+    resolver: git
+"""
+
+
+def test_revision_fallback_cel_does_not_change_the_expected_build() -> None:
+    checks = select_build_checks(
+        [REVISION_FALLBACK_PIPELINE],
+        _context(number=49, base_ref="stable"),
+        app_slug="konflux-internal-p02",
+    )
+    assert len(checks) == 1
+    assert checks[0].name_suffix == "odh-praxis-extproc-on-pull-request-49"
+    assert checks[0].key == "pull-request-pipelines-odh-praxis-extproc"
+
+
 def test_pull_request_number_template_and_stable_names() -> None:
     assert resolved_pipeline_name("odh-core-bff-on-pull-request-{{pull_request_number}}", 2646) == (
         "odh-core-bff-on-pull-request-2646"
@@ -185,13 +215,18 @@ def test_feasibility_requires_every_matrix_job() -> None:
         "main-release-feasibility (rhoai-2.25)",
         "main-release-feasibility (rhoai-3.0)",
     ]
-    runs = [
-        _actions_check(item.name or "", "success" if "3.0" not in (item.name or "") else "failure")
-        for item in expected
-    ]
-    result = evaluate_checks(expected, runs, now=NOW, deadline=revision_deadline(COMMITTER))
-    assert result.outcome == "fail"
-    assert "rhoai-3.0" in result.findings[2].key
+    assert [item.name_suffix for item in expected] == [item.key for item in expected]
+    for check_name in (
+        lambda item: item.name_suffix or "",
+        lambda item: f"Main-to-release feasibility / {item.name_suffix}",
+    ):
+        runs = [
+            _actions_check(check_name(item), "failure" if "3.0" in item.key else "success")
+            for item in expected
+        ]
+        result = evaluate_checks(expected, runs, now=NOW, deadline=revision_deadline(COMMITTER))
+        assert result.outcome == "fail"
+        assert "rhoai-3.0" in result.findings[2].key
 
 
 def test_missing_tekton_directory_is_not_a_query_error() -> None:
@@ -443,6 +478,18 @@ def test_all_current_checks_pass_and_preserve_image_uri(tmp_path: Path) -> None:
     assert any("odh-eval-hub-v3-6" in line for line in result.reports) or result.success_urls
 
 
+def test_bare_feasibility_job_names_pass(tmp_path: Path) -> None:
+    github = _GitHub()
+    github.check_runs = [
+        _build_check("odh-eval-hub-on-pull-request-65317"),
+        *_feasibility_success_payloads(bare=True),
+    ]
+    path = _state(tmp_path, builds=[])
+    result, updater = _run(path, github)
+    assert result.success_urls == [URL]
+    assert updater.posts[0][1] == "success"
+
+
 def test_mixed_component_results_fail_the_repository(tmp_path: Path) -> None:
     github = _GitHub()
     github.tekton["bff.yaml"] = SECOND_PIPELINE
@@ -593,11 +640,19 @@ def test_direct_success_path_is_not_used_for_a_skipped_expected_build(tmp_path: 
     assert result.build_failure_urls == [URL]
 
 
-def _feasibility_success_payloads(*, fail_last: bool = False) -> list[dict[str, Any]]:
+def _feasibility_success_payloads(*, fail_last: bool = False, bare: bool = False) -> list[dict[str, Any]]:
     names = [
-        "Main-to-release feasibility / Select release sync inputs",
-        "Main-to-release feasibility / main-release-feasibility (rhoai-2.25)",
-        "Main-to-release feasibility / main-release-feasibility (rhoai-3.0)",
+        "Select release sync inputs" if bare else "Main-to-release feasibility / Select release sync inputs",
+        (
+            "main-release-feasibility (rhoai-2.25)"
+            if bare
+            else "Main-to-release feasibility / main-release-feasibility (rhoai-2.25)"
+        ),
+        (
+            "main-release-feasibility (rhoai-3.0)"
+            if bare
+            else "Main-to-release feasibility / main-release-feasibility (rhoai-3.0)"
+        ),
     ]
     payloads = []
     for index, name in enumerate(names, start=10):
