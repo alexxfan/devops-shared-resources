@@ -145,6 +145,9 @@ def select_build_checks(
         raw_name = str(metadata.get("generateName") or metadata.get("name") or "").strip()
         if not raw_name:
             raise TriggerParseError("PipelineRun is missing metadata.name")
+        # pipelineRef.revision may be a CEL expression that falls back to main.
+        # That value only chooses the shared pipeline file. The GitHub check
+        # name still comes from metadata.name.
         pipeline_name = resolved_pipeline_name(raw_name, context.number)
         labels = metadata.get("labels") if isinstance(metadata.get("labels"), dict) else {}
         component = str(labels.get(COMPONENT_LABEL) or pipeline_name).strip() or pipeline_name
@@ -183,28 +186,23 @@ def select_feasibility_checks(
     that run becomes its own expected check. When the run has not appeared
     yet, the setup job is still required.
     """
-    setup = ExpectedCheck(
-        key=FEASIBILITY_SETUP_JOB,
-        name=feasibility_check_name(FEASIBILITY_SETUP_JOB),
-        app_slug=app_slug,
-    )
+    setup = _feasibility_expected(FEASIBILITY_SETUP_JOB, app_slug)
     if run.query_error or not run.found or not run.jobs:
         return [setup]
-    checks = [
-        ExpectedCheck(
-            key=job.name,
-            name=feasibility_check_name(job.name),
-            app_slug=app_slug,
-        )
-        for job in run.jobs
-    ]
+    checks = [_feasibility_expected(job.name, app_slug) for job in run.jobs]
     if not any(item.key == FEASIBILITY_SETUP_JOB for item in checks):
         checks.insert(0, setup)
     return checks
 
 
-def feasibility_check_name(job_name: str) -> str:
-    return f"{FEASIBILITY_WORKFLOW_NAME} / {job_name}"
+def _feasibility_expected(job_name: str, app_slug: str) -> ExpectedCheck:
+    """Match a feasibility job whether or not GitHub prefixes the workflow name.
+
+    Check runs are recorded as the job name, for example
+    ``Select release sync inputs``. A name of the form
+    ``Main-to-release feasibility / <job>`` is the same job.
+    """
+    return ExpectedCheck(key=job_name, name_suffix=job_name, app_slug=app_slug)
 
 
 def fetch_tekton_documents(owner: str, repo: str, sha: str, runner: GhRunner) -> list[str]:
