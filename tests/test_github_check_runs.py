@@ -29,7 +29,7 @@ def _run(
     head_sha: str = SHA,
     app_slug: str = "konflux-internal-p02",
     app_id: int = 906404,
-    started_at: str = "2026-10-06T11:00:00Z",
+    started_at: str | None = "2026-10-06T11:00:00Z",
     html_url: str = "https://github.com/example/repo/runs/1",
     details_url: str = "https://konflux.example/ns/rhoai-tenant/pipelinerun/odh-eval-hub-on-pull-request-65317-s8lwr",
     external_id: str = "odh-eval-hub-on-pull-request-65317-s8lwr",
@@ -183,6 +183,31 @@ def test_newest_rerun_wins_over_an_older_result() -> None:
         deadline=NOW + timedelta(hours=1),
     )
     assert passed.outcome == "pass"
+
+
+def test_queued_rerun_without_a_start_time_supersedes_an_older_success() -> None:
+    expected = (_expected(),)
+    committer = datetime(2026, 10, 6, 10, 0, tzinfo=timezone.utc)
+    deadline = revision_deadline(committer)
+    older_success = _run(run_id=10, conclusion="success", started_at="2026-10-06T10:05:00Z")
+    queued = _run(run_id=11, status="queued", conclusion=None, started_at=None)
+    runs = [older_success, queued]
+
+    pending = evaluate_checks(
+        expected,
+        runs,
+        now=committer + timedelta(minutes=30),
+        deadline=deadline,
+    )
+    assert pending.outcome == "pending"
+    assert pending.timed_out is False
+    assert "queued" in pending.findings[0].reason
+
+    expired = evaluate_checks(expected, runs, now=deadline, deadline=deadline)
+    assert expired.outcome == "fail"
+    assert expired.timed_out is True
+    assert "timed out after 6h" in expired.findings[0].reason
+    assert "queued" in expired.findings[0].reason
 
 
 def test_other_revision_and_other_producer_do_not_count() -> None:

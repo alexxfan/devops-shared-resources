@@ -180,13 +180,15 @@ def matches_expected(expected: ExpectedCheck, run: CheckRun) -> bool:
 def latest_matching(expected: ExpectedCheck, runs: Sequence[CheckRun]) -> CheckRun | None:
     """Pick the newest run for this identity.
 
-    An older success must not override a newer rerun, including a rerun that
-    is still unfinished or has failed.
+    GitHub assigns the check-run id when the run is created, including while it
+    is still queued and ``started_at`` is null. An older success must not
+    override a newer rerun, including a rerun that is still unfinished or has
+    failed.
     """
     matches = [run for run in runs if matches_expected(expected, run)]
     if not matches:
         return None
-    return max(matches, key=lambda run: (run.started_at or "", run.id))
+    return max(matches, key=lambda run: run.id)
 
 
 def evaluate_checks(
