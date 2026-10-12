@@ -205,6 +205,8 @@ def _evaluate_feasibility(
             query_error=check_query_error or feasibility.query_error,
             revision=feasibility.head_sha,
         )
+    if not feasibility.found or not feasibility.jobs:
+        return _undiscovered_feasibility(feasibility, now=now, deadline=deadline)
     result = evaluate_checks(
         select_feasibility_checks(feasibility),
         check_runs,
@@ -341,6 +343,36 @@ def _pending_result(builds: GateResult, feasibility: GateResult) -> GateResult:
         timed_out=False,
         link=link,
     )
+
+
+def _undiscovered_feasibility(
+    feasibility: FeasibilityRun,
+    *,
+    now: datetime,
+    deadline: datetime,
+) -> GateResult:
+    """Keep an unknown workflow unresolved until the revision deadline.
+
+    A green setup check cannot stand in for a run or job inventory that has
+    not been discovered. The deadline is the same six-hour revision limit
+    used for other unresolved checks.
+    """
+    if feasibility.found:
+        reason = "feasibility workflow job inventory has not been discovered"
+    else:
+        reason = "feasibility workflow has not been discovered"
+    timed_out = now >= deadline
+    if timed_out:
+        reason = f"timed out after 6h; {reason}"
+    outcome = OUTCOME_FAIL if timed_out else OUTCOME_PENDING
+    finding = CheckFinding(
+        key="main-to-release feasibility",
+        outcome=outcome,
+        reason=reason,
+        revision=feasibility.head_sha,
+        name="Main-to-release feasibility",
+    )
+    return GateResult(outcome=outcome, findings=(finding,), timed_out=timed_out, link=None)
 
 
 def _force(result: GateResult, *, outcome: str, reason: str) -> GateResult:

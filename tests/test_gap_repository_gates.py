@@ -255,6 +255,25 @@ def test_feasibility_requires_every_matrix_job() -> None:
         assert "rhoai-3.0" in result.findings[2].key
 
 
+def test_undiscovered_feasibility_run_does_not_shrink_to_the_setup_job() -> None:
+    missing = FeasibilityRun(
+        found=False,
+        status=None,
+        conclusion=None,
+        head_sha=SHA,
+        jobs=(),
+    )
+    assert select_feasibility_checks(missing) == []
+    empty_inventory = FeasibilityRun(
+        found=True,
+        status="completed",
+        conclusion="success",
+        head_sha=SHA,
+        jobs=(),
+    )
+    assert select_feasibility_checks(empty_inventory) == []
+
+
 def test_missing_tekton_directory_is_not_a_query_error() -> None:
     def runner(args: list[str]) -> str:
         raise GhCommandError(["gh", *args], 1, "HTTP 404: Not Found")
@@ -626,6 +645,54 @@ def test_feasibility_failure_blocks_when_builds_pass(tmp_path: Path) -> None:
     assert updater.posts[0][1] == "failure"
     assert _saved(path)["pull-requests"][0]["pr-status"] == "merge-failure"
     assert any("rhoai-3.0" in line for line in result.reports)
+
+
+def test_undiscovered_feasibility_workflow_stays_unresolved_until_jobs_are_known(
+    tmp_path: Path,
+) -> None:
+    github = _GitHub()
+    github.no_workflow = True
+    github.check_runs = [
+        _build_check("odh-eval-hub-on-pull-request-65317"),
+        _feasibility_success_payloads()[0],
+    ]
+    path = _state(tmp_path, builds=[])
+    result, updater = _run(path, github)
+    assert result.success_urls == []
+    assert result.pending_urls == [URL]
+    assert updater.posts[0][1] == "pending"
+    assert "has not been discovered" in result.reports[0]
+    assert _saved(path)["pull-requests"][0]["pr-status"] == "build-pending"
+
+    expired, updater = _run(path, github, now=COMMITTER + timedelta(hours=6))
+    assert expired.success_urls == []
+    assert expired.merge_failure_urls == [URL]
+    assert updater.posts[0][1] == "failure"
+    assert "timed out after 6h" in expired.reports[0]
+    assert _saved(path)["pull-requests"][0]["pr-status"] == "merge-failure"
+
+    github.no_workflow = False
+    github.jobs[2] = _job("main-release-feasibility (rhoai-3.0)", "failure")
+    github.workflow_conclusion = "failure"
+    github.check_runs = [
+        _build_check("odh-eval-hub-on-pull-request-65317"),
+        *_feasibility_success_payloads(fail_last=True),
+    ]
+    discovered, _updater = _run(path, github)
+    assert discovered.success_urls == []
+    assert discovered.merge_failure_urls == [URL]
+    assert any("rhoai-3.0" in line for line in discovered.reports)
+
+    github.jobs[2] = _job("main-release-feasibility (rhoai-3.0)", "success")
+    github.workflow_conclusion = "success"
+    github.check_runs = [
+        _build_check("odh-eval-hub-on-pull-request-65317"),
+        *_feasibility_success_payloads(),
+    ]
+    passed, updater = _run(path, github)
+    assert passed.success_urls == [URL]
+    assert updater.posts[0][1] == "success"
+    assert _saved(path)["pull-requests"][0]["pr-status"] == "success"
 
 
 def test_pending_feasibility_blocks_a_green_build(tmp_path: Path) -> None:

@@ -180,15 +180,16 @@ def select_feasibility_checks(
     *,
     app_slug: str = FEASIBILITY_APP_SLUG,
 ) -> list[ExpectedCheck]:
-    """Require the setup job and every job in the latest feasibility run.
+    """Require the setup job and every job in a discovered feasibility run.
 
-    One successful release-matrix job is not enough: each job returned for
-    that run becomes its own expected check. When the run has not appeared
-    yet, the setup job is still required.
+    One successful release-matrix job is not enough: each job in that run
+    becomes its own expected check. An undiscovered run, or a run whose job
+    inventory is still empty, does not collapse to the setup job. Callers
+    treat that empty selection as unresolved.
     """
-    setup = _feasibility_expected(FEASIBILITY_SETUP_JOB, app_slug)
     if run.query_error or not run.found or not run.jobs:
-        return [setup]
+        return []
+    setup = _feasibility_expected(FEASIBILITY_SETUP_JOB, app_slug)
     checks = [_feasibility_expected(job.name, app_slug) for job in run.jobs]
     if not any(item.key == FEASIBILITY_SETUP_JOB for item in checks):
         checks.insert(0, setup)
