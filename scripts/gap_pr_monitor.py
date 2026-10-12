@@ -1296,6 +1296,11 @@ def run_monitor(
         dry_run=dry_run,
         continue_on_error=continue_on_error,
         description=description,
+        runner=runner,
+        now=moment,
+        build_app_slug=build_app_slug,
+        build_app_id=build_app_id,
+        retry_unknown=gh_runner is None,
     )
 
 
@@ -1377,6 +1382,60 @@ def _decide_url(
     )
 
 
+def _post_gate_status(
+    updater: PRStatusUpdater,
+    decision: RepositoryGateDecision,
+    description: str | None,
+) -> StatusUpdateResult:
+    """Post one gate decision to the SHA that decision evaluated."""
+    desc = description if description is not None else decision.description
+    return updater.post_status_for_pr(
+        decision.url,
+        decision.cli_status,
+        description=desc,
+        target_url=decision.target_url,
+        head_sha=decision.head_sha,
+        defer_if_head_moved=True,
+    )
+
+
+def _publish_gate_decision(
+    decision: RepositoryGateDecision,
+    *,
+    updater: PRStatusUpdater,
+    description: str | None,
+    runner: Callable[[Sequence[str]], str],
+    now: datetime,
+    build_app_slug: str,
+    build_app_id: int | None,
+    retry_unknown: bool,
+) -> tuple[RepositoryGateDecision | None, StatusUpdateResult | None]:
+    """Publish a decision, or re-evaluate once when the head has moved.
+
+    A second move is left for the next poll. The stale decision is not posted
+    to the untested commit.
+    """
+    if decision.skip_status_post:
+        return decision, None
+    result = _post_gate_status(updater, decision, description)
+    if not result.deferred:
+        return decision, result
+    fresh = _decide_url(
+        decision.url,
+        runner=runner,
+        now=now,
+        build_app_slug=build_app_slug,
+        build_app_id=build_app_id,
+        retry_unknown=retry_unknown,
+    )
+    if fresh.skip_status_post:
+        return fresh, None
+    result = _post_gate_status(updater, fresh, description)
+    if result.deferred:
+        return None, result
+    return fresh, result
+
+
 def _publish_decisions(
     path: Path,
     payload: dict[str, Any],
@@ -1387,6 +1446,11 @@ def _publish_decisions(
     dry_run: bool,
     continue_on_error: bool,
     description: str | None,
+    runner: Callable[[Sequence[str]], str],
+    now: datetime,
+    build_app_slug: str,
+    build_app_id: int | None,
+    retry_unknown: bool,
 ) -> MonitorResult:
     status_updates: dict[str, str] = {}
     updated: list[str] = []
@@ -1398,8 +1462,33 @@ def _publish_decisions(
     reports: list[str] = []
     post_errors: list[tuple[str, str]] = []
 
-    for decision in decisions:
-        url = decision.url
+    for original in decisions:
+        url = original.url
+        try:
+            decision, result = _publish_gate_decision(
+                original,
+                updater=updater,
+                description=description,
+                runner=runner,
+                now=now,
+                build_app_slug=build_app_slug,
+                build_app_id=build_app_id,
+                retry_unknown=retry_unknown,
+            )
+        except (ValueError, RuntimeError, GhCommandError, GapPrMonitorError) as exc:
+            post_errors.append((url, str(exc)))
+            if not continue_on_error:
+                if status_updates and not dry_run:
+                    apply_pr_statuses(payload, status_updates)
+                    apply_overall_status(payload, None)
+                    save_state(path, payload)
+                raise GapPrMonitorError(f"Failed to post status for {url}: {exc}") from exc
+            continue
+        if decision is None:
+            reports.append(f"deferred {url} head changed before status publication")
+            skipped.append(url)
+            continue
+
         status_updates[url] = decision.pr_status
         reports.extend(decision.reports)
         if decision.pr_status == MERGE_FAILURE_PR_STATUS:
@@ -1411,29 +1500,10 @@ def _publish_decisions(
         else:
             successes.append(url)
 
-        if decision.skip_status_post:
+        if decision.skip_status_post or (result is not None and result.skipped):
             skipped.append(url)
-            continue
-        desc = description if description is not None else decision.description
-        try:
-            result: StatusUpdateResult = updater.post_status_for_pr(
-                url,
-                decision.cli_status,
-                description=desc,
-                target_url=decision.target_url,
-            )
-            if result.skipped:
-                skipped.append(url)
-            else:
-                updated.append(url)
-        except (ValueError, RuntimeError, GhCommandError) as exc:
-            post_errors.append((url, str(exc)))
-            if not continue_on_error:
-                if status_updates and not dry_run:
-                    apply_pr_statuses(payload, status_updates)
-                    apply_overall_status(payload, None)
-                    save_state(path, payload)
-                raise GapPrMonitorError(f"Failed to post status for {url}: {exc}") from exc
+        elif result is not None:
+            updated.append(url)
 
     if classify_errors or post_errors:
         if status_updates and not dry_run:

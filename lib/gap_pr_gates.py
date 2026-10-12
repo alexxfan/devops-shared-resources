@@ -59,13 +59,18 @@ class RepositoryPullRequest:
 
 @dataclass(frozen=True)
 class RepositoryGateDecision:
-    """State-file status and commit status for one repository PR."""
+    """State-file status and commit status for one repository PR.
+
+    ``head_sha`` is the revision whose checks were evaluated. The status POST
+    must target that commit.
+    """
 
     url: str
     pr_status: str
     cli_status: str
     description: str
     reason: str
+    head_sha: str
     target_url: str | None = None
     skip_status_post: bool = False
     reports: tuple[str, ...] = ()
@@ -91,6 +96,7 @@ def decide_repository_pr(
             cli_status="success",
             description=_clip(f"{_where(pull_request)} success: PR already merged"),
             reason="already merged",
+            head_sha=pull_request.head_sha,
             skip_status_post=True,
             reports=(f"success {pull_request.url} already merged",),
         )
@@ -253,6 +259,7 @@ def _combine(
             cli_status=decision.cli_status,
             description=decision.description,
             reason=decision.reason,
+            head_sha=decision.head_sha,
             target_url=decision.target_url,
             reports=decision.reports + build_reports,
         )
@@ -315,6 +322,7 @@ def _decision(
         cli_status=cli_status,
         description=description,
         reason=reason,
+        head_sha=pull_request.head_sha,
         target_url=url,
         reports=reports,
     )

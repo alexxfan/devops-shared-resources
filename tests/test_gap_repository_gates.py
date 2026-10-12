@@ -22,7 +22,7 @@ from lib.gap_check_selection import (
 from lib.gap_pr_gates import decide_repository_pr, RepositoryPullRequest
 from lib.github_check_runs import CheckRun, evaluate_checks, revision_deadline
 from lib.github_cli import GhCommandError
-from lib.pr_status_updater import PullRequestRef, StatusUpdateResult
+from lib.pr_status_updater import PRStatusUpdater, PullRequestRef, StatusUpdateResult
 from scripts.gap_pr_monitor import run_monitor
 
 SHA = "a" * 40
@@ -495,6 +495,7 @@ def test_all_current_checks_pass_and_preserve_image_uri(tmp_path: Path) -> None:
     result, updater = _run(path, github)
     assert result.success_urls == [URL]
     assert updater.posts[0][1] == "success"
+    assert updater.posts[0][2]["head_sha"] == SHA
     saved = _saved(path)
     assert saved["pull-requests"][0]["pr-status"] == "success"
     assert saved["pull-requests"][0]["builds"] == [
@@ -832,6 +833,204 @@ def test_decide_repository_pr_reports_component_and_link() -> None:
         build_app_slug="konflux-internal-p02",
     )
     assert decision.pr_status == "build-failure"
+    assert decision.head_sha == SHA
     assert "odh-eval-hub-v3-6" in decision.reason
     assert decision.target_url is not None and "pipelinerun" in decision.target_url
     assert len(decision.description) <= 140
+
+
+class _Cmd:
+    def __init__(self, stdout: str = "") -> None:
+        self.stdout = stdout
+        self.returncode = 0
+        self.stderr = ""
+
+
+def _flag_values(command: list[str]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for index, part in enumerate(command):
+        if part == "-f" and index + 1 < len(command):
+            key, _, value = command[index + 1].partition("=")
+            values[key] = value
+    return values
+
+
+def _passing_check_runs() -> list[dict[str, Any]]:
+    return [
+        _build_check("odh-eval-hub-on-pull-request-65317"),
+        *_feasibility_success_payloads(),
+    ]
+
+
+def _status_updater_factory(runner: Any) -> Any:
+    def factory(*, check_name: str, dry_run: bool = False) -> PRStatusUpdater:
+        return PRStatusUpdater(check_name=check_name, dry_run=dry_run, runner=runner)
+
+    return factory
+
+
+def test_moved_head_is_reevaluated_instead_of_receiving_the_old_success(tmp_path: Path) -> None:
+    github = _GitHub()
+    github.check_runs = _passing_check_runs()
+    posts: list[list[str]] = []
+    head_moved = {"value": False}
+    new_sha = "c" * 40
+
+    def gh_runner(args: list[str]) -> str:
+        if args[0] == "pr" and head_moved["value"]:
+            github.head_sha = new_sha
+        return github(args)
+
+    def updater_runner(command: list[str]) -> _Cmd:
+        if "--method" in command:
+            posts.append(list(command))
+            return _Cmd()
+        path = command[2] if len(command) > 2 else ""
+        if "/pulls/" in path:
+            head_moved["value"] = True
+            return _Cmd(
+                stdout=json.dumps(
+                    {
+                        "sha": new_sha,
+                        "owner": "red-hat-data-services",
+                        "repo": "eval-hub",
+                        "state": "open",
+                    }
+                )
+            )
+        return _Cmd()
+
+    path = _state(tmp_path, builds=[])
+    result = run_monitor(
+        path,
+        updater_factory=_status_updater_factory(updater_runner),
+        gh_runner=gh_runner,
+        now=NOW,
+        build_app_slug="konflux-internal-p02",
+        build_app_id=906404,
+    )
+    assert result.success_urls == []
+    assert result.pending_urls == [URL]
+    assert _saved(path)["pull-requests"][0]["pr-status"] == "build-pending"
+    assert posts
+    posted = [" ".join(command) for command in posts]
+    assert all("state=success" not in command for command in posted)
+    assert any(f"statuses/{new_sha}" in command and "state=pending" in command for command in posted)
+    assert not any(f"statuses/{SHA}" in command and "state=success" in command for command in posted)
+
+
+def test_head_that_moves_again_is_deferred_without_a_success_post(tmp_path: Path) -> None:
+    github = _GitHub()
+    github.check_runs = _passing_check_runs()
+    posts: list[list[str]] = []
+    views = {"n": 0}
+    pulls = {"n": 0}
+    new_sha = "c" * 40
+    later_sha = "d" * 40
+
+    def gh_runner(args: list[str]) -> str:
+        if args[0] == "pr":
+            views["n"] += 1
+            if views["n"] > 1:
+                github.head_sha = new_sha
+        return github(args)
+
+    def updater_runner(command: list[str]) -> _Cmd:
+        if "--method" in command:
+            posts.append(list(command))
+            return _Cmd()
+        path = command[2] if len(command) > 2 else ""
+        if "/pulls/" in path:
+            pulls["n"] += 1
+            sha = new_sha if pulls["n"] == 1 else later_sha
+            return _Cmd(
+                stdout=json.dumps(
+                    {
+                        "sha": sha,
+                        "owner": "red-hat-data-services",
+                        "repo": "eval-hub",
+                        "state": "open",
+                    }
+                )
+            )
+        return _Cmd()
+
+    path = _state(tmp_path, builds=[])
+    result = run_monitor(
+        path,
+        updater_factory=_status_updater_factory(updater_runner),
+        gh_runner=gh_runner,
+        now=NOW,
+        build_app_slug="konflux-internal-p02",
+        build_app_id=906404,
+    )
+    assert posts == []
+    assert result.success_urls == []
+    assert _saved(path)["pull-requests"][0]["pr-status"] == "new"
+    assert URL in result.skipped_urls
+    assert any("deferred" in line and URL in line for line in result.reports)
+
+
+def test_current_head_is_published_and_an_unchanged_status_is_skipped(tmp_path: Path) -> None:
+    github = _GitHub()
+    github.check_runs = _passing_check_runs()
+    posts: list[list[str]] = []
+    published: dict[str, str] = {}
+
+    def updater_runner(command: list[str]) -> _Cmd:
+        if "--method" in command:
+            posts.append(list(command))
+            published.update(_flag_values(command))
+            return _Cmd()
+        path = command[2] if len(command) > 2 else ""
+        if "/pulls/" in path:
+            return _Cmd(
+                stdout=json.dumps(
+                    {
+                        "sha": SHA,
+                        "owner": "red-hat-data-services",
+                        "repo": "eval-hub",
+                        "state": "open",
+                    }
+                )
+            )
+        if path.endswith("/statuses") and published:
+            return _Cmd(
+                stdout=json.dumps(
+                    {
+                        "state": published["state"],
+                        "description": published.get("description"),
+                        "target_url": published.get("target_url"),
+                    }
+                )
+            )
+        return _Cmd()
+
+    path = _state(tmp_path, builds=[])
+    first = run_monitor(
+        path,
+        updater_factory=_status_updater_factory(updater_runner),
+        gh_runner=github,
+        now=NOW,
+        build_app_slug="konflux-internal-p02",
+        build_app_id=906404,
+    )
+    assert first.success_urls == [URL]
+    assert first.updated_urls == [URL]
+    assert len(posts) == 1
+    posted = " ".join(posts[0])
+    assert f"statuses/{SHA}" in posted
+    assert "state=success" in posted
+
+    second = run_monitor(
+        path,
+        updater_factory=_status_updater_factory(updater_runner),
+        gh_runner=github,
+        now=NOW,
+        build_app_slug="konflux-internal-p02",
+        build_app_id=906404,
+    )
+    assert second.success_urls == [URL]
+    assert second.skipped_urls == [URL]
+    assert second.updated_urls == []
+    assert len(posts) == 1
