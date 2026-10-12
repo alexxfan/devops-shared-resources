@@ -427,6 +427,12 @@ class _GitHub:
         ]
         self.fail_checks = False
         self.head_sha = SHA
+        self.committer_date = "2026-10-06T10:00:00Z"
+        self.author_date = "2026-10-06T10:00:00Z"
+        self.commit_shas: list[str] = []
+        self.commit_endpoints: list[str] = []
+        self.pr_views: list[list[str]] = []
+        self.hide_head_commit = False
         self.state = "OPEN"
         self.mergeable = "MERGEABLE"
         self.merge_state = "CLEAN"
@@ -434,6 +440,7 @@ class _GitHub:
 
     def __call__(self, args: list[str]) -> str:
         if args[0] == "pr":
+            self.pr_views.append(list(args))
             return json.dumps(
                 {
                     "state": self.state,
@@ -442,7 +449,7 @@ class _GitHub:
                     "baseRefName": "stable",
                     "headRefOid": self.head_sha,
                     "labels": [],
-                    "commits": [{"oid": self.head_sha, "committedDate": "2026-10-06T10:00:00Z"}],
+                    "commits": self._listed_commits(),
                     "url": URL,
                 }
             )
@@ -451,6 +458,19 @@ class _GitHub:
             if self.fail_checks:
                 raise GhCommandError(["gh", *args], 1, "check API unavailable")
             return json.dumps({"total_count": len(self.check_runs), "check_runs": self.check_runs})
+        if "/commits/" in endpoint and "check-runs" not in endpoint and "/statuses" not in endpoint:
+            sha = endpoint.split("/commits/", 1)[1].split("?", 1)[0].split("/", 1)[0]
+            self.commit_shas.append(sha)
+            self.commit_endpoints.append(endpoint)
+            return json.dumps(
+                {
+                    "sha": sha,
+                    "commit": {
+                        "author": {"date": self.author_date},
+                        "committer": {"date": self.committer_date},
+                    },
+                }
+            )
         if "/pulls/" in endpoint and "/files" in endpoint:
             return json.dumps([{"filename": name} for name in self.files])
         if "contents/.tekton/" in endpoint:
@@ -482,6 +502,14 @@ class _GitHub:
                 }
             )
         raise AssertionError(args)
+
+    def _listed_commits(self) -> list[dict[str, str]]:
+        if not self.hide_head_commit:
+            return [{"oid": self.head_sha, "committedDate": self.committer_date}]
+        return [
+            {"oid": f"{index:040x}", "committedDate": self.author_date}
+            for index in range(100)
+        ]
 
 
 def _job(name: str, conclusion: str, status: str = "completed") -> dict[str, str]:
@@ -842,18 +870,11 @@ def test_unfinished_workflow_uses_the_revision_deadline(tmp_path: Path) -> None:
 
     new_sha = "c" * 40
     github.head_sha = new_sha
+    github.committer_date = "2026-10-06T16:00:00Z"
     for payload in github.check_runs:
         payload["head_sha"] = new_sha
     for job in github.jobs:
         job["head_sha"] = new_sha
-
-    def view(args: list[str]) -> str:
-        if args[0] == "pr":
-            body = json.loads(github(args))
-            body["headRefOid"] = new_sha
-            body["commits"] = [{"oid": new_sha, "committedDate": "2026-10-06T16:00:00Z"}]
-            return json.dumps(body)
-        return github(args)
 
     holder: dict[str, _Updater] = {}
 
@@ -864,7 +885,7 @@ def test_unfinished_workflow_uses_the_revision_deadline(tmp_path: Path) -> None:
     refreshed = run_monitor(
         path,
         updater_factory=factory,
-        gh_runner=view,
+        gh_runner=github,
         now=datetime(2026, 10, 6, 16, 30, tzinfo=timezone.utc),
         build_app_slug="konflux-internal-p02",
         build_app_id=906404,
@@ -876,7 +897,7 @@ def test_unfinished_workflow_uses_the_revision_deadline(tmp_path: Path) -> None:
     refreshed_deadline = run_monitor(
         path,
         updater_factory=factory,
-        gh_runner=view,
+        gh_runner=github,
         now=datetime(2026, 10, 6, 22, 0, tzinfo=timezone.utc),
         build_app_slug="konflux-internal-p02",
         build_app_id=906404,
@@ -1012,18 +1033,11 @@ def test_new_commit_starts_a_new_six_hour_window(tmp_path: Path) -> None:
     assert expired.build_failure_urls == [URL]
 
     github.head_sha = "c" * 40
+    github.committer_date = "2026-10-06T16:00:00Z"
     for payload in github.check_runs:
         payload["head_sha"] = github.head_sha
     for job in github.jobs:
         job["head_sha"] = github.head_sha
-
-    def view(args: list[str]) -> str:
-        if args[0] == "pr":
-            body = json.loads(_GitHub.__call__(github, args))
-            body["commits"] = [{"oid": github.head_sha, "committedDate": "2026-10-06T16:00:00Z"}]
-            body["headRefOid"] = github.head_sha
-            return json.dumps(body)
-        return _GitHub.__call__(github, args)
 
     holder: dict[str, _Updater] = {}
 
@@ -1034,13 +1048,51 @@ def test_new_commit_starts_a_new_six_hour_window(tmp_path: Path) -> None:
     refreshed = run_monitor(
         path,
         updater_factory=factory,
-        gh_runner=view,
+        gh_runner=github,
         now=datetime(2026, 10, 6, 16, 30, tzinfo=timezone.utc),
         build_app_slug="konflux-internal-p02",
         build_app_id=906404,
     )
     assert refreshed.pending_urls == [URL]
     assert _saved(path)["pull-requests"][0]["pr-status"] == "build-pending"
+
+
+def test_truncated_commit_list_uses_the_captured_head_sha(tmp_path: Path) -> None:
+    github = _GitHub()
+    github.hide_head_commit = True
+    github.author_date = "2026-10-06T08:00:00Z"
+    github.committer_date = "2026-10-06T10:00:00Z"
+    github.check_runs = [*_feasibility_success_payloads()]
+    path = _state(tmp_path, builds=[])
+    listed = github._listed_commits()
+    assert len(listed) == 100
+    assert SHA not in {item["oid"] for item in listed}
+
+    pending, _updater = _run(
+        path,
+        github,
+        now=datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc),
+    )
+    assert pending.pending_urls == [URL]
+    assert pending.build_failure_urls == []
+    assert pending.merge_failure_urls == []
+    assert github.pr_views
+    assert github.commit_endpoints == [f"repos/red-hat-data-services/eval-hub/commits/{SHA}"]
+    assert all("commits" not in fields for view in github.pr_views for fields in view)
+
+    expired, _updater = _run(
+        path,
+        github,
+        now=datetime(2026, 10, 6, 16, 0, tzinfo=timezone.utc),
+    )
+    assert expired.build_failure_urls == [URL]
+    assert expired.pending_urls == []
+    assert "timed out after 6h" in expired.reports[0]
+    assert github.commit_shas == [SHA, SHA]
+    assert github.commit_endpoints == [
+        f"repos/red-hat-data-services/eval-hub/commits/{SHA}",
+        f"repos/red-hat-data-services/eval-hub/commits/{SHA}",
+    ]
 
 
 def test_decide_repository_pr_reports_component_and_link() -> None:

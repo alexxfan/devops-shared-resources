@@ -53,7 +53,7 @@ from lib.gap_pr_gates import (
     RepositoryPullRequest,
     decide_repository_pr,
 )
-from lib.github_check_runs import CheckQueryError, list_check_runs
+from lib.github_check_runs import CheckQueryError, github_api_json, list_check_runs
 from lib.pr_status_updater import (
     GhCommandError,
     PRStatusUpdater,
@@ -1162,7 +1162,7 @@ def fetch_repository_pull_request(
     base_ref = str(data.get("baseRefName") or "").strip()
     if not head_sha or not base_ref:
         raise GapPrMonitorError(f"Could not resolve head SHA or base branch for {pr_url}.")
-    committer_at = _head_committer_at(data.get("commits"), head_sha, pr_url)
+    committer_at = _head_committer_at(pr.owner, pr.repo, head_sha, pr_url, runner)
     merge_state = data.get("mergeStateStatus")
     return RepositoryPullRequest(
         url=pr_url,
@@ -1193,7 +1193,7 @@ def _load_pr_view(
             "-R",
             pr.slug,
             "--json",
-            "state,mergeable,mergeStateStatus,baseRefName,headRefOid,labels,commits,url",
+            "state,mergeable,mergeStateStatus,baseRefName,headRefOid,labels,url",
         ]
     )
     try:
@@ -1205,26 +1205,45 @@ def _load_pr_view(
     return data
 
 
-def _head_committer_at(commits: Any, head_sha: str, pr_url: str) -> datetime:
-    if not isinstance(commits, list):
-        raise GapPrMonitorError(f"Could not read head commit timestamp for {pr_url}.")
-    for commit in commits:
-        if not isinstance(commit, dict):
-            continue
-        if str(commit.get("oid") or "") != head_sha:
-            continue
-        raw = commit.get("committedDate")
-        if not raw:
-            break
-        try:
-            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise GapPrMonitorError(
-                f"Invalid head commit timestamp for {pr_url}: {raw}"
-            ) from exc
-    raise GapPrMonitorError(
-        f"Head commit {head_sha} has no committer timestamp on {pr_url}."
-    )
+def _head_committer_at(
+    owner: str,
+    repo: str,
+    head_sha: str,
+    pr_url: str,
+    runner: Callable[[Sequence[str]], str],
+) -> datetime:
+    """Return the committer timestamp of the already captured head SHA.
+
+    ``gh pr view`` only returns the first 100 commits, so a long pull request
+    can omit its head. The commit API addresses that SHA directly.
+    """
+    endpoint = f"repos/{owner}/{repo}/commits/{head_sha}"
+    try:
+        payload = github_api_json(runner, endpoint)
+    except (GhCommandError, CheckQueryError) as exc:
+        raise GapPrMonitorError(
+            f"Could not read head commit {head_sha} on {pr_url}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise GapPrMonitorError(f"Could not read head commit {head_sha} on {pr_url}.")
+    returned = str(payload.get("sha") or "")
+    if returned and returned != head_sha:
+        raise GapPrMonitorError(
+            f"Head commit lookup for {head_sha} returned {returned} on {pr_url}."
+        )
+    commit = payload.get("commit") if isinstance(payload.get("commit"), dict) else {}
+    committer = commit.get("committer") if isinstance(commit.get("committer"), dict) else {}
+    raw = committer.get("date")
+    if not raw:
+        raise GapPrMonitorError(
+            f"Head commit {head_sha} has no committer timestamp on {pr_url}."
+        )
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise GapPrMonitorError(
+            f"Invalid head commit timestamp for {pr_url}: {raw}"
+        ) from exc
 
 
 def _label_names(labels: Any) -> frozenset[str]:
