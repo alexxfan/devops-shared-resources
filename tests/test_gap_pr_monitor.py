@@ -27,11 +27,13 @@ from scripts.gap_pr_monitor import (
     extract_pr_urls,
     extract_trigger_id_from_labels,
     fetch_pr_merge_info,
+    LATEST_LEADER_PR_SENTINEL,
     list_open_leader_prs,
     load_state,
     main,
     publish_state,
     resolve_inputs_for_cli,
+    resolve_leader_pr_url_input,
     resolve_leader_repo,
     resolve_state_file,
     run_monitor_publish_and_signal,
@@ -1491,6 +1493,54 @@ def test_list_open_leader_prs_parses_gh_json() -> None:
     )
 
 
+def test_resolve_leader_pr_url_input_passes_through_url() -> None:
+    url = "https://github.com/org/gap/pull/99"
+    assert (
+        resolve_leader_pr_url_input(
+            url,
+            leader_repo="org/gap",
+            gh_runner=lambda args: "[]",
+        )
+        == url
+    )
+
+
+def test_resolve_leader_pr_url_input_latest_picks_highest_number() -> None:
+    payload = [
+        {
+            "number": 12,
+            "url": "https://github.com/org/gap/pull/12",
+            "headRefName": "leader-old",
+            "labels": [{"name": "gated-artifacts-promoter"}],
+        },
+        {
+            "number": 40,
+            "url": "https://github.com/org/gap/pull/40",
+            "headRefName": "leader-new",
+            "labels": [{"name": "gated-artifacts-promoter"}],
+        },
+    ]
+
+    def fake_gh(args: list[str]) -> str:
+        return json.dumps(payload)
+
+    resolved = resolve_leader_pr_url_input(
+        LATEST_LEADER_PR_SENTINEL,
+        leader_repo="org/gap",
+        gh_runner=fake_gh,
+    )
+    assert resolved == "https://github.com/org/gap/pull/40"
+
+
+def test_resolve_leader_pr_url_input_latest_errors_when_none_open() -> None:
+    with pytest.raises(GapPrMonitorError, match="No open Leader PRs"):
+        resolve_leader_pr_url_input(
+            "latest_leader_pr",
+            leader_repo="org/gap",
+            gh_runner=lambda args: "[]",
+        )
+
+
 def test_should_run_schedule_mode_from_flag_and_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1661,6 +1711,50 @@ def test_publish_state_returns_sha_without_empty_commit(
     assert not any(c[:1] == ["commit"] for c in calls)
 
 
+def test_push_head_with_rebase_retries_after_rejection(tmp_path: Path) -> None:
+    from scripts.gap_pr_monitor import _push_head_with_rebase
+
+    calls: list[list[str]] = []
+    push_attempts = [0]
+
+    def fake_git(args, cwd=None):
+        calls.append(list(args))
+        if args[:1] == ["push"]:
+            push_attempts[0] += 1
+            if push_attempts[0] == 1:
+                raise GapPrMonitorError(
+                    "git push failed (1): rejected; fetch first"
+                )
+            return ""
+        return ""
+
+    _push_head_with_rebase(
+        tmp_path,
+        "gap-leader/gap-abc",
+        git_runner=fake_git,
+    )
+    assert push_attempts[0] == 2
+    assert ["fetch", "origin", "gap-leader/gap-abc"] in calls
+    assert ["pull", "--rebase", "origin", "gap-leader/gap-abc"] in calls
+
+
+def test_push_head_with_rebase_raises_after_max_attempts(tmp_path: Path) -> None:
+    from scripts.gap_pr_monitor import _push_head_with_rebase
+
+    def fake_git(args, cwd=None):
+        if args[:1] == ["push"]:
+            raise GapPrMonitorError("git push failed (1): rejected")
+        return ""
+
+    with pytest.raises(GapPrMonitorError, match="rejected"):
+        _push_head_with_rebase(
+            tmp_path,
+            "leader-branch",
+            git_runner=fake_git,
+            max_attempts=2,
+        )
+
+
 def test_publish_state_commits_when_staged(
     tmp_path: Path,
 ) -> None:
@@ -1674,6 +1768,10 @@ def test_publish_state_commits_when_staged(
             return "state.json"
         if args[:2] == ["rev-parse", "HEAD"]:
             return "new-sha"
+        if args[:1] == ["fetch"]:
+            return ""
+        if args[:1] == ["push"]:
+            return ""
         return ""
 
     published = publish_state(
@@ -1686,6 +1784,7 @@ def test_publish_state_commits_when_staged(
     assert published.committed is True
     assert any(c[:1] == ["commit"] for c in calls)
     assert any(c[:1] == ["push"] for c in calls)
+    assert any(c[:1] == ["fetch"] for c in calls)
 
 
 def test_verify_leader_head_rejects_moved_sha() -> None:

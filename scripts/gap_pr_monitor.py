@@ -51,6 +51,8 @@ from lib.state_file import (
 
 DEFAULT_CHECK_NAME = "gated artifacts promoter"
 DEFAULT_LEADER_LABEL = "gated-artifacts-promoter"
+# workflow_dispatch may pass this instead of a concrete Leader PR URL.
+LATEST_LEADER_PR_SENTINEL = "LATEST_LEADER_PR"
 SUCCESS_PR_STATUS = "success"
 MERGE_FAILURE_PR_STATUS = "merge-failure"
 # Child statuses that mean Stage-1 classification is done for that PR.
@@ -618,6 +620,54 @@ def _run_git(args: Sequence[str], *, cwd: Path) -> str:
     return (completed.stdout or "").strip()
 
 
+def _is_push_rejection(message: str) -> bool:
+    """True when ``git push`` failed because the remote branch moved."""
+    lower = message.lower()
+    return (
+        "rejected" in lower
+        or "non-fast-forward" in lower
+        or "fetch first" in lower
+    )
+
+
+def _push_head_with_rebase(
+    repo_root: Path,
+    head_ref: str,
+    *,
+    remote: str = "origin",
+    git_runner: Callable[..., str],
+    max_attempts: int = 3,
+) -> None:
+    """Push ``HEAD`` to ``head_ref``, rebasing onto the remote tip between attempts."""
+    refspec = f"HEAD:{head_ref}"
+    last_error = ""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            git_runner(["fetch", remote, head_ref], cwd=repo_root)
+        except GapPrMonitorError as exc:
+            raise GapPrMonitorError(
+                f"Could not fetch {remote}/{head_ref} before state publish: {exc}"
+            ) from exc
+        try:
+            git_runner(["push", remote, refspec], cwd=repo_root)
+            return
+        except GapPrMonitorError as exc:
+            last_error = str(exc)
+            if attempt >= max_attempts or not _is_push_rejection(last_error):
+                raise
+            try:
+                git_runner(
+                    ["pull", "--rebase", remote, head_ref],
+                    cwd=repo_root,
+                )
+            except GapPrMonitorError as rebase_exc:
+                raise GapPrMonitorError(
+                    f"State publish push was rejected and rebase failed "
+                    f"({last_error}): {rebase_exc}"
+                ) from rebase_exc
+    raise GapPrMonitorError(last_error or "State publish push failed.")
+
+
 def list_open_leader_prs(
     leader_repo: str,
     *,
@@ -732,7 +782,12 @@ def publish_state(
     if staged.strip():
         run(["commit", "-m", commit_message], cwd=repo_root)
         committed = True
-        run(["push", remote, f"HEAD:{head_ref}"], cwd=repo_root)
+        _push_head_with_rebase(
+            repo_root,
+            head_ref,
+            remote=remote,
+            git_runner=run,
+        )
         print(f"Pushed state update for Leader branch {head_ref}")
     else:
         print(f"No state file changes to commit for {head_ref}.")
@@ -998,6 +1053,45 @@ def should_run_schedule_mode(*, schedule_flag: bool) -> bool:
     return os.environ.get("GITHUB_EVENT_NAME", "").strip() == "schedule"
 
 
+def is_latest_leader_pr_sentinel(value: str | None) -> bool:
+    """True when the caller wants the newest open Leader PR discovered via gh."""
+    return (value or "").strip().upper() == LATEST_LEADER_PR_SENTINEL
+
+
+def resolve_leader_pr_url_input(
+    leader_pr_url: str | None,
+    *,
+    leader_repo: str,
+    label: str = DEFAULT_LEADER_LABEL,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> str | None:
+    """Return a concrete Leader PR URL, resolving ``LATEST_LEADER_PR`` when set."""
+    raw = (leader_pr_url or "").strip()
+    if not raw:
+        return None
+    if not is_latest_leader_pr_sentinel(raw):
+        return raw
+
+    leaders = list_open_leader_prs(leader_repo, label=label, gh_runner=gh_runner)
+    if not leaders:
+        raise GapPrMonitorError(
+            f"No open Leader PRs with label {label!r} in {leader_repo}; "
+            f"cannot resolve {LATEST_LEADER_PR_SENTINEL}."
+        )
+    chosen = max(leaders, key=lambda leader: leader.number)
+    if len(leaders) > 1:
+        print(
+            f"WARNING: {len(leaders)} open Leader PR(s); "
+            f"{LATEST_LEADER_PR_SENTINEL} selected #{chosen.number} {chosen.url}",
+            file=sys.stderr,
+        )
+    print(
+        f"Resolved {LATEST_LEADER_PR_SENTINEL} to Leader "
+        f"#{chosen.number} {chosen.url}"
+    )
+    return chosen.url
+
+
 def resolve_leader_repo(explicit: str | None) -> str:
     """Resolve OWNER/REPO for Leader discovery (CLI, GAP_LEADER_REPO, GITHUB_REPOSITORY)."""
     for candidate in (
@@ -1062,9 +1156,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="URL",
         help=(
-            "Leader PR URL. With --publish-state, after the state commit is "
-            "pushed and overall-status is success, post a green "
-            f"{DEFAULT_CHECK_NAME!r} status on the published SHA "
+            "Leader PR URL, or "
+            f"{LATEST_LEADER_PR_SENTINEL} to discover the newest open Leader "
+            f"labeled {DEFAULT_LEADER_LABEL!r}. With --publish-state, after "
+            "the state commit is pushed and overall-status is success, post a "
+            f"green {DEFAULT_CHECK_NAME!r} status on the published SHA "
             f"(RHOAIENG-97052). Also accepted via {ENV_LEADER_PR_URL}."
         ),
     )
@@ -1161,7 +1257,19 @@ def main(argv: list[str] | None = None) -> int:
         labels=args.labels,
         leader_pr_url=args.leader_pr_url,
     )
+    leader_label = (
+        (args.leader_label or "").strip()
+        or _env_nonempty(ENV_LEADER_LABEL)
+        or DEFAULT_LEADER_LABEL
+    )
     try:
+        if leader_pr_url and is_latest_leader_pr_sentinel(leader_pr_url):
+            leader_repo = resolve_leader_repo(args.leader_repo)
+            leader_pr_url = resolve_leader_pr_url_input(
+                leader_pr_url,
+                leader_repo=leader_repo,
+                label=leader_label,
+            )
         state_path = resolve_state_file(
             state_file=state_file,
             trigger_id=trigger_id,

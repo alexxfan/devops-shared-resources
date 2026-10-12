@@ -51,6 +51,10 @@ is set via `GAP_LEADER_PR_URL` / `--leader-pr-url`) post
 `gated artifacts promoter` = **success** on the **published** Leader head SHA
 so auto-merge cannot race ahead of the state commit.
 
+If another workflow run updated the same Leader branch, publish fetches the
+remote tip, retries `git push` with `pull --rebase` between attempts (up to
+three), instead of failing the job on a non-fast-forward push.
+
 Example after all children succeed:
 
 ```json
@@ -97,7 +101,7 @@ The workflow passes GitHub context via env vars (no resolution logic in YAML):
 | `GAP_PR_LABELS` | Leader PR labels (comma-separated) |
 | `GAP_LEADER_REPO` | Optional override for schedule discovery (default: `GITHUB_REPOSITORY`) |
 | `GAP_LEADER_LABEL` | Optional Leader label for schedule discovery (default: `gated-artifacts-promoter`) |
-| `GAP_LEADER_PR_URL` | Leader PR HTML URL (e.g. `github.event.pull_request.html_url`) |
+| `GAP_LEADER_PR_URL` | Leader PR HTML URL, or `LATEST_LEADER_PR` on `workflow_dispatch` |
 
 The script resolves `state.json`, updates it, publishes the commit (when
 `--publish-state`), and writes `state_path=`, `overall_status=`, and
