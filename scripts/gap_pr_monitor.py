@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Stage-1 GAP PR monitor (RHOAIENG-93565).
+"""GAP PR monitor (RHOAIENG-93565, RHOAIENG-97054).
 
-Read leader state.json → classify each child PR (merge-failure vs success) →
-post the matching commit status via PRStatusUpdater → update pr-status →
-write state.json.
+Read leader state.json, evaluate each child PR's component builds and
+main-to-release feasibility checks, post the gated artifacts promoter commit
+status, and update pr-status.
 
 State path (RHOAIENG-93564 / sync layout):
 GAP Leaders/<YYYY-MM-DD>_<trigger_id>/state.json
@@ -20,7 +20,8 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -36,6 +37,23 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from lib.gap_check_selection import (
+    FeasibilityRun,
+    default_build_producer,
+    fetch_changed_files,
+    fetch_feasibility_run,
+    fetch_tekton_documents,
+)
+from lib.gap_pr_gates import (
+    PR_STATUS_BUILD_FAILURE,
+    PR_STATUS_BUILD_PENDING,
+    PR_STATUS_MERGE_FAILURE,
+    PR_STATUS_SUCCESS,
+    RepositoryGateDecision,
+    RepositoryPullRequest,
+    decide_repository_pr,
+)
+from lib.github_check_runs import CheckQueryError, github_api_json, list_check_runs
 from lib.pr_status_updater import (
     GhCommandError,
     PRStatusUpdater,
@@ -53,10 +71,14 @@ DEFAULT_CHECK_NAME = "gated artifacts promoter"
 DEFAULT_LEADER_LABEL = "gated-artifacts-promoter"
 # workflow_dispatch may pass this instead of a concrete Leader PR URL.
 LATEST_LEADER_PR_SENTINEL = "LATEST_LEADER_PR"
-SUCCESS_PR_STATUS = "success"
-MERGE_FAILURE_PR_STATUS = "merge-failure"
-# Child statuses that mean Stage-1 classification is done for that PR.
-STAGE1_TERMINAL_PR_STATUSES = frozenset({SUCCESS_PR_STATUS, MERGE_FAILURE_PR_STATUS})
+SUCCESS_PR_STATUS = PR_STATUS_SUCCESS
+MERGE_FAILURE_PR_STATUS = PR_STATUS_MERGE_FAILURE
+BUILD_PENDING_PR_STATUS = PR_STATUS_BUILD_PENDING
+BUILD_FAILURE_PR_STATUS = PR_STATUS_BUILD_FAILURE
+# Child statuses that conclude a repository PR. build-pending and new stay open.
+STAGE1_TERMINAL_PR_STATUSES = frozenset(
+    {SUCCESS_PR_STATUS, MERGE_FAILURE_PR_STATUS, BUILD_FAILURE_PR_STATUS}
+)
 TRIGGER_ID_RE = re.compile(r"^gap-[A-Za-z0-9._-]+$")
 # Parent directory for per-trigger Leader state files (sync / RHOAIENG-93564).
 GAP_LEADERS_DIR = "GAP Leaders"
@@ -109,6 +131,9 @@ class MonitorResult:
     overall_status: str | None = None
     leader_status_posted: bool = False
     published_sha: str | None = None
+    build_failure_urls: list[str] = field(default_factory=list)
+    pending_urls: list[str] = field(default_factory=list)
+    reports: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -351,13 +376,14 @@ def apply_success_statuses(payload: dict[str, Any], urls: Sequence[str]) -> None
 
 
 def compute_overall_status(payload: dict[str, Any]) -> str | None:
-    """Derive overall-status once every child PR has a Stage-1 final status.
+    """Derive overall-status once every child PR has a final gate status.
 
-    Stage-1 finals: ``success`` / ``merge-failure`` (RHOAIENG-97052).
+    Finals: ``success``, ``merge-failure``, and ``build-failure``.
+    ``build-pending`` and ``new`` stay in progress.
 
     - all ``success`` → ``success``
-    - any ``merge-failure`` (and none still in progress) → ``failure``
-    - any non-terminal child (e.g. ``new``) → ``None`` (do not conclude yet)
+    - any ``merge-failure`` or ``build-failure`` → ``failure``
+    - any non-terminal child → ``None`` (do not conclude yet)
     """
     entries = payload.get("pull-requests") or []
     if not entries:
@@ -370,7 +396,7 @@ def compute_overall_status(payload: dict[str, Any]) -> str | None:
         if status not in STAGE1_TERMINAL_PR_STATUSES:
             return None
         statuses.append(status)
-    if any(status == MERGE_FAILURE_PR_STATUS for status in statuses):
+    if any(status != SUCCESS_PR_STATUS for status in statuses):
         return OVERALL_STATUS_FAILURE
     return OVERALL_STATUS_SUCCESS
 
@@ -886,7 +912,7 @@ def run_monitor_publish_and_signal(
     Ordering (Chris review / RHOAIENG-97052):
       classify children → save state → commit/push → post Leader success on that SHA
     """
-    result = run_stage1_monitor(
+    result = run_monitor(
         state_path,
         check_name=check_name,
         dry_run=dry_run,
@@ -958,6 +984,9 @@ def run_monitor_publish_and_signal(
         overall_status=result.overall_status,
         leader_status_posted=leader_status_posted,
         published_sha=published.sha,
+        build_failure_urls=result.build_failure_urls,
+        pending_urls=result.pending_urls,
+        reports=result.reports,
     )
 
 
@@ -975,7 +1004,13 @@ def run_scheduled_monitors(
     git_runner: Callable[..., str] | None = None,
     updater_factory: Callable[..., PRStatusUpdater] | None = None,
 ) -> int:
-    """Discover open Leaders and run publish-then-signal on each (RHOAIENG-97050)."""
+    """Discover open Leaders and run gate evaluation, then publish-and-signal.
+
+    Checkout stays in this script so the Actions workflow can stay a thin
+    wrapper. Each Leader uses the same build and feasibility evaluation as a
+    manual run, then publishes state and posts Leader success only after that
+    commit (RHOAIENG-97050 / RHOAIENG-97052).
+    """
     leaders = list_open_leader_prs(
         leader_repo, label=label, gh_runner=gh_runner
     )
@@ -1022,7 +1057,7 @@ def run_scheduled_monitors(
             prefix = "[dry-run] " if result.dry_run else ""
             print(
                 f"{prefix}Processed "
-                f"{len(result.success_urls) + len(result.merge_failure_urls)} "
+                f"{len(result.success_urls) + len(result.merge_failure_urls) + len(result.build_failure_urls) + len(result.pending_urls)} "
                 f"child PR(s) from {result.state_path}"
             )
             if result.published_sha:
@@ -1107,11 +1142,425 @@ def resolve_leader_repo(explicit: str | None) -> str:
     )
 
 
+def fetch_repository_pull_request(
+    pr_url: str,
+    *,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+    retry_unknown: bool = True,
+) -> RepositoryPullRequest:
+    """Load the PR revision, labels, and head committer timestamp."""
+    runner = gh_runner or _run_gh
+    pr = parse_pr_url(pr_url)
+    data = _load_pr_view(pr_url, pr, runner)
+    mergeable = data.get("mergeable")
+    if retry_unknown and (mergeable is None or str(mergeable).upper() == "UNKNOWN"):
+        time.sleep(1.5)
+        data = _load_pr_view(pr_url, pr, runner)
+        mergeable = data.get("mergeable")
+
+    head_sha = str(data.get("headRefOid") or "").strip()
+    base_ref = str(data.get("baseRefName") or "").strip()
+    if not head_sha or not base_ref:
+        raise GapPrMonitorError(f"Could not resolve head SHA or base branch for {pr_url}.")
+    committer_at = _head_committer_at(pr.owner, pr.repo, head_sha, pr_url, runner)
+    merge_state = data.get("mergeStateStatus")
+    return RepositoryPullRequest(
+        url=pr_url,
+        owner=pr.owner,
+        repo=pr.repo,
+        number=pr.number,
+        state=str(data.get("state") or "").upper(),
+        mergeable=(str(mergeable).upper() if mergeable is not None else None),
+        merge_state_status=(str(merge_state).upper() if merge_state is not None else None),
+        base_ref=base_ref,
+        head_sha=head_sha,
+        labels=_label_names(data.get("labels")),
+        changed_files=(),
+        committer_at=committer_at,
+    )
+
+
+def _load_pr_view(
+    pr_url: str,
+    pr: PullRequestRef,
+    runner: Callable[[Sequence[str]], str],
+) -> dict[str, Any]:
+    raw = runner(
+        [
+            "pr",
+            "view",
+            str(pr.number),
+            "-R",
+            pr.slug,
+            "--json",
+            "state,mergeable,mergeStateStatus,baseRefName,headRefOid,labels,url",
+        ]
+    )
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise GapPrMonitorError(f"Invalid JSON from gh pr view for {pr_url}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise GapPrMonitorError(f"Invalid JSON from gh pr view for {pr_url}.")
+    return data
+
+
+def _head_committer_at(
+    owner: str,
+    repo: str,
+    head_sha: str,
+    pr_url: str,
+    runner: Callable[[Sequence[str]], str],
+) -> datetime:
+    """Return the committer timestamp of the already captured head SHA.
+
+    ``gh pr view`` only returns the first 100 commits, so a long pull request
+    can omit its head. The commit API addresses that SHA directly.
+    """
+    endpoint = f"repos/{owner}/{repo}/commits/{head_sha}"
+    try:
+        payload = github_api_json(runner, endpoint)
+    except (GhCommandError, CheckQueryError) as exc:
+        raise GapPrMonitorError(
+            f"Could not read head commit {head_sha} on {pr_url}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise GapPrMonitorError(f"Could not read head commit {head_sha} on {pr_url}.")
+    returned = str(payload.get("sha") or "")
+    if returned and returned != head_sha:
+        raise GapPrMonitorError(
+            f"Head commit lookup for {head_sha} returned {returned} on {pr_url}."
+        )
+    commit = payload.get("commit") if isinstance(payload.get("commit"), dict) else {}
+    committer = commit.get("committer") if isinstance(commit.get("committer"), dict) else {}
+    raw = committer.get("date")
+    if not raw:
+        raise GapPrMonitorError(
+            f"Head commit {head_sha} has no committer timestamp on {pr_url}."
+        )
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise GapPrMonitorError(
+            f"Invalid head commit timestamp for {pr_url}: {raw}"
+        ) from exc
+
+
+def _label_names(labels: Any) -> frozenset[str]:
+    names: set[str] = set()
+    if not isinstance(labels, list):
+        return frozenset()
+    for label in labels:
+        if isinstance(label, str) and label.strip():
+            names.add(label.strip())
+        elif isinstance(label, dict) and str(label.get("name") or "").strip():
+            names.add(str(label["name"]).strip())
+    return frozenset(names)
+
+
+def run_monitor(
+    state_path: Path,
+    *,
+    check_name: str = DEFAULT_CHECK_NAME,
+    dry_run: bool = False,
+    continue_on_error: bool = False,
+    description: str | None = None,
+    updater_factory: Callable[..., PRStatusUpdater] | None = None,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+    now: datetime | None = None,
+    build_app_slug: str | None = None,
+    build_app_id: int | None = None,
+) -> MonitorResult:
+    """Evaluate build and feasibility gates, post statuses, and update state."""
+    path = state_path.expanduser().resolve()
+    payload = load_state(path)
+    pr_urls = extract_pr_urls(payload)
+    if not pr_urls:
+        raise GapPrMonitorError(f"No pull requests listed in {path}.")
+
+    if build_app_slug is None:
+        build_app_slug, env_app_id = default_build_producer()
+        if build_app_id is None:
+            build_app_id = env_app_id
+    moment = now or datetime.now().astimezone()
+    runner = gh_runner or _run_gh
+    factory = updater_factory or PRStatusUpdater
+    updater = factory(check_name=check_name, dry_run=dry_run)
+
+    decisions: list[RepositoryGateDecision] = []
+    classify_errors: list[tuple[str, str]] = []
+    for url in pr_urls:
+        try:
+            decisions.append(
+                _decide_url(
+                    url,
+                    runner=runner,
+                    now=moment,
+                    build_app_slug=build_app_slug,
+                    build_app_id=build_app_id,
+                    retry_unknown=gh_runner is None,
+                )
+            )
+        except (GapPrMonitorError, GhCommandError, ValueError, RuntimeError) as exc:
+            if not continue_on_error:
+                raise GapPrMonitorError(f"Failed to inspect {url}: {exc}") from exc
+            classify_errors.append((url, str(exc)))
+
+    return _publish_decisions(
+        path,
+        payload,
+        decisions,
+        classify_errors=classify_errors,
+        updater=updater,
+        dry_run=dry_run,
+        continue_on_error=continue_on_error,
+        description=description,
+        runner=runner,
+        now=moment,
+        build_app_slug=build_app_slug,
+        build_app_id=build_app_id,
+        retry_unknown=gh_runner is None,
+    )
+
+
+def _decide_url(
+    url: str,
+    *,
+    runner: Callable[[Sequence[str]], str],
+    now: datetime,
+    build_app_slug: str,
+    build_app_id: int | None,
+    retry_unknown: bool,
+) -> RepositoryGateDecision:
+    pull_request = fetch_repository_pull_request(
+        url, gh_runner=runner, retry_unknown=retry_unknown
+    )
+    blocking_merge = pull_request.state == "MERGED" or (
+        pull_request.mergeable == "CONFLICTING"
+        or (pull_request.merge_state_status or "") in CONFLICT_MERGE_STATES
+    )
+    check_runs: list = []
+    check_query_error: str | None = None
+    tekton_documents: list[str] | None = []
+    tekton_error: str | None = None
+    if blocking_merge:
+        feasibility = FeasibilityRun(
+            found=False,
+            status=None,
+            conclusion=None,
+            head_sha=pull_request.head_sha,
+            jobs=(),
+        )
+    else:
+        try:
+            pull_request = replace(
+                pull_request,
+                changed_files=fetch_changed_files(
+                    pull_request.owner, pull_request.repo, pull_request.number, runner
+                ),
+            )
+        except CheckQueryError as exc:
+            tekton_error = str(exc)
+        try:
+            check_runs = list_check_runs(
+                pull_request.owner,
+                pull_request.repo,
+                pull_request.head_sha,
+                runner,
+            )
+        except CheckQueryError as exc:
+            check_query_error = str(exc)
+        if tekton_error is None:
+            try:
+                tekton_documents = fetch_tekton_documents(
+                    pull_request.owner,
+                    pull_request.repo,
+                    pull_request.head_sha,
+                    runner,
+                )
+            except CheckQueryError as exc:
+                tekton_documents = None
+                tekton_error = str(exc)
+        feasibility = fetch_feasibility_run(
+            pull_request.owner,
+            pull_request.repo,
+            pull_request.head_sha,
+            runner,
+        )
+
+    return decide_repository_pr(
+        pull_request,
+        tekton_documents=tekton_documents,
+        tekton_error=tekton_error,
+        check_runs=check_runs,
+        check_query_error=check_query_error,
+        feasibility=feasibility,
+        now=now,
+        build_app_slug=build_app_slug,
+        build_app_id=build_app_id,
+    )
+
+
+def _post_gate_status(
+    updater: PRStatusUpdater,
+    decision: RepositoryGateDecision,
+    description: str | None,
+) -> StatusUpdateResult:
+    """Post one gate decision to the SHA that decision evaluated."""
+    desc = description if description is not None else decision.description
+    return updater.post_status_for_pr(
+        decision.url,
+        decision.cli_status,
+        description=desc,
+        target_url=decision.target_url,
+        head_sha=decision.head_sha,
+        defer_if_head_moved=True,
+    )
+
+
+def _publish_gate_decision(
+    decision: RepositoryGateDecision,
+    *,
+    updater: PRStatusUpdater,
+    description: str | None,
+    runner: Callable[[Sequence[str]], str],
+    now: datetime,
+    build_app_slug: str,
+    build_app_id: int | None,
+    retry_unknown: bool,
+) -> tuple[RepositoryGateDecision | None, StatusUpdateResult | None]:
+    """Publish a decision, or re-evaluate once when the head has moved.
+
+    A second move is left for the next poll. The stale decision is not posted
+    to the untested commit.
+    """
+    if decision.skip_status_post:
+        return decision, None
+    result = _post_gate_status(updater, decision, description)
+    if not result.deferred:
+        return decision, result
+    fresh = _decide_url(
+        decision.url,
+        runner=runner,
+        now=now,
+        build_app_slug=build_app_slug,
+        build_app_id=build_app_id,
+        retry_unknown=retry_unknown,
+    )
+    if fresh.skip_status_post:
+        return fresh, None
+    result = _post_gate_status(updater, fresh, description)
+    if result.deferred:
+        return None, result
+    return fresh, result
+
+
+def _publish_decisions(
+    path: Path,
+    payload: dict[str, Any],
+    decisions: Sequence[RepositoryGateDecision],
+    *,
+    classify_errors: list[tuple[str, str]],
+    updater: PRStatusUpdater,
+    dry_run: bool,
+    continue_on_error: bool,
+    description: str | None,
+    runner: Callable[[Sequence[str]], str],
+    now: datetime,
+    build_app_slug: str,
+    build_app_id: int | None,
+    retry_unknown: bool,
+) -> MonitorResult:
+    status_updates: dict[str, str] = {}
+    updated: list[str] = []
+    skipped: list[str] = []
+    merge_failures: list[str] = []
+    build_failures: list[str] = []
+    pending: list[str] = []
+    successes: list[str] = []
+    reports: list[str] = []
+    post_errors: list[tuple[str, str]] = []
+
+    for original in decisions:
+        url = original.url
+        try:
+            decision, result = _publish_gate_decision(
+                original,
+                updater=updater,
+                description=description,
+                runner=runner,
+                now=now,
+                build_app_slug=build_app_slug,
+                build_app_id=build_app_id,
+                retry_unknown=retry_unknown,
+            )
+        except (ValueError, RuntimeError, GhCommandError, GapPrMonitorError) as exc:
+            post_errors.append((url, str(exc)))
+            if not continue_on_error:
+                if status_updates and not dry_run:
+                    apply_pr_statuses(payload, status_updates)
+                    apply_overall_status(payload, None)
+                    save_state(path, payload)
+                raise GapPrMonitorError(f"Failed to post status for {url}: {exc}") from exc
+            continue
+        if decision is None:
+            reports.append(f"deferred {url} head changed before status publication")
+            skipped.append(url)
+            continue
+
+        status_updates[url] = decision.pr_status
+        reports.extend(decision.reports)
+        if decision.pr_status == MERGE_FAILURE_PR_STATUS:
+            merge_failures.append(url)
+        elif decision.pr_status == BUILD_FAILURE_PR_STATUS:
+            build_failures.append(url)
+        elif decision.pr_status == BUILD_PENDING_PR_STATUS:
+            pending.append(url)
+        else:
+            successes.append(url)
+
+        if decision.skip_status_post or (result is not None and result.skipped):
+            skipped.append(url)
+        elif result is not None:
+            updated.append(url)
+
+    if classify_errors or post_errors:
+        if status_updates and not dry_run:
+            apply_pr_statuses(payload, status_updates)
+            apply_overall_status(payload, None)
+            save_state(path, payload)
+        details = classify_errors + post_errors
+        lines = [f"  - {u}: {e}" for u, e in details]
+        raise GapPrMonitorError(
+            f"{len(details)} PR(s) failed during monitor.\n" + "\n".join(lines)
+        )
+
+    apply_pr_statuses(payload, status_updates)
+    overall_status = compute_overall_status(payload)
+    apply_overall_status(payload, overall_status)
+    if not dry_run:
+        save_state(path, payload)
+
+    return MonitorResult(
+        state_path=path,
+        updated_urls=updated,
+        skipped_urls=skipped,
+        merge_failure_urls=merge_failures,
+        success_urls=successes,
+        dry_run=dry_run,
+        overall_status=overall_status,
+        build_failure_urls=build_failures,
+        pending_urls=pending,
+        reports=tuple(reports),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Stage-1 GAP PR monitor: read leader state.json, post success or "
-            "merge-failure commit statuses, and update pr-status in the state file."
+            "GAP PR monitor: read leader state.json, evaluate component build "
+            "and main-to-release feasibility checks, post the gated artifacts "
+            "promoter commit status, and update pr-status."
         )
     )
     parser.add_argument(
@@ -1200,7 +1649,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "RHOAIENG-97050: discover open Leader PRs (GAP label) and run the "
-            "Stage-1 monitor on each. Also selected automatically when "
+            "monitor on each. Also selected automatically when "
             "GITHUB_EVENT_NAME=schedule."
         ),
     )
@@ -1297,12 +1746,23 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     prefix = "[dry-run] " if result.dry_run else ""
-    total = len(result.success_urls) + len(result.merge_failure_urls)
+    total = (
+        len(result.success_urls)
+        + len(result.merge_failure_urls)
+        + len(result.build_failure_urls)
+        + len(result.pending_urls)
+    )
     print(f"{prefix}Processed {total} PR(s) from {result.state_path}")
     for url in result.success_urls:
         print(f"{prefix}success: {url}")
     for url in result.merge_failure_urls:
         print(f"{prefix}merge-failure: {url}")
+    for url in result.build_failure_urls:
+        print(f"{prefix}build-failure: {url}")
+    for url in result.pending_urls:
+        print(f"{prefix}build-pending: {url}")
+    for line in result.reports:
+        print(f"{prefix}{line}")
     if result.overall_status is not None:
         print(f"{prefix}overall-status: {result.overall_status}")
         append_github_output("overall_status", result.overall_status)
