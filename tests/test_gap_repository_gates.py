@@ -695,6 +695,84 @@ def test_undiscovered_feasibility_workflow_stays_unresolved_until_jobs_are_known
     assert _saved(path)["pull-requests"][0]["pr-status"] == "success"
 
 
+def test_unfinished_workflow_uses_the_revision_deadline(tmp_path: Path) -> None:
+    github = _GitHub()
+    github.workflow_status = "in_progress"
+    github.workflow_conclusion = ""
+    github.check_runs = [
+        _build_check("odh-eval-hub-on-pull-request-65317"),
+        *_feasibility_success_payloads(),
+    ]
+    path = _state(tmp_path, builds=[])
+    result, updater = _run(path, github)
+    assert result.success_urls == []
+    assert result.pending_urls == [URL]
+    assert result.merge_failure_urls == []
+    assert updater.posts[0][1] == "pending"
+    assert "still in progress" in result.reports[0]
+    assert _saved(path)["pull-requests"][0]["pr-status"] == "build-pending"
+
+    expired, updater = _run(path, github, now=COMMITTER + timedelta(hours=6))
+    assert expired.pending_urls == []
+    assert expired.build_failure_urls == []
+    assert expired.merge_failure_urls == [URL]
+    assert updater.posts[0][1] == "failure"
+    assert "timed out after 6h" in expired.reports[0]
+    assert _saved(path)["pull-requests"][0]["pr-status"] == "merge-failure"
+
+    again, _updater = _run(path, github, now=COMMITTER + timedelta(hours=7))
+    assert again.merge_failure_urls == [URL]
+    assert again.pending_urls == []
+    assert "timed out after 6h" in again.reports[0]
+    assert _saved(path)["pull-requests"][0]["pr-status"] == "merge-failure"
+
+    new_sha = "c" * 40
+    github.head_sha = new_sha
+    for payload in github.check_runs:
+        payload["head_sha"] = new_sha
+    for job in github.jobs:
+        job["head_sha"] = new_sha
+
+    def view(args: list[str]) -> str:
+        if args[0] == "pr":
+            body = json.loads(github(args))
+            body["headRefOid"] = new_sha
+            body["commits"] = [{"oid": new_sha, "committedDate": "2026-10-06T16:00:00Z"}]
+            return json.dumps(body)
+        return github(args)
+
+    holder: dict[str, _Updater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> _Updater:
+        holder["updater"] = _Updater(check_name=check_name, dry_run=dry_run)
+        return holder["updater"]
+
+    refreshed = run_monitor(
+        path,
+        updater_factory=factory,
+        gh_runner=view,
+        now=datetime(2026, 10, 6, 16, 30, tzinfo=timezone.utc),
+        build_app_slug="konflux-internal-p02",
+        build_app_id=906404,
+    )
+    assert refreshed.pending_urls == [URL]
+    assert refreshed.merge_failure_urls == []
+    assert _saved(path)["pull-requests"][0]["pr-status"] == "build-pending"
+
+    refreshed_deadline = run_monitor(
+        path,
+        updater_factory=factory,
+        gh_runner=view,
+        now=datetime(2026, 10, 6, 22, 0, tzinfo=timezone.utc),
+        build_app_slug="konflux-internal-p02",
+        build_app_id=906404,
+    )
+    assert refreshed_deadline.merge_failure_urls == [URL]
+    assert refreshed_deadline.pending_urls == []
+    assert "timed out after 6h" in refreshed_deadline.reports[0]
+    assert _saved(path)["pull-requests"][0]["pr-status"] == "merge-failure"
+
+
 def test_pending_feasibility_blocks_a_green_build(tmp_path: Path) -> None:
     github = _GitHub()
     github.workflow_status = "in_progress"

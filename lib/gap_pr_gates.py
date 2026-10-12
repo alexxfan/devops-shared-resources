@@ -219,10 +219,15 @@ def _evaluate_feasibility(
     status = (feasibility.status or "").lower()
     conclusion = (feasibility.conclusion or "").lower()
     if feasibility.found and status != "completed" and result.outcome == OUTCOME_PASS:
+        reason = "feasibility workflow still in progress"
+        timed_out = now >= deadline
+        if timed_out:
+            reason = f"timed out after 6h; {reason}"
         return _force(
             result,
-            outcome=OUTCOME_PENDING,
-            reason="feasibility workflow still in progress",
+            outcome=OUTCOME_FAIL if timed_out else OUTCOME_PENDING,
+            reason=reason,
+            timed_out=timed_out,
         )
     if (
         feasibility.found
@@ -375,7 +380,13 @@ def _undiscovered_feasibility(
     return GateResult(outcome=outcome, findings=(finding,), timed_out=timed_out, link=None)
 
 
-def _force(result: GateResult, *, outcome: str, reason: str) -> GateResult:
+def _force(
+    result: GateResult,
+    *,
+    outcome: str,
+    reason: str,
+    timed_out: bool = False,
+) -> GateResult:
     finding = CheckFinding(
         key="main-to-release feasibility",
         outcome=outcome,
@@ -386,7 +397,7 @@ def _force(result: GateResult, *, outcome: str, reason: str) -> GateResult:
     return GateResult(
         outcome=outcome,
         findings=result.findings + (finding,),
-        timed_out=False,
+        timed_out=timed_out,
         link=result.link,
     )
 
