@@ -14,6 +14,7 @@ from lib.gap_check_selection import (
     PullRequestContext,
     WorkflowJob,
     cel_matches,
+    fetch_feasibility_run,
     fetch_tekton_documents,
     resolved_pipeline_name,
     select_build_checks,
@@ -272,6 +273,119 @@ def test_undiscovered_feasibility_run_does_not_shrink_to_the_setup_job() -> None
         jobs=(),
     )
     assert select_feasibility_checks(empty_inventory) == []
+
+
+def _workflow_run(
+    run_id: int,
+    *,
+    attempt: int,
+    started: str,
+    status: str,
+    conclusion: str | None,
+    **extra: Any,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": run_id,
+        "name": "Main-to-release feasibility",
+        "path": ".github/workflows/main-release-feasibility.yml",
+        "head_sha": SHA,
+        "status": status,
+        "conclusion": conclusion,
+        "run_attempt": attempt,
+        "run_started_at": started,
+    }
+    payload.update(extra)
+    return payload
+
+
+def _fetch_feasibility(
+    runs: list[dict[str, Any]],
+    jobs: dict[int, list[dict[str, Any]]],
+) -> tuple[FeasibilityRun, list[str]]:
+    calls: list[str] = []
+
+    def runner(args: list[str]) -> str:
+        endpoint = args[1]
+        calls.append(endpoint)
+        if "/jobs" in endpoint:
+            run_id = int(endpoint.split("/runs/", 1)[1].split("/", 1)[0])
+            batch = jobs[run_id]
+            return json.dumps({"total_count": len(batch), "jobs": batch})
+        return json.dumps({"total_count": len(runs), "workflow_runs": runs})
+
+    return fetch_feasibility_run("acme", "widget", SHA, runner), calls
+
+
+def _feasibility_job(name: str, status: str, conclusion: str | None) -> dict[str, Any]:
+    return {
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "head_sha": SHA,
+    }
+
+
+def test_later_feasibility_run_beats_an_older_higher_attempt() -> None:
+    result, calls = _fetch_feasibility(
+        [
+            _workflow_run(
+                10,
+                attempt=3,
+                started="2026-10-06T10:00:00Z",
+                status="completed",
+                conclusion="success",
+                updated_at="2026-10-06T16:00:00Z",
+            ),
+            _workflow_run(
+                20,
+                attempt=1,
+                started="2026-10-06T12:00:00Z",
+                status="in_progress",
+                conclusion=None,
+                updated_at="2026-10-06T12:01:00Z",
+            ),
+        ],
+        {
+            10: [_feasibility_job("obsolete-matrix", "completed", "success")],
+            20: [_feasibility_job("current-matrix", "in_progress", None)],
+        },
+    )
+    assert result.found is True
+    assert result.status == "in_progress"
+    assert [job.name for job in result.jobs] == ["current-matrix"]
+    assert any("/runs/20/jobs" in call for call in calls)
+    assert not any("/runs/10/jobs" in call for call in calls)
+
+
+def test_later_rerun_of_an_earlier_run_id_is_the_latest_execution() -> None:
+    result, calls = _fetch_feasibility(
+        [
+            _workflow_run(
+                50,
+                attempt=5,
+                started="2026-10-06T11:00:00Z",
+                status="completed",
+                conclusion="success",
+                created_at="2026-10-06T11:00:00Z",
+            ),
+            _workflow_run(
+                4,
+                attempt=2,
+                started="2026-10-06T15:00:00Z",
+                status="in_progress",
+                conclusion=None,
+                created_at="2026-10-06T09:00:00Z",
+            ),
+        ],
+        {
+            50: [_feasibility_job("newer-id-matrix", "completed", "success")],
+            4: [_feasibility_job("rerun-matrix", "in_progress", None)],
+        },
+    )
+    assert result.status == "in_progress"
+    assert [job.name for job in result.jobs] == ["rerun-matrix"]
+    assert any("/runs/4/jobs" in call for call in calls)
+    assert not any("/runs/50/jobs" in call for call in calls)
 
 
 def test_missing_tekton_directory_is_not_a_query_error() -> None:

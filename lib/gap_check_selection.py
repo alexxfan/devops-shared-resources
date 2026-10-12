@@ -254,8 +254,24 @@ def fetch_changed_files(owner: str, repo: str, number: int, runner: GhRunner) ->
     return tuple(names)
 
 
+def _workflow_execution_key(run: dict[str, Any]) -> tuple[str, int]:
+    """Return when this workflow run's latest attempt started.
+
+    ``run_started_at`` is that attempt's start time and moves forward when the
+    run is rerun. ``run_attempt`` only counts retries of one run id, so it does
+    not order distinct runs. The run id breaks timestamp ties.
+    """
+    started = (
+        _optional_str(run.get("run_started_at"))
+        or _optional_str(run.get("updated_at"))
+        or _optional_str(run.get("created_at"))
+        or ""
+    )
+    return (started, int(run.get("id") or 0))
+
+
 def fetch_feasibility_run(owner: str, repo: str, sha: str, runner: GhRunner) -> FeasibilityRun:
-    """Load the newest feasibility workflow run for this commit, if any."""
+    """Load the latest feasibility execution for this commit, if any."""
     endpoint = f"repos/{owner}/{repo}/actions/runs?head_sha={sha}"
     try:
         runs = collect_github_pages(runner, endpoint, "workflow_runs", 100)
@@ -289,10 +305,7 @@ def fetch_feasibility_run(owner: str, repo: str, sha: str, runner: GhRunner) -> 
             jobs=(),
         )
 
-    latest = max(
-        matching,
-        key=lambda item: (int(item.get("run_attempt") or 0), int(item.get("id") or 0)),
-    )
+    latest = max(matching, key=_workflow_execution_key)
     run_id = latest.get("id")
     if not run_id:
         return FeasibilityRun(
