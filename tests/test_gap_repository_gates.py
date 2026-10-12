@@ -13,6 +13,7 @@ from lib.gap_check_selection import (
     FeasibilityRun,
     PullRequestContext,
     WorkflowJob,
+    cel_matches,
     fetch_tekton_documents,
     resolved_pipeline_name,
     select_build_checks,
@@ -195,6 +196,31 @@ def test_cel_ignores_other_tekton_files_but_matches_product_changes() -> None:
         app_slug="konflux-internal-p02",
     )
     assert len(product_change) == 1
+    own_pipeline = select_build_checks(
+        [EVAL_HUB_PIPELINE],
+        _context(changed_files=(".tekton/odh-eval-hub-pull-request.yaml",)),
+        app_slug="konflux-internal-p02",
+    )
+    assert [item.key for item in own_pipeline] == ["odh-eval-hub-v3-6"]
+
+
+def test_files_all_exists_matches_when_any_changed_file_is_outside_tekton() -> None:
+    mixed = select_build_checks(
+        [EVAL_HUB_PIPELINE],
+        _context(changed_files=("README.md", ".tekton/other.yaml")),
+        app_slug="konflux-internal-p02",
+    )
+    assert [item.key for item in mixed] == ["odh-eval-hub-v3-6"]
+
+    universal = EVAL_HUB_PIPELINE.replace("files.all.exists", "files.all.all")
+    every_file = select_build_checks(
+        [universal],
+        _context(changed_files=("README.md", ".tekton/other.yaml")),
+        app_slug="konflux-internal-p02",
+    )
+    assert every_file == []
+    assert cel_matches("files.all.all(p, p.matches('^README'))", _context(changed_files=()))
+    assert not cel_matches("files.all.exists(p, p.matches('^README'))", _context(changed_files=()))
 
 
 def test_feasibility_requires_every_matrix_job() -> None:
@@ -535,6 +561,41 @@ def test_missing_check_is_not_a_no_build_success(tmp_path: Path) -> None:
     result, _updater = _run(path, github)
     assert result.pending_urls == [URL]
     assert _saved(path)["pull-requests"][0]["pr-status"] == "build-pending"
+
+
+def test_mixed_tekton_change_keeps_a_missing_build_pending_until_deadline(tmp_path: Path) -> None:
+    github = _GitHub()
+    github.files = ["README.md", ".tekton/other.yaml"]
+    github.check_runs = [*_feasibility_success_payloads()]
+    path = _state(tmp_path, builds=[])
+    result, updater = _run(path, github)
+    assert result.success_urls == []
+    assert result.pending_urls == [URL]
+    assert updater.posts[0][1] == "pending"
+    assert _saved(path)["pull-requests"][0]["pr-status"] == "build-pending"
+
+    expired, updater = _run(path, github, now=COMMITTER + timedelta(hours=6))
+    assert expired.success_urls == []
+    assert expired.build_failure_urls == [URL]
+    assert updater.posts[0][1] == "failure"
+    assert "timed out after 6h" in expired.reports[0]
+    assert _saved(path)["pull-requests"][0]["pr-status"] == "build-failure"
+
+
+def test_mixed_tekton_change_fails_when_the_selected_build_fails(tmp_path: Path) -> None:
+    github = _GitHub()
+    github.files = ["README.md", ".tekton/other.yaml"]
+    github.check_runs = [
+        _build_check("odh-eval-hub-on-pull-request-65317", "failure"),
+        *_feasibility_success_payloads(),
+    ]
+    path = _state(tmp_path, builds=[])
+    result, updater = _run(path, github)
+    assert result.success_urls == []
+    assert result.build_failure_urls == [URL]
+    assert updater.posts[0][1] == "failure"
+    assert _saved(path)["pull-requests"][0]["pr-status"] == "build-failure"
+    assert any("odh-eval-hub-v3-6" in line for line in result.reports)
 
 
 def test_skipped_build_fails_immediately(tmp_path: Path) -> None:

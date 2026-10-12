@@ -554,15 +554,22 @@ class _CelParser:
         raise TriggerParseError(f"unsupported CEL comparison on {name}")
 
     def _parse_files(self) -> bool:
+        """Evaluate ``files.<collection>.<macro>(variable, predicate)``.
+
+        ``files.all`` is the changed-file collection. ``.exists`` is CEL's
+        existential macro and matches when any file satisfies the predicate.
+        ``.all`` is the universal macro and matches only when every file does,
+        including an empty collection.
+        """
         self.expect("ident", "files")
         self.expect("sym", ".")
-        kind = self.pop()
-        if kind[0] != "ident" or kind[1] not in {"all", "exists"}:
+        collection = self.pop()
+        if collection != ("ident", "all"):
+            raise TriggerParseError("unsupported files collection")
+        self.expect("sym", ".")
+        macro = self.pop()
+        if macro[0] != "ident" or macro[1] not in {"exists", "all"}:
             raise TriggerParseError("unsupported files macro")
-        quantifier = kind[1]
-        if quantifier == "all" and self.peek() == ("sym", "."):
-            self.expect("sym", ".")
-            self.expect("ident", "exists")
         self.expect("sym", "(")
         variable = self.pop()
         if variable[0] != "ident":
@@ -571,8 +578,8 @@ class _CelParser:
         predicate = self._parse_file_predicate(variable[1])
         self.expect("sym", ")")
         results = [predicate(path) for path in self.context.changed_files]
-        if quantifier == "all":
-            return all(results) if results else True
+        if macro[1] == "all":
+            return all(results)
         return any(results)
 
     def _parse_file_predicate(self, variable: str) -> Callable[[str], bool]:
