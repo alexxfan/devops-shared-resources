@@ -24,6 +24,8 @@ Usage in config.yaml:
             - component_starts_with
 """
 
+import re
+
 from lib.tekton import extract_component_prefix, get_annotation
 
 
@@ -56,6 +58,16 @@ def is_push_pipeline_by_cel(name, data):
     on-cel-expression instead of on-event annotations, and metadata.name
     does not end with '-on-push'.
     """
+    # Incorrect CEL must not hide an explicitly identified PR pipeline.
+    on_event = get_annotation(data, "pipelinesascode.tekton.dev/on-event")
+    if on_event and "pull_request" in on_event:
+        return False
+    # Only an explicit terminal PR event marker overrides the CEL event.
+    if re.search(
+        r"-(?:on-)?pull-request(?:-(?:\d+|\{\{\s*pull_request_number\s*\}\}))?$",
+        name,
+    ):
+        return False
     cel = get_annotation(data, "pipelinesascode.tekton.dev/on-cel-expression")
     return bool(cel and 'event == "push"' in cel)
 

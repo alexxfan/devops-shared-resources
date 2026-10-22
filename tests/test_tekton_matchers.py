@@ -58,6 +58,35 @@ class TestIsPushPipelineByCel:
         )
         assert not is_push_pipeline_by_cel("odh-dashboard-pull-request", data)
 
+    @pytest.mark.parametrize("event", ["on-pull-request", "pull-request"])
+    @pytest.mark.parametrize("suffix", [
+        "", "-51472", "-{{pull_request_number}}", "-{{ pull_request_number }}",
+    ])
+    def test_rejects_push_cel_in_pr_name(self, event, suffix):
+        name = f"odh-must-gather-{event}{suffix}"
+        data = _make_data(name, {
+            "pipelinesascode.tekton.dev/on-cel-expression": 'event == "push"',
+        })
+        assert not is_push_pipeline_by_cel(name, data)
+
+    @pytest.mark.parametrize("name", ["some-pipeline", "some-pipeline-on-push"])
+    def test_rejects_push_cel_with_pr_annotation(self, name):
+        data = _make_data(name, {
+            "pipelinesascode.tekton.dev/on-event": "[pull_request]",
+            "pipelinesascode.tekton.dev/on-cel-expression": 'event == "push"',
+        })
+        assert not is_push_pipeline_by_cel(name, data)
+
+    @pytest.mark.parametrize("suffix", [
+        "", "-v3-6", "-v3-6-ea-2", "-on-push", "-push", "-on-schedule", "-schedule",
+    ])
+    def test_preserves_push_cel_in_component_with_pr_marker(self, suffix):
+        name = f"odh-pull-request-handler{suffix}"
+        data = _make_data(name, {
+            "pipelinesascode.tekton.dev/on-cel-expression": 'event == "push"',
+        })
+        assert is_push_pipeline_by_cel(name, data)
+
     def test_rejects_no_cel(self):
         data = _make_data("odh-dashboard-v3-6")
         assert not is_push_pipeline_by_cel("odh-dashboard-v3-6", data)
