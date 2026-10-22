@@ -57,21 +57,32 @@ def git(*args, check=True, **kwargs) -> subprocess.CompletedProcess:
 # --- Pipeline loading ---
 
 
-def _glob_tekton_files(base_dir: Path, layout: str = "flat"):
+def _glob_tekton_files(base_dir: Path, layout: str = "flat", pipeline_dir: Path | None = None):
     """Yield PipelineRun YAML file paths for the given layout.
 
     Args:
         base_dir: For 'flat' layout, the .tekton/ directory.
                   For 'nested' layout, the repo root.
         layout: 'flat' (.tekton/*.yaml) or 'nested' (pipelineruns/*/.tekton/*.yaml).
+        pipeline_dir: Optional path relative to the repo root that scopes nested
+                      scans to one pipeline directory.
     """
     if layout == "nested":
-        yield from sorted(base_dir.glob("pipelineruns/*/.tekton/*.yaml"))
+        if pipeline_dir is not None:
+            yield from sorted((base_dir / pipeline_dir).glob(".tekton/*.yaml"))
+        else:
+            yield from sorted(base_dir.glob("pipelineruns/*/.tekton/*.yaml"))
     else:
         yield from sorted(base_dir.glob("*.yaml"))
 
 
-def _load_pipelines(tekton_dir: Path, namespace_filter: str | None, config=None, layout: str = "flat"):
+def _load_pipelines(
+    tekton_dir: Path,
+    namespace_filter: str | None,
+    config=None,
+    layout: str = "flat",
+    pipeline_dir: Path | None = None,
+):
     """Load PipelineRun files and build parent pipeline indexes.
 
     Returns (pipelines, parent_indexes, yaml_errors, skipped_ns) where:
@@ -88,7 +99,7 @@ def _load_pipelines(tekton_dir: Path, namespace_filter: str | None, config=None,
     parent_indexes = {name: {} for name in parent_template_names}
     yaml_errors = {}
     skipped_ns = 0
-    for filepath in _glob_tekton_files(tekton_dir, layout):
+    for filepath in _glob_tekton_files(tekton_dir, layout, pipeline_dir):
         try:
             with open(filepath) as f:
                 data = ruamel.load(f)
@@ -228,6 +239,7 @@ def validate_tekton_dir(
     pipelines_data: dict | None = None,
     external_parent_indexes: dict | None = None,
     layout: str = "flat",
+    pipeline_dir: Path | None = None,
 ) -> dict:
     if config is None:
         config = load_config(DEFAULT_CONFIG_DIR)
@@ -244,7 +256,9 @@ def validate_tekton_dir(
                     parent_indexes[pipeline_type][prefix] = data
         yaml_errors = {}
     else:
-        pipelines, parent_indexes, yaml_errors, _ = _load_pipelines(tekton_dir, namespace_filter, config, layout=layout)
+        pipelines, parent_indexes, yaml_errors, _ = _load_pipelines(
+            tekton_dir, namespace_filter, config, layout=layout, pipeline_dir=pipeline_dir,
+        )
 
     # Use external parent indexes if provided (cross-branch parenting)
     if external_parent_indexes is not None:
@@ -356,6 +370,7 @@ def fix_tekton_dir(
     cli_vars: dict | None = None,
     external_parent_indexes: dict | None = None,
     layout: str = "flat",
+    pipeline_dir: Path | None = None,
 ) -> tuple[list[str], dict]:
     """Fix tekton files. Returns (fixed_filenames, post_fix_data).
 
@@ -373,7 +388,9 @@ def fix_tekton_dir(
     ruamel.preserve_quotes = True
     ruamel.width = 4096
 
-    pipelines, parent_indexes, _, _ = _load_pipelines(tekton_dir, namespace_filter, config, layout=layout)
+    pipelines, parent_indexes, _, _ = _load_pipelines(
+        tekton_dir, namespace_filter, config, layout=layout, pipeline_dir=pipeline_dir,
+    )
 
     # Use external parent indexes if provided (cross-branch parenting)
     if external_parent_indexes is not None:
@@ -556,6 +573,10 @@ def main():
         "--tekton-layout", default=None, choices=["flat", "nested"],
         help="Pipeline file layout: flat (.tekton/) or nested (pipelineruns/*/.tekton/). Overrides config tekton_layout.",
     )
+    parser.add_argument(
+        "--pipeline-dir",
+        help="For nested layout, limit validation and fixes to a directory relative to the repo root (e.g. pipelineruns/feast).",
+    )
     parser.add_argument("--verbose", action="store_true", help="Show detailed progress on stderr")
     args = parser.parse_args()
     verbose = args.verbose
@@ -601,9 +622,24 @@ def main():
     layout = args.tekton_layout or config.tekton_layout
     parent_ref = args.parent_ref or config.parent_ref
 
+    pipeline_dir = None
+    if args.pipeline_dir:
+        pipeline_dir_arg = Path(args.pipeline_dir)
+        if pipeline_dir_arg.is_absolute():
+            die("--pipeline-dir must be a relative path inside the repo root")
+        if layout != "nested":
+            die("--pipeline-dir requires the nested Tekton layout")
+        resolved_pipeline_dir = (repo_root / pipeline_dir_arg).resolve()
+        try:
+            pipeline_dir = resolved_pipeline_dir.relative_to(repo_root.resolve())
+        except ValueError:
+            die("--pipeline-dir must stay inside the repo root")
+        if not resolved_pipeline_dir.is_dir():
+            die(f"--pipeline-dir does not exist: {resolved_pipeline_dir}")
+
     if layout == "nested":
         tekton_dir = repo_root
-        if not any(repo_root.glob("pipelineruns/*/.tekton/*.yaml")):
+        if not any(_glob_tekton_files(repo_root, layout, pipeline_dir)):
             info("no pipelineruns/*/.tekton/ files found")
             return
     else:
@@ -622,7 +658,11 @@ def main():
 
     # Validate
     prefix = "[dry-run] " if args.dry_run else ""
-    layout_desc = "pipelineruns/*/.tekton/" if layout == "nested" else ".tekton/"
+    layout_desc = (
+        f"{pipeline_dir}/.tekton/" if pipeline_dir is not None
+        else "pipelineruns/*/.tekton/" if layout == "nested"
+        else ".tekton/"
+    )
     info(f"==> {prefix}Validating {layout_desc} on branch {current_branch}")
 
     results = validate_tekton_dir(
@@ -630,10 +670,11 @@ def main():
         config=config, cli_vars=cli_vars,
         external_parent_indexes=external_parent_indexes,
         layout=layout,
+        pipeline_dir=pipeline_dir,
     )
 
     if not results:
-        total_yaml = len(list(_glob_tekton_files(tekton_dir, layout)))
+        total_yaml = len(list(_glob_tekton_files(tekton_dir, layout, pipeline_dir)))
         if args.namespace and total_yaml:
             info(f"  no PipelineRun files in namespace '{args.namespace}' ({total_yaml} files in other namespaces)")
         else:
@@ -669,6 +710,7 @@ def main():
             config=config, cli_vars=cli_vars,
             external_parent_indexes=external_parent_indexes,
             layout=layout,
+            pipeline_dir=pipeline_dir,
         )
 
         if fixed:
