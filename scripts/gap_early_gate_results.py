@@ -600,6 +600,7 @@ def run_early_gate_results(
         published.sha,
         overall_status=new_overall,
         updater=updater,
+        gh_runner=gh_runner,
     )
     # Reload after publish so child list matches committed state.
     payload = load_state(state_path)

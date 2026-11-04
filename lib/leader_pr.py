@@ -240,27 +240,6 @@ class LeaderPRManager:
             mutate=True,
         )
 
-    def close_previous_leader_prs(self, *, keep_number: int | None = None) -> list[int]:
-        """Close superseded GAP Leader PRs.
-
-        ``keep_number``, when set, is left open (the current run's Leader PR).
-        """
-        closed: list[int] = []
-        for pull in self.list_open_prs_by_label(GAP_LABEL):
-            number = int(pull["number"])
-            if keep_number is not None and number == keep_number:
-                continue
-            self.close_pr(
-                number,
-                comment=(
-                    "Closing this Leader PR because a newer Gated Artifacts "
-                    "Promoter run is opening a replacement."
-                ),
-            )
-            closed.append(number)
-            print(f"Closed previous Leader PR #{number} ({pull.get('url')})")
-        return closed
-
     def create_or_update(
         self,
         state: PromoterState,
@@ -282,12 +261,6 @@ class LeaderPRManager:
         preview_state_rel = state_path_for_trigger(trigger_id)
 
         if self.dry_run:
-            if existing is None:
-                for pull in self.list_open_prs_by_label(GAP_LABEL):
-                    print(
-                        f"[dry-run] would close previous Leader PR "
-                        f"#{pull['number']} ({pull.get('url')})"
-                    )
             pr_body = body or self._default_body(
                 state, trigger_id=trigger_id, state_path=preview_state_rel
             )
@@ -324,11 +297,8 @@ class LeaderPRManager:
                 dry_run=True,
             )
 
-        # New run: close prior open Leader PRs before opening the replacement.
-        # Each trigger has a unique head branch, so deleting a prior branch
-        # cannot affect this PR.
-        if existing is None:
-            self.close_previous_leader_prs()
+        # Other triggers retain their PRs and branches until their own monitors
+        # conclude and merge their records. A new daily run must not erase them.
 
         workdir = Path(tempfile.mkdtemp(prefix="gap-leader-"))
         try:
