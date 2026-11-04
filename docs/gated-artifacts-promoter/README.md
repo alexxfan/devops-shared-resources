@@ -25,8 +25,7 @@ python scripts/run_gated_artifacts_promoter.py \
 ```
 
 Omit `--trigger-id` to generate one (used in the state path and as a PR label).
-Each new trigger ID **closes** any previously open Leader PR (and deletes its
-branch), then creates `gap-leader/<trigger-id>` from main and opens a **new
+Each new trigger ID preserves previously open Leaders and their branches, then creates `gap-leader/<trigger-id>` from main and opens a **new
 Leader PR** with a dated state file at
 `GAP Leaders/<UTC-date>_<trigger-id>/state.json`. A rerun with the same trigger
 ID updates that trigger's existing PR and branch. Child sync PRs are reused via
@@ -96,3 +95,41 @@ The GitHub Actions workflow lives in `rhods-devops-infra`:
 4. Run `scripts/run_gated_artifacts_promoter.py`
 
 See `docs/gated-artifacts-promoter/consumer-setup.md`.
+
+## Run history and failed Leaders
+
+A newer daily run no longer closes an older Leader or deletes its branch.
+The scheduled monitors continue to process open Leaders until each run has a
+terminal outcome. A pending run is not recorded as failed merely because a
+newer run started.
+
+Both terminal outcomes use normal GitHub auto-merge to preserve the run record
+in the Leader repository. The exact published head is supplied with
+`--match-head-commit`; repository checks, approvals and merge rules still apply.
+No admin override is used. A blocked merge leaves the PR and branch available.
+
+| Run result | Leader label | Title prefix | State retained |
+| --- | --- | --- | --- |
+| Success | `gap-result-success` | `[GAP passed]` | Original dated state path |
+| Failure | `gap-result-failure` | `[GAP failed]` | Original path plus unsuccessful-history snapshot |
+
+Failed run snapshots are committed **with** the canonical state update:
+
+`GAP History/unsuccessful/<UTC-date>_<trigger-id>/state.json`
+
+The canonical `GAP Leaders/<UTC-date>_<trigger-id>/state.json` remains where
+the monitors expect it. Both copies retain `overall-status: failure` and the
+individual child statuses/builds. The history folder is outside monitor
+discovery, so it cannot trigger a second run. Existing archived failures can be
+indexed directly by a future dashboard; use the canonical tree for all runs
+and do not count the failure snapshot as another run.
+
+The green Leader conclusion check permits merging the **record**, not passing
+the product gate. Existing component checks and the distinction between Early
+Gate success and failure are unchanged. An incomplete run has no failure
+snapshot and is not queued for merge by this finalization path.
+
+This change applies to future finalizations. It does not automatically reopen
+or recover previously closed Leader PRs. The Leader repository's GitHub App
+needs label/title write and pull-request auto-merge permissions. If those
+operations fail, the error is surfaced; the run is not silently deleted.

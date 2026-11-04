@@ -70,6 +70,7 @@ from lib.pr_status_updater import (
     StatusUpdateResult,
     parse_pr_url,
 )
+from lib.leader_history import prepare_leader_history_merge, write_failure_snapshot
 from lib.state_file import (
     OVERALL_STATUS_EARLY_GATE_TRIGGERED,
     OVERALL_STATUS_FAILURE,
@@ -1004,7 +1005,11 @@ def publish_state(
         ["config", "user.email", "github-actions[bot]@users.noreply.github.com"],
         cwd=repo_root,
     )
-    run(["add", "--", rel], cwd=repo_root)
+    snapshot = write_failure_snapshot(repo_root, state_path)
+    paths = [rel]
+    if snapshot is not None:
+        paths.append(state_path_for_output(snapshot, repo_root=repo_root))
+    run(["add", "--", *paths], cwd=repo_root)
     staged = run(["diff", "--cached", "--name-only"], cwd=repo_root)
     committed = False
     if staged.strip():
@@ -1083,6 +1088,7 @@ def post_leader_conclusion(
     *,
     overall_status: str,
     updater: PRStatusUpdater,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> StatusUpdateResult:
     """Post Leader green on the published SHA once overall-status is set (RHAI-8079).
 
@@ -1098,6 +1104,10 @@ def post_leader_conclusion(
         raise GapPrMonitorError(
             f"Cannot post Leader conclusion for overall-status={overall_status!r}"
         )
+    prepare_leader_history_merge(
+        leader_pr_url, published_sha, overall_status=overall_status,
+        dry_run=updater.dry_run, gh_runner=gh_runner,
+    )
     return updater.post_status_for_pr(
         leader_pr_url,
         "completed",
@@ -1208,6 +1218,7 @@ def run_monitor_publish_and_signal(
                 published.sha,
                 overall_status=result.overall_status or "",
                 updater=updater,
+                gh_runner=gh_runner,
             )
             leader_status_posted = not leader_result.skipped
             if leader_status_posted:
