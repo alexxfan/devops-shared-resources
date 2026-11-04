@@ -10,19 +10,21 @@ from typing import Callable, Sequence
 from lib.github_cli import run_gh
 from lib.pr_status_updater import parse_pr_url
 
-HISTORY_ROOT = Path("GAP History") / "unsuccessful"
+HISTORY_ROOT = Path("GAP History")
+HISTORY_FOLDERS = {"success": "successful", "failure": "unsuccessful"}
 RESULT_LABELS = {"success": "gap-result-success", "failure": "gap-result-failure"}
 
 
-def write_failure_snapshot(repo_root: Path, state_path: Path) -> Path | None:
-    """Copy only a concluded failure; retain the canonical monitor state path."""
+def write_history_snapshot(repo_root: Path, state_path: Path) -> Path | None:
+    """Copy either terminal outcome; retain the canonical monitor state path."""
     payload = json.loads(state_path.read_text(encoding="utf-8"))
-    if payload.get("overall-status") != "failure":
+    folder = HISTORY_FOLDERS.get(payload.get("overall-status"))
+    if folder is None:
         return None
     relative = state_path.resolve().relative_to(repo_root.resolve())
     if relative.parts[0] == "GAP Leaders":
         relative = Path(*relative.parts[1:])
-    snapshot = repo_root / HISTORY_ROOT / relative
+    snapshot = repo_root / HISTORY_ROOT / folder / relative
     snapshot.parent.mkdir(parents=True, exist_ok=True)
     snapshot.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return snapshot

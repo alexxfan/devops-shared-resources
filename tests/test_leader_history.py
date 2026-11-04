@@ -8,7 +8,7 @@ import pytest
 
 from lib.leader_history import (
     prepare_leader_history_merge,
-    write_failure_snapshot,
+    write_history_snapshot,
 )
 from scripts.gap_pr_monitor import publish_state
 
@@ -124,33 +124,35 @@ def test_repeated_finalization_keeps_same_title_prefix():
     assert pull["title"] == "[GAP failed] GAP leader: gap-test"
 
 
-@pytest.mark.parametrize("outcome", [None, "success", "early-gate-triggered"])
-def test_incomplete_and_successful_runs_have_no_failure_snapshot(tmp_path, outcome):
+@pytest.mark.parametrize("outcome", [None, "early-gate-triggered"])
+def test_incomplete_runs_have_no_history_snapshot(tmp_path, outcome):
     state = tmp_path / "state.json"
     payload = {"pull-requests": []}
     if outcome:
         payload["overall-status"] = outcome
     state.write_text(json.dumps(payload))
-    assert write_failure_snapshot(tmp_path, state) is None
+    assert write_history_snapshot(tmp_path, state) is None
     assert not (tmp_path / "GAP History").exists()
 
 
-def test_failure_snapshot_preserves_canonical_and_child_failure(tmp_path):
+@pytest.mark.parametrize("outcome,folder", [("success", "successful"), ("failure", "unsuccessful")])
+def test_snapshot_preserves_canonical_and_child_outcome(tmp_path, outcome, folder):
     state = tmp_path / "GAP Leaders" / "2026-11-04_gap-test" / "state.json"
     state.parent.mkdir(parents=True)
-    payload = {"overall-status": "failure", "pull-requests": [
+    payload = {"overall-status": outcome, "pull-requests": [
         {"repo": "component", "pr-url": "https://github.com/acme/component/pull/3",
-         "pr-status": "build-failure", "builds": []}]}
+         "pr-status": "success" if outcome == "success" else "build-failure", "builds": []}]}
     state.write_text(json.dumps(payload))
-    snapshot = write_failure_snapshot(tmp_path, state)
-    assert snapshot == tmp_path / "GAP History/unsuccessful/2026-11-04_gap-test/state.json"
+    snapshot = write_history_snapshot(tmp_path, state)
+    assert snapshot == tmp_path / f"GAP History/{folder}/2026-11-04_gap-test/state.json"
     assert json.loads(snapshot.read_text()) == payload
     assert json.loads(state.read_text()) == payload
     first = snapshot.read_bytes()
-    assert write_failure_snapshot(tmp_path, state).read_bytes() == first
+    assert write_history_snapshot(tmp_path, state).read_bytes() == first
 
 
-def test_failed_state_and_snapshot_land_in_same_real_git_commit(tmp_path):
+@pytest.mark.parametrize("outcome,folder", [("success", "successful"), ("failure", "unsuccessful")])
+def test_state_and_snapshot_land_in_same_real_git_commit(tmp_path, outcome, folder):
     """Prove both copies survive a normal local push; no GitHub or mocks."""
     remote = tmp_path / "remote.git"
     root = tmp_path / "leader"
@@ -170,12 +172,12 @@ def test_failed_state_and_snapshot_land_in_same_real_git_commit(tmp_path):
     git(["add", "."], root)
     git(["commit", "-m", "Pending run"], root)
     git(["push", "-u", "origin", "HEAD"], root)
-    state.write_text(json.dumps({"pull-requests": [], "overall-status": "failure"}))
+    state.write_text(json.dumps({"pull-requests": [], "overall-status": outcome}))
     result = publish_state(root, state, "gap-leader/gap-test", git_runner=git)
     canonical = git(["show", f"{result.sha}:GAP Leaders/2026-11-04_gap-test/state.json"], root)
-    archive = git(["show", f"{result.sha}:GAP History/unsuccessful/2026-11-04_gap-test/state.json"], root)
+    archive = git(["show", f"{result.sha}:GAP History/{folder}/2026-11-04_gap-test/state.json"], root)
     assert json.loads(canonical) == json.loads(archive)
-    assert json.loads(archive)["overall-status"] == "failure"
+    assert json.loads(archive)["overall-status"] == outcome
     assert git(["rev-parse", "origin/gap-leader/gap-test"], root) == result.sha
 
 
@@ -210,15 +212,16 @@ def test_moved_head_cannot_receive_a_leader_green_from_history_finalization():
                               updater=Updater(), gh_runner=lambda args: json.dumps(pull))
 
 
-def test_failed_snapshot_preserves_creator_reporting_payload(tmp_path):
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+def test_snapshot_preserves_creator_reporting_payload(tmp_path, outcome):
     state = tmp_path / "GAP Leaders/2026-11-04_gap-test/state.json"
     state.parent.mkdir(parents=True)
-    payload = {"pull-requests": [], "overall-status": "failure", "creator-outcomes": [{
+    payload = {"pull-requests": [], "overall-status": outcome, "creator-outcomes": [{
         "repo": "acme/foo", "source-branch": "main", "target-branch": "stable",
         "outcome": "creation-failure", "reason": "Access denied",
         "pr-url": "", "workflow-url": "", "observed-at": "2026-11-04T12:00:00+00:00"}]}
     state.write_text(json.dumps(payload))
-    snapshot = write_failure_snapshot(tmp_path, state)
+    snapshot = write_history_snapshot(tmp_path, state)
     assert json.loads(snapshot.read_text()) == payload
 
 

@@ -70,7 +70,7 @@ from lib.pr_status_updater import (
     StatusUpdateResult,
     parse_pr_url,
 )
-from lib.leader_history import prepare_leader_history_merge, write_failure_snapshot
+from lib.leader_history import prepare_leader_history_merge, write_history_snapshot
 from lib.state_file import (
     OVERALL_STATUS_EARLY_GATE_TRIGGERED,
     OVERALL_STATUS_FAILURE,
@@ -1005,7 +1005,7 @@ def publish_state(
         ["config", "user.email", "github-actions[bot]@users.noreply.github.com"],
         cwd=repo_root,
     )
-    snapshot = write_failure_snapshot(repo_root, state_path)
+    snapshot = write_history_snapshot(repo_root, state_path)
     paths = [rel]
     if snapshot is not None:
         paths.append(state_path_for_output(snapshot, repo_root=repo_root))

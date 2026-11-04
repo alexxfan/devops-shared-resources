@@ -39,7 +39,7 @@ A newly onboarded component has no `stable` branch. That sync pushes the
 source tip as `stable` and does not open a child PR. Once `stable` exists,
 later runs stay on the main→stable PR path.
 
-## Run history and failed Leaders
+## Run history and Leader outcomes
 
 A newer daily run no longer closes an older Leader or deletes its branch.
 The scheduled monitors continue to process open Leaders until each run has a
@@ -53,23 +53,27 @@ No admin override is used. A blocked merge leaves the PR and branch available.
 
 | Run result | Leader label | Title prefix | State retained |
 | --- | --- | --- | --- |
-| Success | `gap-result-success` | `[GAP passed]` | Original dated state path |
+| Success | `gap-result-success` | `[GAP passed]` | Original path plus successful-history snapshot |
 | Failure | `gap-result-failure` | `[GAP failed]` | Original path plus unsuccessful-history snapshot |
 
-Failed run snapshots are committed **with** the canonical state update:
+Both outcomes get a history snapshot committed **with** the canonical state update:
 
-`GAP History/unsuccessful/<UTC-date>_<trigger-id>/state.json`
+```text
+GAP History/
+  successful/<UTC-date>_<trigger-id>/state.json
+  unsuccessful/<UTC-date>_<trigger-id>/state.json
+```
 
 The canonical `GAP Leaders/<UTC-date>_<trigger-id>/state.json` remains where
-the monitors expect it. Both copies retain `overall-status: failure` and the
-individual child statuses/builds. The history folder is outside monitor
-discovery, so it cannot trigger a second run. Existing archived failures can be
-indexed directly by a future dashboard; use the canonical tree for all runs
-and do not count the failure snapshot as another run.
+the monitors expect it. Both copies retain the actual `overall-status` and
+individual child statuses/builds. History is outside monitor discovery, so
+snapshots cannot trigger duplicate runs. A future dashboard can read both
+history folders for completed runs and the open Leaders for in-progress runs.
+Count each trigger once; its canonical file and history snapshot are the same run.
 
 The green Leader conclusion check permits merging the **record**, not passing
 the product gate. Existing component checks and the distinction between Early
-Gate success and failure are unchanged. An incomplete run has no failure
+Gate success and failure are unchanged. An incomplete run has no history
 snapshot and is not queued for merge by this finalization path.
 
 This change applies to future finalizations. It does not automatically reopen
