@@ -79,6 +79,7 @@ class StatePullRequest:
     pr_status: str = PR_STATUS_NEW
     builds: tuple[StateBuild, ...] = ()
     build_observations: dict[str, Any] | None = None
+    head_sha: str | None = None
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any], *, index: int) -> "StatePullRequest":
@@ -123,8 +124,15 @@ class StatePullRequest:
             or not isinstance(observations.get("runs"), list)
         ):
             raise StateFileError(f"{path}.build-observations must be Konflux evidence")
-        return cls(repo=repo, pr_url=pr_url, pr_status=pr_status, builds=builds,
-                   build_observations=observations)
+        head_sha = str(data.get("head-sha") or "").strip() or None
+        return cls(
+            repo=repo,
+            pr_url=pr_url,
+            pr_status=pr_status,
+            builds=builds,
+            build_observations=observations,
+            head_sha=head_sha,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         result = {
@@ -135,6 +143,8 @@ class StatePullRequest:
         }
         if self.build_observations is not None:
             result["build-observations"] = self.build_observations
+        if self.head_sha is not None:
+            result["head-sha"] = self.head_sha
         return result
 
 
@@ -235,6 +245,7 @@ def build_state(
                 "pr-url": item.get("pr-url") or item.get("pr_url") or item.get("url"),
                 "pr-status": item.get("pr-status") or item.get("pr_status") or PR_STATUS_NEW,
                 "builds": item.get("builds") if "builds" in item else [],
+                "head-sha": item.get("head-sha"),
             }
             # Accept owner/name and reduce to short slug.
             repo = str(payload["repo"] or "").strip()

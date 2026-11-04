@@ -76,6 +76,22 @@ def test_write_and_load_state_file(tmp_path: Path) -> None:
     }
 
 
+def test_write_and_load_state_file_preserves_child_head_sha(tmp_path: Path) -> None:
+    head_sha = "a" * 40
+    state = build_state(
+        pull_requests=[
+            {
+                "repo": "kubeflow",
+                "pr-url": "https://github.com/rhoai-rhtap/kubeflow/pull/81",
+                "head-sha": head_sha,
+            }
+        ]
+    )
+    path = write_state_file(tmp_path / "state.json", state)
+
+    assert load_state_file(path)["pull-requests"][0]["head-sha"] == head_sha
+
+
 def test_validate_state_rejects_legacy_prs_key() -> None:
     with pytest.raises(StateFileError, match="obsolete key 'prs'"):
         validate_state({"prs": []})
