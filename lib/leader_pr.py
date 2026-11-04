@@ -15,10 +15,14 @@ from lib.git_utils import authenticated_clone_url
 from lib.state_file import (
     DEFAULT_LEADER_REPO,
     PromoterState,
+    StatePullRequest,
     find_existing_state_path,
     state_path_for_trigger,
     write_state_file,
+    load_state_file,
 )
+
+from lib.creator_outcomes import ERROR_OUTCOMES, PR, merge_outcomes
 
 GAP_LABEL = "gated-artifacts-promoter"
 LEADER_BRANCH_PREFIX = "gap-leader"
@@ -365,6 +369,28 @@ class LeaderPRManager:
                 self.run_git(["checkout", "-B", branch], cwd=workdir, mutate=True)
                 state_rel = state_path_for_trigger(trigger_id)
 
+            if existing and (workdir / state_rel).exists():
+                previous_state = load_state_file(workdir / state_rel)
+                attempted = {item["repo"].lower() for item in state.creator_outcomes}
+                failed_without_pr = {
+                    item["repo"].lower() for item in state.creator_outcomes
+                    if item["outcome"] in ERROR_OUTCOMES and not item.get("pr-url")
+                }
+                known_pr_urls = {child.pr_url for child in state.pull_requests}
+                if attempted:
+                    # Keep untouched children and failed retries with no fresh PR
+                    # identity. Successful no-change attempts still clear old children.
+                    for index, child in enumerate(previous_state["pull-requests"]):
+                        match = PR.fullmatch(child["pr-url"])
+                        if (match and child["pr-url"] not in known_pr_urls and (
+                                match[1].lower() not in attempted
+                                or match[1].lower() in failed_without_pr)):
+                            state.pull_requests.append(StatePullRequest.from_mapping(child, index=index))
+                            known_pr_urls.add(child["pr-url"])
+                state.creator_outcomes = merge_outcomes(
+                    previous_state.get("creator-outcomes", []), state.creator_outcomes
+                )
+
             pr_body = body or self._default_body(
                 state, trigger_id=trigger_id, state_path=state_rel
             )
@@ -455,6 +481,16 @@ class LeaderPRManager:
             )
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+    def publish_creator_outcomes(self, result: LeaderPRResult, state: PromoterState) -> None:
+        """Use the reporter's existing summary marker, never a second comment."""
+        if not result.pr_url:
+            return
+        from scripts.gap_failure_reporter import publish_creator_outcomes
+        publish_creator_outcomes(
+            result.pr_url, state.creator_outcomes,
+            dry_run=self.dry_run, gh_runner=lambda args: self.run_gh(args),
+        )
 
     def _default_body(
         self,

@@ -96,3 +96,16 @@ The GitHub Actions workflow lives in `rhods-devops-infra`:
 4. Run `scripts/run_gated_artifacts_promoter.py`
 
 See `docs/gated-artifacts-promoter/consumer-setup.md`.
+
+## Per-repository creator reporting
+
+The creator records `creator-outcomes` in Leader state and updates the existing
+consolidated Leader summary comment, including failures with no child PR URL.
+It processes the remaining repositories after an error, publishes what it
+collected, then exits nonzero if creation/operation errors remain. An
+`automerge: no` policy or GitHub's explicit auto-merge-disabled warning is
+reported separately and does not itself fail a successful PR creation.
+
+Same-trigger partial retries preserve unattempted child state and observations.
+See [the reporter documentation](../gap-failure-reporter/README.md) for the
+data contract, dashboard columns and recovery behavior.
