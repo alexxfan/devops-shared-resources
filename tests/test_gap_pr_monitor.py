@@ -59,6 +59,18 @@ from scripts.gap_pr_monitor import (
 )
 
 
+
+@pytest.fixture(autouse=True)
+def history_merge_boundary(monkeypatch):
+    # Coordinator tests already fake GitHub statuses and publication. Keep the
+    # new GitHub mutation behind the same boundary; test_leader_history covers
+    # its real command contract, SHA checks, and publication ordering offline.
+    from unittest.mock import Mock
+    operation = Mock()
+    monkeypatch.setattr("scripts.gap_pr_monitor.prepare_leader_history_merge", operation)
+    return operation
+
+
 def _fake_child_monitor(
     monkeypatch: pytest.MonkeyPatch,
     *,
