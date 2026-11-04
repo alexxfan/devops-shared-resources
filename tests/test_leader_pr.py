@@ -140,7 +140,7 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
                 / "2026-09-20_gap-existing"
             )
             existing.mkdir(parents=True, exist_ok=True)
-            (existing / "state.json").write_text("{}", encoding="utf-8")
+            (existing / "state.json").write_text('{"pull-requests": []}', encoding="utf-8")
             return _completed("")
         if command[0] == "git" and command[1] == "status":
             return _completed("M  GAP Leaders/2026-09-20_gap-existing/state.json\n")
@@ -263,7 +263,7 @@ def test_update_existing_does_not_close_current_leader(
             assert cwd is not None
             existing = Path(cwd) / "GAP Leaders" / "2026-09-20_gap-existing"
             existing.mkdir(parents=True, exist_ok=True)
-            (existing / "state.json").write_text("{}", encoding="utf-8")
+            (existing / "state.json").write_text('{"pull-requests": []}', encoding="utf-8")
             return _completed("")
         if command[0] == "git" and command[1] == "status":
             return _completed("M  GAP Leaders/2026-09-20_gap-existing/state.json\n")

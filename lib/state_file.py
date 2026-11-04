@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from lib.creator_outcomes import validate_outcomes
+
 DEFAULT_LEADER_REPO = "red-hat-data-services/gated-artifacts-promoter"
 
 # Stage 1 initial status written by the PR sync workflow (RHOAIENG-93524).
@@ -131,11 +133,14 @@ class PromoterState:
     pull_requests: list[StatePullRequest] = field(default_factory=list)
     # Set when the GAP run has concluded; omitted from JSON while unset.
     overall_status: str | None = None
+    creator_outcomes: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "pull-requests": [pr.to_dict() for pr in self.pull_requests]
         }
+        if self.creator_outcomes:
+            payload["creator-outcomes"] = validate_outcomes(self.creator_outcomes)
         if self.overall_status is not None:
             payload["overall-status"] = self.overall_status
         return payload
@@ -199,6 +204,7 @@ def build_state(
     pull_requests: list[StatePullRequest] | list[dict[str, Any]] | None = None,
     prs: list[StatePullRequest] | list[dict[str, Any]] | None = None,
     overall_status: str | None = None,
+    creator_outcomes: list[dict[str, str]] | None = None,
 ) -> PromoterState:
     """Build a validated PromoterState from PR records.
 
@@ -229,6 +235,7 @@ def build_state(
     state = PromoterState(
         pull_requests=normalized,
         overall_status=_normalize_overall_status(overall_status),
+        creator_outcomes=validate_outcomes(creator_outcomes or []),
     )
     validate_state(state.to_dict())
     return state
@@ -256,6 +263,11 @@ def validate_state(data: Any) -> dict[str, Any]:
     normalized: dict[str, Any] = {
         "pull-requests": [pr.to_dict() for pr in prs]
     }
+    if "creator-outcomes" in data:
+        try:
+            normalized["creator-outcomes"] = validate_outcomes(data["creator-outcomes"])
+        except ValueError as exc:
+            raise StateFileError(str(exc)) from exc
     # Accept either wire key or pythonic alias from callers.
     overall = _normalize_overall_status(
         data.get("overall-status", data.get("overall_status"))

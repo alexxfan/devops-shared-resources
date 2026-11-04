@@ -15,10 +15,14 @@ from lib.git_utils import authenticated_clone_url
 from lib.state_file import (
     DEFAULT_LEADER_REPO,
     PromoterState,
+    StatePullRequest,
     find_existing_state_path,
     state_path_for_trigger,
     write_state_file,
+    load_state_file,
 )
+
+from lib.creator_outcomes import PR, merge_outcomes
 
 GAP_LABEL = "gated-artifacts-promoter"
 LEADER_BRANCH_PREFIX = "gap-leader"
@@ -365,6 +369,19 @@ class LeaderPRManager:
                 self.run_git(["checkout", "-B", branch], cwd=workdir, mutate=True)
                 state_rel = state_path_for_trigger(trigger_id)
 
+            if existing and (workdir / state_rel).exists():
+                previous_state = load_state_file(workdir / state_rel)
+                attempted = {item["repo"].lower() for item in state.creator_outcomes}
+                if attempted:
+                    # --only retries must not remove other child PRs/progress.
+                    for index, child in enumerate(previous_state["pull-requests"]):
+                        match = PR.fullmatch(child["pr-url"])
+                        if match and match[1].lower() not in attempted:
+                            state.pull_requests.append(StatePullRequest.from_mapping(child, index=index))
+                state.creator_outcomes = merge_outcomes(
+                    previous_state.get("creator-outcomes", []), state.creator_outcomes
+                )
+
             pr_body = body or self._default_body(
                 state, trigger_id=trigger_id, state_path=state_rel
             )
@@ -455,6 +472,16 @@ class LeaderPRManager:
             )
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+    def publish_creator_outcomes(self, result: LeaderPRResult, state: PromoterState) -> None:
+        """Use the reporter's existing summary marker, never a second comment."""
+        if not result.pr_url:
+            return
+        from scripts.gap_failure_reporter import publish_creator_outcomes
+        publish_creator_outcomes(
+            result.pr_url, state.creator_outcomes,
+            dry_run=self.dry_run, gh_runner=lambda args: self.run_gh(args),
+        )
 
     def _default_body(
         self,

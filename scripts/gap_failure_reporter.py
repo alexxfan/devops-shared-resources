@@ -16,6 +16,7 @@ Separate from Stage-1 build gating. Each run (hourly schedule or dispatch):
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
@@ -60,6 +61,11 @@ ENV_LEADER_PR_URL = gpm.ENV_LEADER_PR_URL
 ENV_PR_LABELS = gpm.ENV_PR_LABELS
 ENV_STATE_FILE = gpm.ENV_STATE_FILE
 ENV_TRIGGER_ID = gpm.ENV_TRIGGER_ID
+
+from lib.creator_outcomes import validate_outcomes
+
+CREATOR_START = "<!-- gap-creator-outcomes -->"
+CREATOR_END = "<!-- /gap-creator-outcomes -->"
 
 SUMMARY_MARKER = "<!-- gap-failure-summary -->"
 DEFAULT_CHECK_NAME = "gated artifacts promoter"
@@ -205,7 +211,7 @@ def fetch_pull_request(
             ref.slug,
             "--json",
             "number,url,state,mergedAt,title,headRefOid,closedAt,"
-            "baseRefName,headRefName,labels",
+            "baseRefName,headRefName,labels,autoMergeRequest",
         ]
     )
     try:
@@ -553,11 +559,85 @@ def build_child_row(
     )
 
 
+def render_creator_outcomes(outcomes: Sequence[dict[str, str]]) -> str:
+    records = [item for item in validate_outcomes(list(outcomes)) if item["outcome"] != "success"]
+    def creator_cell(value):
+        return html.escape(_cell(value), quote=False)
+    lines = [CREATOR_START, "### Repository creation / auto-merge reports", "",
+             "These creator observations are separate from component build failures.", ""]
+    if not records:
+        lines.append("No outstanding repository creation or auto-merge warnings recorded.")
+    else:
+        lines.extend(["| Repository | Source → target | Category | Child PR | Reason / action | Creator run | Observed at |",
+                      "| --- | --- | --- | --- | --- | --- | --- |"])
+        for item in records:
+            repo = item["repo"]
+            pr = item.get("pr-url", "")
+            pr_cell = f"[#{pr.rsplit('/', 1)[-1]}]({pr})" if pr else "—"
+            run = item.get("workflow-url", "")
+            lines.append("| " + " | ".join([
+                f"[{repo}](https://github.com/{repo})",
+                creator_cell(item["source-branch"] + " → " + item["target-branch"]),
+                creator_cell(item["outcome"]), pr_cell, creator_cell(item["reason"]),
+                f"[Workflow run]({run})" if run else "—", creator_cell(item["observed-at"]),
+            ]) + " |")
+    lines.extend(["", CREATOR_END])
+    return "\n".join(lines)
+
+
+def current_creator_outcomes(outcomes, *, gh_runner=None):
+    """Keep unresolved evidence on lookup errors; merged PRs need no manual action."""
+    records = validate_outcomes(outcomes)
+    result = []
+    cache = {}
+    for item in records:
+        if item["outcome"] != "success" and item.get("pr-url"):
+            url = item["pr-url"]
+            if url not in cache:
+                try:
+                    cache[url] = fetch_pull_request(url, gh_runner=gh_runner)
+                except (GapPrMonitorError, GhCommandError, ValueError):
+                    cache[url] = None
+            pr = cache[url]
+            if pr is None:
+                item = dict(item, reason=item["reason"] + " (Current PR lookup unavailable; recorded observation retained.)")
+            if pr and (pr.get("mergedAt") or (
+                    item["outcome"] == "automerge-unavailable" and pr.get("autoMergeRequest"))):
+                continue
+        result.append(item)
+    return result
+
+
+def publish_creator_outcomes(leader_pr_url, outcomes, *, dry_run=False, gh_runner=None):
+    """Update only the creator section; preserve #45's current build summary."""
+    run = gh_runner or _run_gh
+    section = render_creator_outcomes(outcomes)
+    comments = list_issue_comments(leader_pr_url, gh_runner=run)
+    existing = find_summary_comment(comments)
+    if existing:
+        body = str(existing.get("body") or "")
+        if CREATOR_START in body:
+            start = body.index(CREATOR_START)
+            end = body.find(CREATOR_END, start)
+            if end < 0:
+                raise GapPrMonitorError("Creator report section is incomplete; refusing to overwrite the summary")
+            body = body[:start] + section + body[end + len(CREATOR_END):]
+        else:
+            body = body.rstrip() + "\n\n" + section + "\n"
+    else:
+        body = (SUMMARY_MARKER + "\n## GAP repository reports\n\n" + section
+                + "\n\nComponent build status will be refreshed by the failure reporter.\n")
+    return upsert_leader_summary_comment(
+        leader_pr_url, body, dry_run=dry_run, gh_runner=run, comments=comments
+    )
+
+
 def render_summary_markdown(
     rows: Sequence[ChildFailureRow],
     *,
     leader_pr_url: str,
     generated_at: str | None = None,
+    creator_outcomes: Sequence[dict[str, str]] = (),
 ) -> str:
     stamp = generated_at or utc_now_stamp()
     lines = [
@@ -575,6 +655,8 @@ def render_summary_markdown(
         "PipelineRun page, else the GitHub check run — no cluster token required.",
         "",
     ]
+    if creator_outcomes:
+        lines.extend([render_creator_outcomes(creator_outcomes), ""])
     if not rows:
         lines.extend(
             [
@@ -646,10 +728,12 @@ def upsert_leader_summary_comment(
     *,
     dry_run: bool = False,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
+    comments: Sequence[dict[str, Any]] | None = None,
 ) -> tuple[int | None, bool, bool]:
     run = gh_runner or _run_gh
     ref = parse_pr_url(leader_pr_url)
-    comments = list_issue_comments(leader_pr_url, gh_runner=run)
+    if comments is None:
+        comments = list_issue_comments(leader_pr_url, gh_runner=run)
     existing = find_summary_comment(comments)
 
     if dry_run:
@@ -767,7 +851,8 @@ def report_for_leader(
     )
     payload = load_state(path)
     rows = collect_rows_from_state(payload, gh_runner=run)
-    body = render_summary_markdown(rows, leader_pr_url=leader_pr_url)
+    creator_outcomes = current_creator_outcomes(payload.get("creator-outcomes", []), gh_runner=run)
+    body = render_summary_markdown(rows, leader_pr_url=leader_pr_url, creator_outcomes=creator_outcomes)
     comment_id, created, updated = upsert_leader_summary_comment(
         leader_pr_url, body, dry_run=dry_run, gh_runner=run
     )
