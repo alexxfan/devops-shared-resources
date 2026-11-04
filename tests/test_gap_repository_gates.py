@@ -1348,7 +1348,8 @@ def test_head_that_moves_again_is_deferred_without_a_success_post(tmp_path: Path
     )
     assert posts == []
     assert result.success_urls == []
-    assert _saved(path)["pull-requests"][0]["pr-status"] == "new"
+    assert _saved(path)["pull-requests"][0]["pr-status"] == "build-pending"
+    assert result.pending_urls == [URL]
     assert URL in result.skipped_urls
     assert any("deferred" in line and URL in line for line in result.reports)
 
