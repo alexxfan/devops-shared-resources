@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from lib.leader_history import (
+    RESULT_LABELS,
     prepare_leader_history_merge,
     write_history_snapshot,
 )
@@ -26,14 +27,14 @@ def metadata():
 
 
 @pytest.mark.parametrize("outcome,label,prefix", [
-    ("failure", "gap-result-failure", "[GAP failed]"),
-    ("success", "gap-result-success", "[GAP passed]"),
+    ("failure", "result-gap-failure", "[GAP failed]"),
+    ("success", "result-gap-success", "[GAP passed]"),
 ])
 def test_terminal_leader_is_labelled_before_sha_pinned_auto_merge(outcome, label, prefix):
     calls = []
     pull = metadata()
     pull["title"] = "[GAP failed] GAP leader: gap-test"
-    pull["labels"].append({"name": "gap-result-failure"})
+    pull["labels"].append({"name": "result-gap-failure"})
 
     def gh(args):
         calls.append(list(args))
@@ -51,7 +52,7 @@ def test_terminal_leader_is_labelled_before_sha_pinned_auto_merge(outcome, label
     assert not any("--admin" in c or "--delete-branch" in c for c in calls)
     assert not any("statuses" in " ".join(c) for c in calls)
     if outcome == "success":
-        assert any("DELETE" in c and c[-1].endswith("/gap-result-failure") for c in calls)
+        assert any("DELETE" in c and c[-1].endswith("/result-gap-failure") for c in calls)
     else:
         assert not any("DELETE" in c for c in calls)
 
@@ -232,3 +233,15 @@ def test_merged_leader_for_different_head_cannot_authorize_stale_status():
     with pytest.raises(RuntimeError, match="head moved"):
         prepare_leader_history_merge(LEADER, SHA, overall_status="failure",
                                      gh_runner=lambda args: json.dumps(pull))
+
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+@pytest.mark.parametrize("result_first", [True, False])
+def test_result_label_does_not_shadow_leader_trigger(outcome, result_first):
+    """Finalization labels must not redirect the next scheduled monitor."""
+    from scripts.gap_pr_monitor import extract_trigger_id_from_labels
+
+    trigger = "gap-65c20b4a54fb4221ae161d227cd3402c"
+    result_label = RESULT_LABELS[outcome]
+    labels = [result_label, trigger] if result_first else [trigger, result_label]
+    assert extract_trigger_id_from_labels(labels) == trigger
+    assert extract_trigger_id_from_labels([result_label]) is None

@@ -53,8 +53,8 @@ No admin override is used. A blocked merge leaves the PR and branch available.
 
 | Run result | Leader label | Title prefix | State retained |
 | --- | --- | --- | --- |
-| Success | `gap-result-success` | `[GAP passed]` | Original path plus successful-history snapshot |
-| Failure | `gap-result-failure` | `[GAP failed]` | Original path plus unsuccessful-history snapshot |
+| Success | `result-gap-success` | `[GAP passed]` | Original path plus successful-history snapshot |
+| Failure | `result-gap-failure` | `[GAP failed]` | Original path plus unsuccessful-history snapshot |
 
 Both outcomes get a history snapshot committed **with** the canonical state update:
 

@@ -12,7 +12,8 @@ from lib.pr_status_updater import parse_pr_url
 
 HISTORY_ROOT = Path("GAP History")
 HISTORY_FOLDERS = {"success": "successful", "failure": "unsuccessful"}
-RESULT_LABELS = {"success": "gap-result-success", "failure": "gap-result-failure"}
+# Keep result labels outside the gap-* trigger-ID namespace used by monitors.
+RESULT_LABELS = {"success": "result-gap-success", "failure": "result-gap-failure"}
 
 
 def write_history_snapshot(repo_root: Path, state_path: Path) -> Path | None:
