@@ -249,10 +249,12 @@ def test_periodic_report_reads_persisted_creation_failure(tmp_path, monkeypatch)
     assert path.read_text() == json.dumps(payload)
 
 
-def test_partial_creator_retry_keeps_unattempted_child_progress(tmp_path, monkeypatch):
+@pytest.mark.parametrize("retry", ["updated", "failed_without_pr", "no_change", "failed_with_current_child"])
+def test_partial_creator_retry_keeps_unattempted_child_progress(tmp_path, monkeypatch, retry):
     monkeypatch.setenv("GITHUB_TOKEN", "unused")
     previous = build_state(
-        pull_requests=[{"repo": "foo", "pr-url": URL, "pr-status": "build-failure"},
+        pull_requests=[{"repo": "foo", "pr-url": URL, "pr-status": "build-failure",
+                        "builds": [{"component": "odh-foo", "image": "quay.io/acme/foo@sha256:" + "a" * 64}]},
                        {"repo": "other", "pr-url": "https://github.com/acme/other/pull/3",
                         "pr-status": "build-success"}],
         creator_outcomes=[record(), record(repo="acme/other")],
@@ -278,15 +280,22 @@ def test_partial_creator_retry_keeps_unattempted_child_progress(tmp_path, monkey
             return completed("M state.json")
         return completed()
     state = build_state(
-        pull_requests=[StatePullRequest(repo="foo", pr_url=URL)],
-        creator_outcomes=[record("success", pr_url=URL)],
+        pull_requests=[StatePullRequest(repo="foo", pr_url=URL)] if retry in {"updated", "failed_with_current_child"} else [],
+        creator_outcomes=[record("creation-failure" if retry in {"failed_without_pr", "failed_with_current_child"} else "success",
+                                 pr_url=URL if retry == "updated" else "")],
     )
     manager = LeaderPRManager(repo="acme/leaders", runner=gh_git)
     manager.create_or_update(state, trigger_id="gap-test")
-    assert {p["repo"]: p["pr-status"] for p in captured["pull-requests"]} == {
-        "foo": "new", "other": "build-success"}
+    expected = {"other": "build-success"}
+    if retry != "no_change":
+        expected["foo"] = "new" if retry in {"updated", "failed_with_current_child"} else "build-failure"
+    assert {p["repo"]: p["pr-status"] for p in captured["pull-requests"]} == expected
+    assert len(captured["pull-requests"]) == len(expected)
+    if retry == "failed_without_pr":
+        assert next(p for p in captured["pull-requests"] if p["repo"] == "foo") == previous["pull-requests"][0]
     assert {r["repo"]: r["outcome"] for r in captured["creator-outcomes"]} == {
-        "acme/foo": "success", "acme/other": "creation-failure"}
+        "acme/foo": "creation-failure" if retry in {"failed_without_pr", "failed_with_current_child"} else "success",
+        "acme/other": "creation-failure"}
 
 
 def test_manual_policy_does_not_become_workflow_failure(tmp_path, monkeypatch):
@@ -334,3 +343,52 @@ def test_config_aliases_do_not_duplicate_or_drop_repository_outcomes(tmp_path):
     records = manager.create_or_update.call_args.args[0].creator_outcomes
     assert len(records) == 1 and records[0]["outcome"] == "success"
     assert result.failures == []
+
+
+@pytest.mark.parametrize("malformation", ["timestamp", "duplicate", "wrong_type"])
+def test_invalid_creator_data_does_not_block_build_reports_or_other_leaders(
+        tmp_path, monkeypatch, capsys, malformation):
+    from types import SimpleNamespace
+
+    broken = record()
+    broken["observed-at"] = "not-a-timestamp"
+    invalid = {"timestamp": [broken], "duplicate": [record(), record()],
+               "wrong_type": {"not": "a list"}}[malformation]
+    leaders = [
+        SimpleNamespace(number=9, url=LEADER, head_ref="gap-one", labels=()),
+        SimpleNamespace(number=10, url="https://github.com/acme/leaders/pull/10",
+                        head_ref="gap-two", labels=()),
+    ]
+    paths = {}
+    originals = {}
+    for leader, creator_data in zip(leaders, [invalid, [record()]]):
+        path = tmp_path / leader.head_ref / "state.json"
+        path.parent.mkdir()
+        path.write_text(json.dumps({"pull-requests": [], "creator-outcomes": creator_data}))
+        paths[leader.head_ref] = path
+        originals[path] = path.read_bytes()
+    selected = {}
+    monkeypatch.setattr(fr, "list_open_leader_prs", lambda *a, **k: leaders)
+    monkeypatch.setattr(fr, "checkout_leader_branch",
+                        lambda root, head_ref, **kwargs: selected.update(path=paths[head_ref]))
+    monkeypatch.setattr(fr, "resolve_state_file", lambda **kwargs: selected["path"])
+    row = fr.ChildFailureRow(repo="component", pr_url=URL, pr_number=2,
+                             state_status="build-failure", pr_state="open",
+                             merged=False, reason="Current component build failed")
+    monkeypatch.setattr(fr, "collect_rows_from_state", lambda *a, **k: [row])
+    published = {}
+    def publish(url, body, **kwargs):
+        published[url] = body
+        return int(url.rsplit("/", 1)[-1]), True, False
+    monkeypatch.setattr(fr, "upsert_leader_summary_comment", publish)
+
+    results = fr.run_scheduled_reporters(repo_root=tmp_path, leader_repo="acme/leaders")
+    assert len(results) == 2
+    assert set(published) == {leader.url for leader in leaders}
+    assert all("| component |" in body and "build-failure" in body
+               for body in published.values())
+    assert fr.CREATOR_START not in published[LEADER]
+    assert fr.CREATOR_START in published[leaders[1].url]
+    assert "creation-failure" in published[leaders[1].url]
+    assert "invalid creator-outcomes" in capsys.readouterr().err
+    assert all(path.read_bytes() == original for path, original in originals.items())

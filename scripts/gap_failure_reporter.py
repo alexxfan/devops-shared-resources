@@ -851,7 +851,13 @@ def report_for_leader(
     )
     payload = load_state(path)
     rows = collect_rows_from_state(payload, gh_runner=run)
-    creator_outcomes = current_creator_outcomes(payload.get("creator-outcomes", []), gh_runner=run)
+    try:
+        creator_outcomes = current_creator_outcomes(payload.get("creator-outcomes", []), gh_runner=run)
+    except ValueError:
+        # Optional creator diagnostics must not disable this build table or
+        # abort reporting for unrelated Leaders. Do not log the invalid payload.
+        print(f"WARNING: ignoring invalid creator-outcomes in {path}; creator section omitted.", file=sys.stderr)
+        creator_outcomes = []
     body = render_summary_markdown(rows, leader_pr_url=leader_pr_url, creator_outcomes=creator_outcomes)
     comment_id, created, updated = upsert_leader_summary_comment(
         leader_pr_url, body, dry_run=dry_run, gh_runner=run

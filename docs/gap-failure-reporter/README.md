@@ -75,3 +75,9 @@ write Leader PR issue comments; failure is surfaced after the state has been
 saved so a subsequent reporter pass can recover it. Dry run sends no comment
 writes. This work neither changes component gate decisions nor enables repository
 auto-merge settings, Slack notifications, or run-history retention.
+
+A failed retry that cannot determine the child PR URL retains the previous
+child PR and its recorded build/status data. A successful no-change retry
+still clears that repository's old child entry. Malformed optional creator
+observations are warned about and omitted from rendering; the build table and
+reports for other Leaders continue, and the stored state is not rewritten.
