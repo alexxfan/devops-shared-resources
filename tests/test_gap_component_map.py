@@ -71,3 +71,8 @@ def test_invalid_mapping_is_not_an_empty_allowlist(data):
 def test_bad_contents_response_is_an_error(response):
     with pytest.raises(CheckQueryError):
         fetch_component_repo_map(lambda args: response)
+
+def test_exact_and_ea_build_component_allowlisting():
+    assert component_is_allowed("odh-foo-v3-6", frozenset({"odh-foo-v3-6"}))
+    assert component_is_allowed("odh-foo-v3-7-ea-1", frozenset({"odh-foo"}))
+    assert not component_is_allowed("odh-other-v3-7-ea-1", frozenset({"odh-foo"}))

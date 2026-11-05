@@ -32,6 +32,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from lib.gap_check_selection import DEFAULT_BUILD_APP_SLUG, default_build_producer
+from lib.konflux_builds import build_status_source, DEFAULT_UI
 from lib.github_check_runs import CheckQueryError, list_check_runs
 from lib.pr_status_updater import GhCommandError, parse_pr_url
 from scripts import gap_pr_monitor as gpm
@@ -398,6 +399,7 @@ def build_child_row(
     entry: dict[str, Any],
     *,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
+    reuse_monitor_evidence: bool = False,
 ) -> ChildFailureRow | None:
     repo = str(entry.get("repo") or "").strip()
     pr_url = str(entry.get("pr-url") or entry.get("pr_url") or "").strip()
@@ -407,7 +409,26 @@ def build_child_row(
     if state_status in {"success", "build-success"}:
         return None
 
-    pr = fetch_pull_request(pr_url, gh_runner=gh_runner)
+    ref = parse_pr_url(pr_url)
+    evidence = entry.get("build-observations")
+    konflux_evidence = isinstance(evidence, dict) and evidence.get("source") == "konflux"
+    reusable = (
+        reuse_monitor_evidence and konflux_evidence
+        and evidence.get("repository", "").lower() == f"{ref.owner}/{ref.repo}".lower()
+        and str(evidence.get("pr", "")) == str(ref.number)
+        and evidence.get("pr-state") in {"OPEN", "CLOSED", "MERGED"}
+        and re.fullmatch(r"[0-9a-f]{40}", str(evidence.get("head-sha", "")))
+    )
+    if reusable:
+        # This invocation follows the monitor's publish/head guard. Render its
+        # fresh receipt rather than scanning the same child PRs a second time.
+        pr = {"state": evidence["pr-state"], "number": ref.number,
+              "headRefOid": evidence["head-sha"],
+              "mergedAt": evidence["pr-state"] == "MERGED"}
+    else:
+        # Standalone reports still check the current PR head before displaying
+        # a persisted receipt, so old-head failures are not misrepresented.
+        pr = fetch_pull_request(pr_url, gh_runner=gh_runner)
     pr_state = str(pr.get("state") or "").lower() or "unknown"
     merged = bool(pr.get("mergedAt"))
     number = int(pr.get("number") or parse_pr_url(pr_url).number)
@@ -417,9 +438,11 @@ def build_child_row(
     if not should_report_child(state_status=state_status, pr_state=pr_state):
         return None
 
-    gap_desc = fetch_gap_status_description(
-        ref.owner, ref.repo, head_sha, gh_runner=gh_runner
-    )
+    gap_desc = ""
+    if reusable and state_status == "merge-failure":
+        gap_desc = str(evidence.get("gate-reason") or "")
+    elif state_status == "merge-failure" or not (konflux_evidence or build_status_source() == "konflux"):
+        gap_desc = fetch_gap_status_description(ref.owner, ref.repo, head_sha, gh_runner=gh_runner)
     close_reason = None
     if pr_state == "closed":
         comments = list_issue_comments(pr_url, gh_runner=gh_runner)
@@ -428,7 +451,40 @@ def build_child_row(
     # Build links only for build-failure. merge-failure / build-pending / new:
     # reason text only — never attach push or unrelated PR build links.
     status_key = (state_status or "").strip()
-    if status_key in {"merge-failure", "build-pending", "new"}:
+    evidence_reason = None
+    if konflux_evidence or build_status_source() == "konflux":
+        build_links = ()
+        if (not konflux_evidence or evidence.get("head-sha") != head_sha
+                or evidence.get("repository", "").lower() != f"{ref.owner}/{ref.repo}".lower()
+                or str(evidence.get("pr", "")) != str(number)):
+            evidence_reason = "Konflux evidence is missing or belongs to an older head; awaiting monitor refresh"
+            if status_key != "merge-failure":
+                status_key = state_status = "build-pending"
+        else:
+            if evidence.get("query-error"):
+                evidence_reason = "Konflux lookup unavailable: " + _clip(str(evidence["query-error"]))
+            elif status_key in {"build-pending", "new"}:
+                pending = [str(r.get("component", "?")) + ": " + str(r.get("status", "unknown"))
+                           for r in evidence.get("runs", []) if isinstance(r, dict) and r.get("status") != "success"]
+                evidence_reason = "Konflux: " + "; ".join(pending) if pending else "Awaiting monitor refresh"
+            if status_key == "build-failure":
+                from urllib.parse import urlsplit
+                expected_host = urlsplit(os.environ.get("KONFLUX_UI_URL", DEFAULT_UI)).netloc
+                verified = []
+                for record in evidence.get("runs", []):
+                    if not isinstance(record, dict) or record.get("status") not in {"failure", "timed_out"}:
+                        continue
+                    if record.get("head_sha") != head_sha:
+                        continue
+                    link = str(record.get("url", ""))
+                    parsed = urlsplit(link)
+                    if (parsed.scheme == "https" and parsed.netloc == expected_host
+                            and re.fullmatch(r"/ns/[a-z0-9.-]+/pipelinerun/[a-z0-9.-]+", parsed.path)
+                            and not parsed.query and not parsed.fragment):
+                        verified.append(BuildCheckLink(name=str(record.get("name") or record.get("component")),
+                                                       conclusion=record["status"], url=link))
+                build_links = tuple(verified)
+    elif status_key in {"merge-failure", "build-pending", "new"}:
         build_links: tuple[BuildCheckLink, ...] = ()
     else:
         build_links = fetch_failed_build_check_links(
@@ -446,7 +502,7 @@ def build_child_row(
         if close_reason:
             reason_parts.append(close_reason)
     if status_key in {"build-pending", "new"}:
-        reason_parts.append("builds pending")
+        reason_parts.append(evidence_reason or "builds pending")
     elif status_key == "merge-failure":
         reason_parts.append(gap_desc or f"{repo}#{number} merge-failure")
     elif status_key == "build-failure" or (
@@ -467,6 +523,8 @@ def build_child_row(
     elif state_status:
         reason_parts.append(f"state pr-status={state_status}")
 
+    if evidence_reason and status_key not in {"build-pending", "new"}:
+        reason_parts.append(evidence_reason)
     reason = " — ".join(reason_parts) if reason_parts else state_status or pr_state
     return ChildFailureRow(
         repo=repo,
@@ -571,9 +629,9 @@ def render_summary_markdown(
         "This comment is maintained by `gap-failure-reporter` "
         "(one comment, updated each run).",
         "",
-        "Build links are completed Konflux check failures whose name includes "
-        "``on-pull-request`` (GitHub Checks only; never ``on-push``). URL prefers "
-        "a PipelineRun page, else the GitHub check run — no cluster token required. "
+        "Konflux-enabled entries use the monitor's persisted current-head PipelineRun evidence "
+        "for failure reasons and links, including both PR pipeline naming conventions. "
+        "Legacy entries use GitHub check diagnostics until migrated. "
         "``merge-failure`` / ``build-pending`` rows leave Build links blank.",
         "",
     ]
@@ -705,6 +763,7 @@ def collect_rows_from_state(
     *,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
     continue_on_error: bool = True,
+    reuse_monitor_evidence: bool = False,
 ) -> list[ChildFailureRow]:
     entries = payload.get("pull-requests")
     if not isinstance(entries, list):
@@ -714,7 +773,8 @@ def collect_rows_from_state(
         if not isinstance(entry, dict):
             continue
         try:
-            row = build_child_row(entry, gh_runner=gh_runner)
+            options = {"reuse_monitor_evidence": True} if reuse_monitor_evidence else {}
+            row = build_child_row(entry, gh_runner=gh_runner, **options)
         except (GapPrMonitorError, GhCommandError, ValueError) as exc:
             if not continue_on_error:
                 raise
@@ -759,6 +819,7 @@ def report_for_leader(
     dry_run: bool = False,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
     git_runner: Callable[..., str] | None = None,
+    reuse_monitor_evidence: bool = False,
 ) -> ReporterResult:
     run = gh_runner or _run_gh
     if head_ref:
@@ -772,7 +833,8 @@ def report_for_leader(
         allow_gap_dir_fallback=True,
     )
     payload = load_state(path)
-    rows = collect_rows_from_state(payload, gh_runner=run)
+    options = {"reuse_monitor_evidence": True} if reuse_monitor_evidence else {}
+    rows = collect_rows_from_state(payload, gh_runner=run, **options)
     try:
         creator_outcomes = current_creator_outcomes(payload.get("creator-outcomes", []), gh_runner=run)
     except ValueError:

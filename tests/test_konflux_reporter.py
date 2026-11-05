@@ -1,0 +1,87 @@
+"""Reporting must consume the monitor's exact Konflux evidence, not GH checks."""
+import copy
+import pytest
+from scripts import gap_failure_reporter as reporter
+from tests.test_konflux_builds import SHA, REPO, COMPONENT, run, observe
+
+
+@pytest.fixture
+def entry(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("Konflux build diagnostics must not query GitHub checks/statuses")
+    monkeypatch.setattr(reporter, "fetch_failed_build_check_links", forbidden)
+    monkeypatch.setattr(reporter, "fetch_gap_status_description", forbidden)
+    monkeypatch.setattr(reporter, "fetch_pull_request", lambda *args, **kwargs: {
+        "state": "OPEN", "number": 123, "headRefOid": SHA, "mergedAt": None,
+    })
+    failed = observe([run(status="False", reason="Failed")]).to_dict()
+    return {
+        "repo": "foo", "pr-url": "https://github.com/acme/foo/pull/123",
+        "pr-status": "build-failure",
+        "build-observations": {"source": "konflux", "head-sha": SHA,
+                               "repository": REPO, "pr": 123, "runs": [failed]},
+    }
+
+
+def test_failure_links_match_persisted_konflux_attempt_including_pull_request_name(entry):
+    row = reporter.build_child_row(entry)
+    assert row.state_status == "build-failure"
+    assert len(row.build_links) == 1
+    assert row.build_links[0].name == "foo-pull-request-r1"
+    assert row.build_links[0].url.endswith("/pipelinerun/foo-pull-request-r1")
+
+
+@pytest.mark.parametrize("field,value", [("head-sha", "b" * 40), ("repository", "acme/other"), ("pr", 999)])
+def test_stale_or_wrong_identity_is_not_reported_as_current_failure(entry, field, value):
+    entry["build-observations"][field] = value
+    row = reporter.build_child_row(entry)
+    assert row.state_status == "build-pending"
+    assert row.build_links == ()
+    assert "awaiting monitor refresh" in row.reason
+
+
+def test_konflux_mode_does_not_fall_back_to_github_for_unmigrated_state(entry, monkeypatch):
+    monkeypatch.setenv("GAP_BUILD_STATUS_SOURCE", "konflux")
+    del entry["build-observations"]
+    row = reporter.build_child_row(entry)
+    assert row.state_status == "build-pending"
+    assert row.build_links == ()
+
+
+def test_lookup_problem_is_visible_as_unknown_not_failed(entry):
+    entry["pr-status"] = "build-pending"
+    entry["build-observations"]["query-error"] = "Konflux lookup failed (HTTP 403)"
+    entry["build-observations"]["runs"] = []
+    row = reporter.build_child_row(entry)
+    assert "HTTP 403" in row.reason
+    assert row.state_status == "build-pending"
+
+
+@pytest.mark.parametrize("field,value", [("url", "https://evil.example/ns/rhoai-tenant/pipelinerun/run"),
+                                        ("head_sha", "c" * 40)])
+def test_untrusted_or_old_head_link_is_not_rendered(entry, field, value):
+    entry["build-observations"]["runs"][0][field] = value
+    assert reporter.build_child_row(entry).build_links == ()
+
+def test_comment_after_monitor_reuses_pr_and_build_receipt_without_second_scan(entry, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("A report immediately after monitoring must not query the child again")
+    monkeypatch.setattr(reporter, "fetch_pull_request", forbidden)
+    entry["build-observations"]["pr-state"] = "OPEN"
+    row = reporter.build_child_row(entry, reuse_monitor_evidence=True)
+    assert row.state_status == "build-failure"
+    assert row.pr_number == 123
+    assert row.build_links[0].name == "foo-pull-request-r1"
+
+
+def test_standalone_report_still_checks_current_head(entry, monkeypatch):
+    calls = []
+    def fetch(*args, **kwargs):
+        calls.append(args)
+        return {"state": "OPEN", "number": 123, "headRefOid": "b" * 40}
+    monkeypatch.setattr(reporter, "fetch_pull_request", fetch)
+    entry["build-observations"]["pr-state"] = "OPEN"
+    row = reporter.build_child_row(entry)
+    assert len(calls) == 1
+    assert row.state_status == "build-pending"
+    assert not row.build_links
