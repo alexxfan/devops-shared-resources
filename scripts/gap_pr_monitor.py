@@ -1826,16 +1826,6 @@ def _publish_gate_decision(
     """
     if decision.skip_status_post:
         return decision, None
-    if build_status_source() == "konflux":
-        # The first pass may have inspected many other PRs. Refresh immediately
-        # before publication so a same-head retry cannot inherit an old green.
-        decision = _decide_url(
-            decision.url, runner=runner, now=now, build_app_slug=build_app_slug,
-            build_app_id=build_app_id, retry_unknown=retry_unknown,
-            component_repo_map=component_repo_map,
-        )
-        if decision.skip_status_post:
-            return decision, None
     to_post = status_decision_for_post(
         decision,
         batch_concluded=batch_concluded,
@@ -1894,7 +1884,25 @@ def _publish_decisions(
     successes: list[str] = []
     reports: list[str] = []
     post_errors: list[tuple[str, str]] = []
-    # Provisional statuses from first-pass decisions (before head-move refresh).
+    if build_status_source() == "konflux":
+        # Refresh the whole batch before deriving the child-green hold. A retry
+        # can turn a terminal failure into pending/success; mixing fresh child
+        # decisions with the old batch outcome could release a green before EG.
+        # This is the existing second observation, moved ahead of all POSTs.
+        try:
+            decisions = tuple(
+                decision if decision.skip_status_post else _decide_url(
+                    decision.url, runner=runner, now=now, build_app_slug=build_app_slug,
+                    build_app_id=build_app_id, retry_unknown=retry_unknown,
+                    component_repo_map=component_repo_map,
+                )
+                for decision in decisions
+            )
+        except (GapPrMonitorError, GhCommandError, ValueError, RuntimeError) as exc:
+            # No status or state writes have happened: retain the prior batch
+            # rather than publishing a mix of refreshed and stale decisions.
+            raise GapPrMonitorError(f"Could not refresh child batch before publication: {exc}") from exc
+    # One coherent batch decides both persisted outcomes and the child-green hold.
     provisional_updates = {d.url: d.pr_status for d in decisions}
     batch_concluded = children_batch_concluded(list(provisional_updates.values()))
     overall_status = provisional_overall_status(payload, provisional_updates)

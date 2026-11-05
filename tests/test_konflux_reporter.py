@@ -1,5 +1,7 @@
 """Reporting must consume the monitor's exact Konflux evidence, not GH checks."""
 import copy
+import json
+
 import pytest
 from scripts import gap_failure_reporter as reporter
 from tests.test_konflux_builds import SHA, REPO, COMPONENT, run, observe
@@ -105,3 +107,31 @@ def test_merge_conflict_summary_reuses_monitor_facts_without_another_pr_scan(tmp
     row = reporter.build_child_row(child, reuse_monitor_evidence=True)
     assert row.state_status == "merge-failure"
     assert "merge conflict" in row.reason
+
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+def test_build_receipt_survives_eg_result_and_history_snapshot(tmp_path, monkeypatch, outcome):
+    """Stage-2 result handling and history retain Stage-1 evidence and image data."""
+    from scripts import gap_early_gate_results as eg
+    from lib.leader_history import write_history_snapshot
+    from tests.test_gap_early_gate_results import _bot_comment, PASSED_BARE_MARKER, FAILED_BARE_MARKER
+    receipt = {"source": "konflux", "repository": REPO, "pr": 123,
+               "head-sha": SHA, "pr-state": "OPEN", "runs": [observe([run()]).to_dict()]}
+    images = [{"component": "odh-foo", "image": "quay.io/acme/foo@sha256:" + "b" * 64}]
+    folder = tmp_path / "GAP Leaders" / "2026-11-05_gap-audit"
+    folder.mkdir(parents=True)
+    path = folder / "state.json"
+    path.write_text(json.dumps({"overall-status": "early-gate-triggered", "pull-requests": [{
+        "repo": "foo", "pr-url": "https://github.com/acme/foo/pull/123",
+        "pr-status": "success", "builds": images, "build-observations": receipt,
+    }]}))
+    comment = PASSED_BARE_MARKER if outcome == "success" else FAILED_BARE_MARKER
+    monkeypatch.setattr(eg, "list_leader_pr_comments", lambda *a, **k: [_bot_comment(comment)])
+    result = eg.run_early_gate_results(
+        repo_root=tmp_path, leader_pr_url="https://github.com/acme/gap/pull/9",
+        state_file=str(path), publish=False)
+    assert result.overall_status == outcome
+    for saved in (path, write_history_snapshot(tmp_path, path)):
+        child = json.loads(saved.read_text())["pull-requests"][0]
+        assert child["build-observations"] == receipt
+        assert child["builds"] == images
+        assert child["pr-status"] == "success"

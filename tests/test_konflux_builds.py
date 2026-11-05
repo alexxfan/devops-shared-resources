@@ -417,3 +417,62 @@ def test_prefetch_query_failure_is_cached_for_the_poll_and_reset_explicitly():
 def test_prefetch_has_a_hard_concurrency_limit(workers):
     with pytest.raises(KonfluxQueryError):
         client(lambda url: {}).prefetch_prs([], max_workers=workers)
+
+@pytest.mark.parametrize("initial,fresh,expected_overall", [
+    (("success", "build-failure"), ("build-pending", "success"), None),
+    (("build-failure", "build-failure"), ("success", "success"), "early-gate-triggered"),
+])
+def test_retry_refresh_recomputes_batch_hold_before_posting_child_greens(
+        tmp_path, monkeypatch, initial, fresh, expected_overall):
+    """Retry changes must not release a good child before its siblings or EG."""
+    from scripts import gap_pr_monitor as monitor
+    from tests.test_gap_pr_monitor import FakeUpdater, _gate
+    urls = ["https://github.com/acme/one/pull/1", "https://github.com/acme/two/pull/2"]
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"pull-requests": [
+        {"repo": repo, "pr-url": url, "pr-status": "new", "builds": []}
+        for repo, url in zip(("one", "two"), urls)
+    ]}))
+    calls = {url: 0 for url in urls}
+    def decide(url, **kwargs):
+        index = urls.index(url)
+        status = initial[index] if calls[url] == 0 else fresh[index]
+        calls[url] += 1
+        cli = {"success": "success", "build-failure": "failure", "build-pending": "pending"}[status]
+        return _gate(url, status, cli)
+    updater = FakeUpdater(check_name='gated artifacts promoter')
+    monkeypatch.setenv("GAP_BUILD_STATUS_SOURCE", "konflux")
+    monkeypatch.setattr(monitor, "fetch_component_repo_map", lambda runner: {})
+    monkeypatch.setattr(monitor, "_decide_url", decide)
+    result = monitor.run_monitor(path, gh_runner=lambda *_: "",
+                                 updater_factory=lambda **kwargs: updater)
+    assert result.overall_status == expected_overall
+    assert all(status == "pending" for _, status, _ in updater.posts)
+    assert all(count == 2 for count in calls.values())
+
+def test_refresh_failure_cannot_partially_publish_an_old_batch(tmp_path, monkeypatch):
+    """An unavailable second observation must leave statuses and state untouched."""
+    from scripts import gap_pr_monitor as monitor
+    from tests.test_gap_pr_monitor import FakeUpdater, _gate
+    urls = ["https://github.com/acme/one/pull/1", "https://github.com/acme/two/pull/2"]
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"pull-requests": [
+        {"repo": repo, "pr-url": url, "pr-status": "new"}
+        for repo, url in zip(("one", "two"), urls)
+    ]}))
+    before = path.read_bytes()
+    calls = []
+    def decide(url, **kwargs):
+        calls.append(url)
+        if len(calls) == 4:
+            raise RuntimeError("GitHub PR metadata unavailable during refresh")
+        return _gate(url, "success", "success")
+    updater = FakeUpdater(check_name="gated artifacts promoter")
+    monkeypatch.setenv("GAP_BUILD_STATUS_SOURCE", "konflux")
+    monkeypatch.setattr(monitor, "fetch_component_repo_map", lambda runner: {})
+    monkeypatch.setattr(monitor, "_decide_url", decide)
+    with pytest.raises(monitor.GapPrMonitorError, match="refresh child batch"):
+        monitor.run_monitor(path, gh_runner=lambda *_: "",
+                            updater_factory=lambda **kwargs: updater)
+    assert not updater.posts
+    assert path.read_bytes() == before
