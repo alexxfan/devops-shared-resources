@@ -629,6 +629,8 @@ def render_summary_markdown(
         "This comment is maintained by `gap-failure-reporter` "
         "(one comment, updated each run).",
         "",
+        "Source: the latest child-monitoring observations in `state.json`.",
+        "",
         "Konflux-enabled entries use the monitor's persisted current-head PipelineRun evidence "
         "for failure reasons and links, including both PR pipeline naming conventions. "
         "Legacy entries use GitHub check diagnostics until migrated. "

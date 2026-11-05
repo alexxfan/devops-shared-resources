@@ -8,6 +8,7 @@ revision-pinned copy can also run inside the snapshot task image.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import json
 import os
@@ -19,7 +20,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
-KONFLUX_BUILD_API_VERSION = 1
+KONFLUX_BUILD_API_VERSION = 2
 
 PAC = "pipelinesascode.tekton.dev/"
 COMPONENT = "appstudio.openshift.io/component"
@@ -243,9 +244,8 @@ class KonfluxClient:
             raise KonfluxQueryError("Konflux namespace or read credential is unavailable")
         self.namespace, self._token = namespace, token
         self.deadline = deadline if deadline is not None else time.monotonic() + 60
-        self._cache = {}
-        context = ssl.create_default_context(cafile=ca_file)
-        self._opener = build_opener(_NoRedirect(), HTTPSHandler(context=context))
+        self._cache, self._errors = {}, {}
+        self._tls_context = ssl.create_default_context(cafile=ca_file)
         self._request_json = request_json or self._get
 
     @classmethod
@@ -270,7 +270,10 @@ class KonfluxClient:
         try:
             request = Request(url, headers={"Authorization": "Bearer " + self._token,
                                            "Accept": "application/json"})
-            with self._opener.open(request, timeout=min(10, remaining)) as response:
+            # Each concurrent request gets its own opener/handlers. The TLS
+            # context is immutable after construction and safe to share.
+            opener = build_opener(_NoRedirect(), HTTPSHandler(context=self._tls_context))
+            with opener.open(request, timeout=min(10, remaining)) as response:
                 return json.load(response)
         except HTTPError as exc:
             raise KonfluxQueryError(f"Konflux lookup failed (HTTP {exc.code}); build state is unknown") from None
@@ -281,6 +284,8 @@ class KonfluxClient:
         if not REPO.fullmatch(repo) or not SHA.fullmatch(sha) or not re.fullmatch(r"[0-9]+", str(number)):
             raise KonfluxQueryError("Invalid repository/PR/head query")
         key = (repo.lower(), str(number), sha)
+        if key in self._errors and not refresh:
+            raise KonfluxQueryError(self._errors[key])
         if key in self._cache and not refresh:
             return self._cache[key]
         # Query only this PR revision; archive payloads for long-lived notebook
@@ -349,9 +354,40 @@ class KonfluxClient:
         self._cache[key] = list(by_uid.values())
         return self._cache[key]
 
+    def prefetch_prs(self, queries, *, max_workers=4):
+        """Read each unique PR/head once with bounded parallelism.
+
+        Callers wait for completion before consuming the cache. No two workers
+        own the same cache key; requests never share mutable opener handlers.
+        Failed reads are cached for this polling observation, never as success.
+        """
+        if not isinstance(max_workers, int) or not 1 <= max_workers <= 8:
+            raise KonfluxQueryError("Konflux prefetch concurrency must be between 1 and 8")
+        unique = sorted({(repo.lower(), str(number), sha) for repo, number, sha in queries})
+        # Resolve the optional endpoint once, before workers start.
+        if unique and self.archive_url is None:
+            try:
+                discovery = self._request_json(
+                    self.api_url + "/api/v1/namespaces/product-kubearchive/configmaps/kubearchive-api-url")
+                self.archive_url = _endpoint(discovery["data"]["URL"], path=True)
+            except (KonfluxQueryError, KeyError, TypeError) as exc:
+                reason = str(exc) if isinstance(exc, KonfluxQueryError) else "KubeArchive endpoint discovery unavailable"
+                self._errors.update({key: reason for key in unique})
+                return
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            jobs = {executor.submit(self.runs_for_pr, *key): key for key in unique}
+            for job in as_completed(jobs):
+                try:
+                    job.result()
+                except KonfluxQueryError as exc:
+                    key = jobs[job]
+                    self._cache.pop(key, None)
+                    self._errors[key] = str(exc)
+
     def clear_cache(self):
         """Start a fresh polling observation without reusing prior run lists."""
         self._cache.clear()
+        self._errors.clear()
 
     def observe(self, *, repo, number, sha, components, base_names=False, refresh=False, pipeline_names=None):
         return select_latest(self.runs_for_pr(repo, number, sha, refresh=refresh),

@@ -76,6 +76,10 @@ old-head failure. Closed-PR explanations can still require reading discussion.
 EG admission is a different checkpoint: it revalidates requested PRs and builds
 before selecting images and before publishing the trusted artifact. This catches
 manual EG invocations, moved heads and newer attempts since Stage-1 monitoring.
+Snapshot admission prefetches up to four unique PR/head lookups concurrently,
+then reuses each result for all matching components within that polling pass.
+The shared helper contract is version 2.
+
 Both checkpoints use the same client/selection rules. They do not need separate
 implementations or a second build scan merely to render a comment.
 

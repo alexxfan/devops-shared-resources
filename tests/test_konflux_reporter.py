@@ -85,3 +85,23 @@ def test_standalone_report_still_checks_current_head(entry, monkeypatch):
     assert len(calls) == 1
     assert row.state_status == "build-pending"
     assert not row.build_links
+
+def test_merge_conflict_summary_reuses_monitor_facts_without_another_pr_scan(tmp_path, monkeypatch):
+    from lib.konflux_builds import KonfluxClient
+    from tests.test_gap_repository_gates import _GitHub, _state, _run, _saved
+    def forbidden(*args, **kwargs):
+        pytest.fail("Merge-conflict reporting must reuse the monitor receipt")
+    github = _GitHub()
+    github.mergeable = "CONFLICTING"
+    monkeypatch.setenv("GAP_BUILD_STATUS_SOURCE", "konflux")
+    monkeypatch.setattr(KonfluxClient, "from_environment", forbidden)
+    path = _state(tmp_path)
+    result, _ = _run(path, github)
+    child = _saved(path)["pull-requests"][0]
+    assert child["pr-status"] == "merge-failure"
+    assert child["build-observations"]["query-skipped"]
+    monkeypatch.setattr(reporter, "fetch_pull_request", forbidden)
+    monkeypatch.setattr(reporter, "fetch_gap_status_description", forbidden)
+    row = reporter.build_child_row(child, reuse_monitor_evidence=True)
+    assert row.state_status == "merge-failure"
+    assert "merge conflict" in row.reason

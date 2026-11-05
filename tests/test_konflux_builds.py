@@ -371,3 +371,49 @@ def test_same_head_retry_is_refreshed_before_status_publication(tmp_path, monkey
     assert child["pr-status"] == "build-pending"
     assert child["build-observations"]["runs"][0]["status"] == "pending"
     assert updater.posts[0][1] == "pending"
+
+def test_prefetch_parallelism_deduplicates_pr_heads_and_reuses_cache():
+    from threading import Barrier, Lock
+    barrier, lock, calls = Barrier(2), Lock(), []
+    def fetch(url):
+        query = parse_qs(urlsplit(url).query)
+        number = query["labelSelector"][0].split("pull-request=", 1)[1].split(",", 1)[0]
+        with lock:
+            calls.append(url)
+        if "cluster.example" in url:
+            # A serial implementation cannot satisfy this barrier.
+            barrier.wait(timeout=5)
+            item = run(name="pr-" + number)
+            item["metadata"]["labels"]["pipelinesascode.tekton.dev/pull-request"] = number
+            item["metadata"]["annotations"]["build.appstudio.redhat.com/pull_request_number"] = number
+            return {"metadata": {"resourceVersion": "1"}, "items": [item]}
+        return {"metadata": {}, "items": []}
+    api = client(fetch)
+    api.prefetch_prs([(REPO, 123, SHA), (REPO, 124, SHA), (REPO, 123, SHA)], max_workers=2)
+    assert len(calls) == 4  # One live + archive read per unique PR/head.
+    for number in (123, 124):
+        assert api.observe(repo=REPO, number=number, sha=SHA, components={COMPONENT}).status == "success"
+    assert len(calls) == 4
+
+
+def test_prefetch_query_failure_is_cached_for_the_poll_and_reset_explicitly():
+    calls = []
+    def unavailable(url):
+        calls.append(url)
+        raise KonfluxQueryError("Konflux lookup failed (HTTP 403)")
+    api = client(unavailable)
+    api.prefetch_prs([(REPO, 123, SHA)])
+    for _ in range(2):
+        with pytest.raises(KonfluxQueryError, match="403"):
+            api.observe(repo=REPO, number=123, sha=SHA, components={COMPONENT})
+    assert len(calls) == 1
+    api.clear_cache()
+    with pytest.raises(KonfluxQueryError):
+        api.observe(repo=REPO, number=123, sha=SHA, components={COMPONENT})
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("workers", [0, 9, "unbounded"])
+def test_prefetch_has_a_hard_concurrency_limit(workers):
+    with pytest.raises(KonfluxQueryError):
+        client(lambda url: {}).prefetch_prs([], max_workers=workers)

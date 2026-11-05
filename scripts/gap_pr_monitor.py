@@ -1744,14 +1744,14 @@ def _decide_url(
     if not blocking_merge and build_status_source() == "konflux":
         configuration_error = None
         try:
-            if tekton_error:
+            if tekton_error is not None:
                 raise TriggerParseError(tekton_error)
             expected = expected_builds_for_pr(
                 pull_request, tekton_documents, app_slug=build_app_slug, app_id=build_app_id,
                 allowed_components=repository_components(component_repo_map, pull_request.repo),
             )
         except TriggerParseError as exc:
-            expected, configuration_error = (), str(exc)
+            expected, configuration_error = (), str(exc) or "Expected Konflux build configuration could not be verified"
         build_gate_override, observations = evaluate_konflux_gate(
             repo=f"{pull_request.owner}/{pull_request.repo}",
             number=pull_request.number, sha=pull_request.head_sha, expected=expected,
@@ -1771,6 +1771,15 @@ def _decide_url(
         allowed_components=repository_components(component_repo_map, pull_request.repo),
         build_gate_override=build_gate_override,
     )
+    if observations is None and build_status_source() == "konflux":
+        # Merge/conflict decisions need no build query, but the immediately
+        # following comment can still reuse their freshly evaluated PR facts.
+        observations = {
+            "source": "konflux", "repository": f"{pull_request.owner}/{pull_request.repo}",
+            "pr": pull_request.number, "head-sha": pull_request.head_sha,
+            "observed-at": now.isoformat(), "runs": [], "expected-components": [],
+            "query-skipped": "PR already merged or has a merge conflict",
+        }
     if observations is not None:
         observations["pr-state"] = pull_request.state
         observations["gate-reason"] = decision.reason
