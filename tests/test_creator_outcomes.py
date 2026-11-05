@@ -249,7 +249,7 @@ def test_periodic_report_reads_persisted_creation_failure(tmp_path, monkeypatch)
     assert path.read_text() == json.dumps(payload)
 
 
-@pytest.mark.parametrize("retry", ["updated", "failed_without_pr", "no_change", "failed_with_current_child"])
+@pytest.mark.parametrize("retry", ["updated", "different_pr", "failed_without_pr", "no_change", "failed_with_current_child"])
 def test_partial_creator_retry_keeps_unattempted_child_progress(tmp_path, monkeypatch, retry):
     monkeypatch.setenv("GITHUB_TOKEN", "unused")
     previous = build_state(
@@ -259,6 +259,8 @@ def test_partial_creator_retry_keeps_unattempted_child_progress(tmp_path, monkey
                         "pr-status": "build-success"}],
         creator_outcomes=[record(), record(repo="acme/other")],
     ).to_dict()
+    evidence = {"source": "konflux", "runs": [], "head-sha": "a" * 40}
+    previous["pull-requests"][0]["build-observations"] = evidence
     captured = {}
     def completed(text=""):
         value = MagicMock()
@@ -280,7 +282,7 @@ def test_partial_creator_retry_keeps_unattempted_child_progress(tmp_path, monkey
             return completed("M state.json")
         return completed()
     state = build_state(
-        pull_requests=[StatePullRequest(repo="foo", pr_url=URL)] if retry in {"updated", "failed_with_current_child"} else [],
+        pull_requests=[StatePullRequest(repo="foo", pr_url=URL if retry != "different_pr" else URL + "0")] if retry in {"updated", "different_pr", "failed_with_current_child"} else [],
         creator_outcomes=[record("creation-failure" if retry in {"failed_without_pr", "failed_with_current_child"} else "success",
                                  pr_url=URL if retry == "updated" else "")],
     )
@@ -288,9 +290,12 @@ def test_partial_creator_retry_keeps_unattempted_child_progress(tmp_path, monkey
     manager.create_or_update(state, trigger_id="gap-test")
     expected = {"other": "build-success"}
     if retry != "no_change":
-        expected["foo"] = "new" if retry in {"updated", "failed_with_current_child"} else "build-failure"
+        expected["foo"] = "new" if retry in {"updated", "different_pr", "failed_with_current_child"} else "build-failure"
     assert {p["repo"]: p["pr-status"] for p in captured["pull-requests"]} == expected
     assert len(captured["pull-requests"]) == len(expected)
+    if retry != "no_change":
+        child = next(p for p in captured["pull-requests"] if p["repo"] == "foo")
+        assert child.get("build-observations") == (None if retry == "different_pr" else evidence)
     if retry == "failed_without_pr":
         assert next(p for p in captured["pull-requests"] if p["repo"] == "foo") == previous["pull-requests"][0]
     assert {r["repo"]: r["outcome"] for r in captured["creator-outcomes"]} == {

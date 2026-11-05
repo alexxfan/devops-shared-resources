@@ -45,6 +45,7 @@ def build_status_source() -> str:
 
 
 def _timestamp(value):
+    """Parse a controller timestamp as UTC; malformed evidence is unknown."""
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
@@ -55,6 +56,7 @@ def _timestamp(value):
 
 
 def _repository(value):
+    """Extract an owner/repository identity from a GitHub HTTPS URL."""
     if not isinstance(value, str):
         return None
     parsed = urlsplit(value)
@@ -65,6 +67,7 @@ def _repository(value):
 
 
 def _endpoint(value, *, path=False):
+    """Validate a configured HTTPS endpoint before attaching credentials."""
     parsed = urlsplit(value)
     if (parsed.scheme != "https" or not parsed.hostname or parsed.username
             or parsed.password or parsed.query or parsed.fragment
@@ -86,10 +89,12 @@ class BuildObservation:
     url: str = ""
 
     def to_dict(self):
+        """Serialize the selected build observation for state persistence."""
         return asdict(self)
 
 
 def _facts(run):
+    """Extract and cross-check the controller identity for one PR build."""
     metadata = run.get("metadata") or {}
     if not isinstance(metadata, dict):
         raise KonfluxQueryError("PipelineRun metadata is malformed")
@@ -229,6 +234,7 @@ def select_latest(runs, *, repo, number, sha, components, namespace, ui_url=DEFA
 
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
+        """Reject redirects rather than forwarding the bearer credential."""
         return None
 
 
@@ -237,6 +243,7 @@ class KonfluxClient:
 
     def __init__(self, api_url, archive_url, token, *, namespace="rhoai-tenant",
                  ui_url=DEFAULT_UI, ca_file=None, deadline=None, request_json=None):
+        """Configure authenticated read endpoints, TLS and the lookup deadline."""
         self.api_url = _endpoint(api_url)
         self.archive_url = _endpoint(archive_url, path=True) if archive_url else None
         self.ui_url = _endpoint(ui_url)
@@ -250,6 +257,7 @@ class KonfluxClient:
 
     @classmethod
     def from_environment(cls, *, deadline=None):
+        """Build a read-only client from deployment environment settings."""
         token = os.environ.get("KONFLUX_TOKEN", "").strip()
         token_file = os.environ.get("KONFLUX_TOKEN_FILE")
         try:
@@ -264,6 +272,7 @@ class KonfluxClient:
             raise KonfluxQueryError("Konflux read credential or TLS configuration is unavailable") from None
 
     def _get(self, url):
+        """Read authenticated JSON within the deadline without leaking error bodies."""
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise KonfluxQueryError("Konflux lookup deadline reached")
@@ -281,6 +290,7 @@ class KonfluxClient:
             raise KonfluxQueryError("Konflux lookup or response failed; build state is unknown") from None
 
     def runs_for_pr(self, repo, number, sha, *, refresh=False):
+        """Enumerate live and archived attempts for one current PR head."""
         if not REPO.fullmatch(repo) or not SHA.fullmatch(sha) or not re.fullmatch(r"[0-9]+", str(number)):
             raise KonfluxQueryError("Invalid repository/PR/head query")
         key = (repo.lower(), str(number), sha)
@@ -390,6 +400,7 @@ class KonfluxClient:
         self._errors.clear()
 
     def observe(self, *, repo, number, sha, components, base_names=False, refresh=False, pipeline_names=None):
+        """Select the latest identity-matching build from the cached PR snapshot."""
         return select_latest(self.runs_for_pr(repo, number, sha, refresh=refresh),
                              repo=repo, number=number, sha=sha, components=components,
                              namespace=self.namespace, ui_url=self.ui_url, base_names=base_names,

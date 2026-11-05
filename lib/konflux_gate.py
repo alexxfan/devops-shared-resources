@@ -7,6 +7,7 @@ from lib.konflux_builds import KonfluxClient, KonfluxQueryError
 
 
 def evaluate_konflux_gate(*, repo, number, sha, expected, client=None, query_error=None):
+    """Translate expected Konflux builds into a gate verdict and evidence receipt."""
     evidence = {"source": "konflux", "head-sha": sha, "repository": repo, "pr": number,
                 "observed-at": datetime.now(timezone.utc).isoformat(),
                 "expected-components": sorted({item.key for item in expected}),
