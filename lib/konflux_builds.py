@@ -141,7 +141,10 @@ def _identity(run, repo, number, sha):
         return False
     if any(r != repo.lower() for r in repos) or any(p != str(number) for p in prs) or any(s != sha for s in shas):
         raise KonfluxQueryError("Conflicting repository/PR/revision identity on a matching PipelineRun")
-    if labels.get("pipelines.appstudio.openshift.io/type") != "build":
+    build_type = labels.get("pipelines.appstudio.openshift.io/type")
+    if not build_type:
+        raise KonfluxQueryError("PR-associated PipelineRun has no verifiable build type")
+    if build_type != "build":
         return False
     if event not in {"pull_request", "on-comment", "retest-comment", "test-comment"}:
         raise KonfluxQueryError("PR-associated PipelineRun has an unknown trigger event")
@@ -333,7 +336,9 @@ class KonfluxClient:
                 self.archive_url = _endpoint(discovery["data"]["URL"], path=True)
             except (KeyError, TypeError):
                 raise KonfluxQueryError("Set KONFLUX_KUBEARCHIVE_URL; archive discovery is unavailable") from None
-        archive_selector = selector + ",pipelines.appstudio.openshift.io/type=build"
+        # Use the same identity scope for both sources. Filtering type here
+        # could hide a newer matching run whose build-type metadata is missing.
+        archive_selector = selector
         records, continuation, seen = [], "", set()
         for _ in range(40):
             query = {"labelSelector": archive_selector, "limit": 20}
@@ -362,6 +367,7 @@ class KonfluxClient:
                 raise KonfluxQueryError("PipelineRun record has no UID")
             by_uid[uid] = run
         self._cache[key] = list(by_uid.values())
+        self._errors.pop(key, None)
         return self._cache[key]
 
     def prefetch_prs(self, queries, *, max_workers=4):

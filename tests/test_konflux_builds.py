@@ -476,3 +476,41 @@ def test_refresh_failure_cannot_partially_publish_an_old_batch(tmp_path, monkeyp
                             updater_factory=lambda **kwargs: updater)
     assert not updater.posts
     assert path.read_bytes() == before
+
+def test_newer_matching_run_without_build_type_cannot_authorize_old_success():
+    newer = run(name="r2", created="2026-11-05T11:00:00Z", status="Unknown", reason="Running")
+    del newer["metadata"]["labels"]["pipelines.appstudio.openshift.io/type"]
+    with pytest.raises(KonfluxQueryError, match="build type"):
+        observe([run(), newer])
+
+
+def test_nonbuild_run_with_explicit_type_does_not_replace_build_success():
+    other = run(name="integration", created="2026-11-05T11:00:00Z", status="False")
+    other["metadata"]["labels"]["pipelines.appstudio.openshift.io/type"] = "test"
+    assert observe([run(), other]).status == "success"
+
+
+def test_successful_explicit_refresh_clears_a_cached_query_error():
+    denied = True
+    def fetch(url):
+        if denied:
+            raise KonfluxQueryError("Temporary archive failure")
+        return {"metadata": {"resourceVersion": "1"}, "items": [run()]}
+    api = client(fetch)
+    api.prefetch_prs([(REPO, 123, SHA)])
+    denied = False
+    query = dict(repo=REPO, number=123, sha=SHA, components={COMPONENT})
+    assert api.observe(**query, refresh=True).status == "success"
+    assert api.observe(**query).status == "success"
+
+def test_archived_run_missing_type_is_not_hidden_by_server_side_filtering():
+    newer = run(name="r2", created="2026-11-05T11:00:00Z", status="Unknown", reason="Running")
+    del newer["metadata"]["labels"]["pipelines.appstudio.openshift.io/type"]
+    def fetch(url):
+        if "cluster.example" in url:
+            return {"metadata": {"resourceVersion": "1"}, "items": [run()]}
+        selector = parse_qs(urlsplit(url).query)["labelSelector"][0]
+        # Model Kubernetes label filtering: a type selector would omit this run.
+        return {"metadata": {}, "items": [] if "type=build" in selector else [newer]}
+    with pytest.raises(KonfluxQueryError, match="build type"):
+        client(fetch).observe(repo=REPO, number=123, sha=SHA, components={COMPONENT})
