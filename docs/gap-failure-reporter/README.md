@@ -82,3 +82,9 @@ child PR and its recorded build/status data. A successful no-change retry
 still clears that repository's old child entry. Malformed optional creator
 observations are warned about and omitted from rendering; the build table and
 reports for other Leaders continue, and the stored state is not rewritten.
+
+## Konflux-backed monitor entries
+
+For entries with current-head Konflux build observations, the report uses the
+monitor's persisted PipelineRun evidence and links rather than independently
+classifying GitHub build checks. See [the source-of-truth migration](../gap-pr-monitor/konflux-build-status.md).

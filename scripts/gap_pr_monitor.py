@@ -59,11 +59,14 @@ from lib.gap_promotion_gates import (
 )
 from lib.gap_check_selection import (
     FeasibilityRun,
+    TriggerParseError,
     default_build_producer,
     fetch_file_collections,
     fetch_feasibility_run,
     fetch_tekton_documents,
 )
+from lib.konflux_builds import build_status_source
+from lib.konflux_gate import evaluate_konflux_gate
 from lib.gap_component_map import fetch_component_repo_map, repository_components
 from lib.gap_pr_gates import (
     PR_STATUS_BUILD_FAILURE,
@@ -73,6 +76,7 @@ from lib.gap_pr_gates import (
     RepositoryGateDecision,
     RepositoryPullRequest,
     decide_repository_pr,
+    expected_builds_for_pr,
 )
 from lib.github_check_runs import CheckQueryError, github_api_json, list_check_runs
 from lib.pr_status_updater import (
@@ -1193,6 +1197,7 @@ def _post_leader_failure_summary(
         state_file=str(state_path),
         dry_run=dry_run,
         gh_runner=gh_runner,
+        reuse_monitor_evidence=build_status_source() == "konflux",
     )
     prefix = "[dry-run] " if dry_run else ""
     action = "create" if summary.created else ("update" if summary.updated else "noop")
@@ -1780,7 +1785,25 @@ def _decide_url(
             runner,
         )
 
-    return decide_repository_pr(
+    build_gate_override, observations = None, None
+    if not blocking_merge and build_status_source() == "konflux":
+        configuration_error = None
+        try:
+            if tekton_error is not None:
+                raise TriggerParseError(tekton_error)
+            expected = expected_builds_for_pr(
+                pull_request, tekton_documents, app_slug=build_app_slug, app_id=build_app_id,
+                allowed_components=repository_components(component_repo_map, pull_request.repo),
+            )
+        except TriggerParseError as exc:
+            expected, configuration_error = (), str(exc) or "Expected Konflux build configuration could not be verified"
+        build_gate_override, observations = evaluate_konflux_gate(
+            repo=f"{pull_request.owner}/{pull_request.repo}",
+            number=pull_request.number, sha=pull_request.head_sha, expected=expected,
+            query_error=configuration_error,
+        )
+
+    decision = decide_repository_pr(
         pull_request,
         tekton_documents=tekton_documents,
         tekton_error=tekton_error,
@@ -1791,7 +1814,21 @@ def _decide_url(
         build_app_slug=build_app_slug,
         build_app_id=build_app_id,
         allowed_components=repository_components(component_repo_map, pull_request.repo),
+        build_gate_override=build_gate_override,
     )
+    if observations is None and build_status_source() == "konflux":
+        # Merge/conflict decisions need no build query, but the immediately
+        # following comment can still reuse their freshly evaluated PR facts.
+        observations = {
+            "source": "konflux", "repository": f"{pull_request.owner}/{pull_request.repo}",
+            "pr": pull_request.number, "head-sha": pull_request.head_sha,
+            "observed-at": now.isoformat(), "runs": [], "expected-components": [],
+            "query-skipped": "PR already merged or has a merge conflict",
+        }
+    if observations is not None:
+        observations["pr-state"] = pull_request.state
+        observations["gate-reason"] = decision.reason
+    return replace(decision, build_observations=observations)
 
 
 def _post_gate_status(
@@ -1895,7 +1932,25 @@ def _publish_decisions(
     successes: list[str] = []
     reports: list[str] = []
     post_errors: list[tuple[str, str]] = []
-    # Provisional statuses from first-pass decisions (before head-move refresh).
+    if build_status_source() == "konflux":
+        # Refresh the whole batch before deriving the child-green hold. A retry
+        # can turn a terminal failure into pending/success; mixing fresh child
+        # decisions with the old batch outcome could release a green before EG.
+        # This is the existing second observation, moved ahead of all POSTs.
+        try:
+            decisions = tuple(
+                decision if decision.skip_status_post else _decide_url(
+                    decision.url, runner=runner, now=now, build_app_slug=build_app_slug,
+                    build_app_id=build_app_id, retry_unknown=retry_unknown,
+                    component_repo_map=component_repo_map,
+                )
+                for decision in decisions
+            )
+        except (GapPrMonitorError, GhCommandError, ValueError, RuntimeError) as exc:
+            # No status or state writes have happened: retain the prior batch
+            # rather than publishing a mix of refreshed and stale decisions.
+            raise GapPrMonitorError(f"Could not refresh child batch before publication: {exc}") from exc
+    # One coherent batch decides both persisted outcomes and the child-green hold.
     provisional_updates = {d.url: d.pr_status for d in decisions}
     batch_concluded = children_batch_concluded(list(provisional_updates.values()))
     ensure_promotion_gates(payload)
@@ -1936,6 +1991,14 @@ def _publish_decisions(
             continue
 
         status_updates[url] = decision.pr_status
+        for entry in payload.get("pull-requests", []):
+            if (entry.get("pr-url") or entry.get("pr_url")) == url:
+                if decision.build_observations is not None:
+                    entry["build-observations"] = decision.build_observations
+                elif build_status_source() == "github":
+                    # An explicit rollback must not leave obsolete Konflux
+                    # receipts attached to newly evaluated GitHub statuses.
+                    entry.pop("build-observations", None)
         reports.extend(decision.reports)
         if decision.pr_status == MERGE_FAILURE_PR_STATUS:
             merge_failures.append(url)

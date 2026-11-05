@@ -77,6 +77,7 @@ class StatePullRequest:
     pr_url: str
     pr_status: str = PR_STATUS_NEW
     builds: tuple[StateBuild, ...] = ()
+    build_observations: dict[str, Any] | None = None
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any], *, index: int) -> "StatePullRequest":
@@ -115,15 +116,25 @@ class StatePullRequest:
                 for i, item in enumerate(raw_builds)
             )
 
-        return cls(repo=repo, pr_url=pr_url, pr_status=pr_status, builds=builds)
+        observations = data.get("build-observations")
+        if observations is not None and (
+            not isinstance(observations, dict) or observations.get("source") != "konflux"
+            or not isinstance(observations.get("runs"), list)
+        ):
+            raise StateFileError(f"{path}.build-observations must be Konflux evidence")
+        return cls(repo=repo, pr_url=pr_url, pr_status=pr_status, builds=builds,
+                   build_observations=observations)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "repo": self.repo,
             "pr-url": self.pr_url,
             "pr-status": self.pr_status,
             "builds": [build.to_dict() for build in self.builds],
         }
+        if self.build_observations is not None:
+            result["build-observations"] = self.build_observations
+        return result
 
 
 @dataclass

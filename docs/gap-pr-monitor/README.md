@@ -271,3 +271,8 @@ Resolution order (`resolve_state_file`, after merging CLI + `GAP_*` env):
 python scripts/gap_pr_monitor.py --trigger-id gap-e2e20260923133000
 python scripts/gap_pr_monitor.py --state-file GAP Leaders/2026-09-25_gap-e2e…/state.json --dry-run
 ```
+
+## Direct Konflux build status
+
+See [Konflux build status](konflux-build-status.md) for the shared client,
+current-head evidence, credentials and staged rollout for RHAI-19805.

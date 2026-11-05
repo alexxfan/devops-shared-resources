@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -341,6 +341,17 @@ class LeaderPRManager:
 
             if existing and (workdir / state_rel).exists():
                 previous_state = load_state_file(workdir / state_rel)
+                previous_children = {
+                    child["pr-url"]: child for child in previous_state["pull-requests"]
+                }
+                # Creator retries can return the same PR without new build data.
+                # Preserve its receipt, but never transfer evidence to another PR.
+                state.pull_requests[:] = [
+                    replace(child, build_observations=previous_children[child.pr_url].get("build-observations"))
+                    if child.build_observations is None and child.pr_url in previous_children
+                    else child
+                    for child in state.pull_requests
+                ]
                 attempted = {item["repo"].lower() for item in state.creator_outcomes}
                 failed_without_pr = {
                     item["repo"].lower() for item in state.creator_outcomes

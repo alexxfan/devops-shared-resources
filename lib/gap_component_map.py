@@ -42,12 +42,12 @@ def fetch_component_repo_map(runner: GhRunner) -> dict[str, frozenset[str]]:
 
 def normalize_component_name(component: str) -> str:
     """Strip a trailing numeric Konflux release suffix, leaving other names intact."""
-    return re.sub(r"-v\d+(?:-\d+)+$", "", component)
+    return re.sub(r"-v\d+(?:-\d+)+(?:-ea-\d+)?$", "", component)
 
 
 def component_is_allowed(component: str, allowed: frozenset[str]) -> bool:
     """Normalize the component before checking its repository allowlist."""
-    return normalize_component_name(component) in allowed
+    return component in allowed or normalize_component_name(component) in allowed
 
 
 def repository_components(
