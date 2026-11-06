@@ -46,14 +46,21 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from lib.gap_promotion_gates import (
+    GATE_COMPONENT_BUILDS,
+    GATE_EARLY_GATE_BUILD,
+    GATE_EARLY_GATE_TEST,
+    GATE_STATUS_PENDING,
+    GATE_STATUS_SUCCESS,
     apply_component_builds_from_children,
     early_gate_concluded,
     children_ready_for_success_status,
     derive_legacy_overall_status,
     ensure_promotion_gates,
+    get_gate_status,
     migrate_legacy_overall_status,
     should_green_leader_for_build_failure,
     should_trigger_early_gate,
+    set_gate_status,
     strip_legacy_overall_status,
     waiting_for_early_gate,
 )
@@ -187,6 +194,7 @@ class MonitorResult:
     build_failure_urls: list[str] = field(default_factory=list)
     pending_urls: list[str] = field(default_factory=list)
     reports: tuple[str, ...] = ()
+    child_head_changed: bool = False
 
 
 @dataclass(frozen=True)
@@ -424,6 +432,38 @@ def apply_pr_statuses(
             entry["pr-status"] = updates[url]
 
 
+def record_child_head_shas(
+    payload: dict[str, Any], decisions: Sequence[RepositoryGateDecision]
+) -> bool:
+    entries = payload.get("pull-requests")
+    if not isinstance(entries, list):
+        return False
+    by_url = {
+        str(entry.get("pr-url") or ""): entry
+        for entry in entries
+        if isinstance(entry, dict)
+    }
+    changed = False
+    for decision in decisions:
+        entry = by_url.get(decision.url)
+        if entry is None:
+            continue
+        previous = str(entry.get("head-sha") or "")
+        if previous and previous != decision.head_sha:
+            changed = True
+        entry["head-sha"] = decision.head_sha
+    if changed:
+        ensure_promotion_gates(payload)
+        for gate_id in (
+            GATE_COMPONENT_BUILDS,
+            GATE_EARLY_GATE_BUILD,
+            GATE_EARLY_GATE_TEST,
+        ):
+            set_gate_status(payload, gate_id, GATE_STATUS_PENDING)
+        strip_legacy_overall_status(payload)
+    return changed
+
+
 def apply_success_statuses(payload: dict[str, Any], urls: Sequence[str]) -> None:
     """Back-compat helper used by older tests."""
     apply_pr_statuses(payload, {u: SUCCESS_PR_STATUS for u in urls})
@@ -615,6 +655,7 @@ def post_early_gate_trigger_comment(
     leader_pr_url: str,
     *,
     dry_run: bool = False,
+    allow_repeat: bool = False,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> bool:
     """Comment ``/early-gate`` on the Leader once (RHAI-10942).
@@ -623,7 +664,9 @@ def post_early_gate_trigger_comment(
     Idempotent: skips if a matching comment already exists.
     """
     run = gh_runner or _run_gh
-    if early_gate_comment_already_present(leader_pr_url, gh_runner=run):
+    if not allow_repeat and early_gate_comment_already_present(
+        leader_pr_url, gh_runner=run
+    ):
         return False
     if dry_run:
         print(
@@ -1349,6 +1392,12 @@ def run_monitor_publish_and_signal(
             check_name=check_name, dry_run=dry_run, remote=remote,
             updater_factory=updater_factory, gh_runner=gh_runner, git_runner=git_runner,
         )
+    previous_payload = load_state(Path(state_path))
+    ensure_promotion_gates(previous_payload)
+    migrate_legacy_overall_status(previous_payload)
+    previous_component_build_status = get_gate_status(
+        previous_payload, GATE_COMPONENT_BUILDS
+    )
     result = run_monitor(
         state_path,
         check_name=check_name,
@@ -1397,6 +1446,10 @@ def run_monitor_publish_and_signal(
             early_gate_comment_posted = post_early_gate_trigger_comment(
                 leader_url,
                 dry_run=dry_run,
+                allow_repeat=(
+                    result.child_head_changed
+                    or previous_component_build_status != GATE_STATUS_SUCCESS
+                ),
                 gh_runner=gh_runner,
             )
         except (GhCommandError, ValueError, RuntimeError) as exc:
@@ -2108,6 +2161,9 @@ def _publish_decisions(
     successes: list[str] = []
     reports: list[str] = []
     post_errors: list[tuple[str, str]] = []
+    evaluated_decisions: list[RepositoryGateDecision] = []
+    ensure_promotion_gates(payload)
+    migrate_legacy_overall_status(payload)
     if build_status_source() == "konflux":
         # Refresh the whole batch before deriving the child-green hold. A retry
         # can turn a terminal failure into pending/success; mixing fresh child
@@ -2127,10 +2183,10 @@ def _publish_decisions(
             # rather than publishing a mix of refreshed and stale decisions.
             raise GapPrMonitorError(f"Could not refresh child batch before publication: {exc}") from exc
     # One coherent batch decides both persisted outcomes and the child-green hold.
+    child_head_changed = record_child_head_shas(payload, decisions)
+    # Provisional statuses from first-pass decisions (before head-move refresh).
     provisional_updates = {d.url: d.pr_status for d in decisions}
     batch_concluded = children_batch_concluded(list(provisional_updates.values()))
-    ensure_promotion_gates(payload)
-    migrate_legacy_overall_status(payload)
     probe = provisional_payload_with_updates(payload, provisional_updates)
     overall_status = derive_legacy_overall_status(probe)
 
@@ -2164,8 +2220,11 @@ def _publish_decisions(
         if decision is None:
             reports.append(f"deferred {url} head changed before status publication")
             skipped.append(url)
+            status_updates[url] = BUILD_PENDING_PR_STATUS
+            pending.append(url)
             continue
 
+        evaluated_decisions.append(decision)
         status_updates[url] = decision.pr_status
         for entry in payload.get("pull-requests", []):
             if (entry.get("pr-url") or entry.get("pr_url")) == url:
@@ -2203,6 +2262,7 @@ def _publish_decisions(
         )
 
     apply_pr_statuses(payload, status_updates)
+    child_head_changed |= record_child_head_shas(payload, evaluated_decisions)
     apply_component_builds_from_children(payload)
     strip_legacy_overall_status(payload)
     overall_status = derive_legacy_overall_status(payload)
@@ -2220,6 +2280,7 @@ def _publish_decisions(
         build_failure_urls=build_failures,
         pending_urls=pending,
         reports=tuple(reports),
+        child_head_changed=child_head_changed,
     )
 
 
