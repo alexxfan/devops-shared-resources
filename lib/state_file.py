@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from lib.creator_outcomes import validate_outcomes
+from lib.leader_lifecycle import KEY as LIFECYCLE_KEY, retired_outcome
 
 DEFAULT_LEADER_REPO = "red-hat-data-services/gated-artifacts-promoter"
 
@@ -285,6 +286,15 @@ def validate_state(data: Any) -> dict[str, Any]:
     )
     if overall is not None:
         normalized["overall-status"] = overall
+    if LIFECYCLE_KEY in data:
+        try:
+            retired_outcome(data)
+        except ValueError as exc:
+            raise StateFileError(str(exc)) from exc
+        normalized[LIFECYCLE_KEY] = data[LIFECYCLE_KEY]
+    # Preserve canonical gate results when reading an existing Leader record.
+    if LIFECYCLE_KEY in data and "promotion-gates" in data:
+        normalized["promotion-gates"] = data["promotion-gates"]
     return normalized
 
 

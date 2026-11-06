@@ -23,6 +23,7 @@ from lib.state_file import (
 )
 
 from lib.creator_outcomes import ERROR_OUTCOMES, PR, merge_outcomes
+from lib.leader_lifecycle import retired_outcome
 
 GAP_LABEL = "gated-artifacts-promoter"
 LEADER_BRANCH_PREFIX = "gap-leader"
@@ -258,6 +259,15 @@ class LeaderPRManager:
         self.ensure_labels(labels)
 
         existing = self.find_open_pr_by_label(trigger_id)
+        if existing is None:
+            previous = json.loads(self.run_gh([
+                "pr", "list", "--repo", self.repo, "--state", "all",
+                "--label", trigger_id, "--json", "number,url", "--limit", "1",
+            ]) or "[]")
+            if previous:
+                raise RuntimeError(
+                    "This trigger already has a closed or merged Leader; use a new trigger ID"
+                )
         preview_state_rel = state_path_for_trigger(trigger_id)
 
         if self.dry_run:
@@ -318,8 +328,14 @@ class LeaderPRManager:
             )
             self._configure_origin_auth(workdir, token)
 
-            if existing:
-                head = existing.get("headRefName") or branch
+            # A failed PR-create can leave a valid state branch behind. Resume
+            # it rather than force-pushing a new history over the existing data.
+            resume_branch = bool(existing) or bool(self.run_git(
+                ["ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
+                cwd=workdir,
+            ))
+            if resume_branch:
+                head = (existing or {}).get("headRefName") or branch
                 self.run_git(
                     ["fetch", "origin", f"+refs/heads/{head}:refs/remotes/origin/{head}"],
                     cwd=workdir,
@@ -339,8 +355,10 @@ class LeaderPRManager:
                 self.run_git(["checkout", "-B", branch], cwd=workdir, mutate=True)
                 state_rel = state_path_for_trigger(trigger_id)
 
-            if existing and (workdir / state_rel).exists():
+            if resume_branch and (workdir / state_rel).exists():
                 previous_state = load_state_file(workdir / state_rel)
+                if retired_outcome(previous_state):
+                    raise RuntimeError("Cannot update a retired Leader; use a new trigger ID")
                 previous_children = {
                     child["pr-url"]: child for child in previous_state["pull-requests"]
                 }
@@ -393,12 +411,8 @@ class LeaderPRManager:
                     cwd=workdir,
                     mutate=True,
                 )
-                # Force-push when opening in case a closed PR left this
-                # trigger's branch behind with stale history.
-                push_cmd = ["push", "-u", "origin", "HEAD"]
-                if existing is None:
-                    push_cmd.insert(1, "--force")
-                self.run_git(push_cmd, cwd=workdir, mutate=True)
+                # A leftover branch is evidence to preserve, never overwrite.
+                self.run_git(["push", "-u", "origin", "HEAD"], cwd=workdir, mutate=True)
 
             if existing:
                 number = int(existing["number"])

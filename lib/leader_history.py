@@ -10,12 +10,14 @@ from typing import Callable, Sequence
 
 from lib.gap_promotion_gates import derive_legacy_overall_status
 from lib.github_cli import run_gh
+from lib.leader_lifecycle import retired_outcome
 from lib.pr_status_updater import parse_pr_url
 
 HISTORY_ROOT = Path("GAP History")
-HISTORY_FOLDERS = {"success": "successful", "failure": "unsuccessful"}
+HISTORY_FOLDERS = {"success": "successful", "failure": "unsuccessful", "superseded": "unsuccessful"}
 # Keep result labels outside the gap-* trigger-ID namespace used by monitors.
-RESULT_LABELS = {"success": "result-gap-success", "failure": "result-gap-failure"}
+RESULT_LABELS = {"success": "result-gap-success", "failure": "result-gap-failure",
+                 "superseded": "result-gap-superseded"}
 
 
 def write_history_snapshot(repo_root: Path, state_path: Path) -> Path | None:
@@ -23,7 +25,7 @@ def write_history_snapshot(repo_root: Path, state_path: Path) -> Path | None:
     payload = json.loads(state_path.read_text(encoding="utf-8"))
     # Canonical gates take precedence, even when empty or incomplete. Derivation
     # normalizes gates, so use a copy to preserve the exact archived payload.
-    overall = (
+    overall = retired_outcome(payload) or (
         derive_legacy_overall_status(copy.deepcopy(payload))
         if "promotion-gates" in payload
         else payload.get("overall-status")
@@ -76,9 +78,12 @@ def prepare_leader_history_merge(
             or (head.get("repo") or {}).get("full_name") != ref.slug):
         raise RuntimeError("Refusing history merge for a PR that is not a same-repository GAP Leader")
 
+    if "result-gap-superseded" in labels and overall_status != "superseded":
+        raise RuntimeError("Cannot replace a superseded Leader result with a build/test outcome")
+
     label = RESULT_LABELS[overall_status]
     run(["label", "create", label, "--repo", ref.slug, "--force",
-         "--color", "b60205" if overall_status == "failure" else "0e8a16",
+         "--color", {"failure": "b60205", "success": "0e8a16", "superseded": "6e7781"}[overall_status],
          "--description", f"Recorded GAP run result: {overall_status}"])
     run(["api", "--method", "POST", f"repos/{ref.slug}/issues/{ref.number}/labels",
          "-f", f"labels[]={label}"])
@@ -86,8 +91,9 @@ def prepare_leader_history_merge(
         if other != label and other in labels:
             run(["api", "--method", "DELETE",
                  f"repos/{ref.slug}/issues/{ref.number}/labels/{other}"])
-    title = re.sub(r"^\[GAP (?:failed|passed)\]\s*", "", pull["title"])
-    prefix = "[GAP failed]" if overall_status == "failure" else "[GAP passed]"
+    title = re.sub(r"^\[GAP (?:failed|passed|superseded)\]\s*", "", pull["title"])
+    prefix = {"failure": "[GAP failed]", "success": "[GAP passed]",
+              "superseded": "[GAP superseded]"}[overall_status]
     run(["api", "--method", "PATCH", endpoint, "-f", f"title={prefix} {title}"])
     # No --admin, force merge, branch deletion, or synthetic component success.
     run(["pr", "merge", str(ref.number), "--repo", ref.slug, "--auto", "--merge",

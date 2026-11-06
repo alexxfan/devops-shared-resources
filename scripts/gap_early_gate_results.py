@@ -36,6 +36,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from lib.leader_lifecycle import retired_outcome
+
 from lib.gap_promotion_gates import (
     GATE_COMPONENT_BUILDS,
     GATE_EARLY_GATE_BUILD,
@@ -481,6 +483,8 @@ def decide_overall_from_comments(
 
     ``current_overall`` is ignored (legacy arg); gates are SoT.
     """
+    if payload is not None and retired_outcome(payload):
+        return None, "Leader retired; ignoring late Early Gate results", {}
     del current_overall  # legacy; gates are SoT
     label_list = list(labels or [])
     working = payload if payload is not None else {}
@@ -591,6 +595,8 @@ def child_pass_pr_urls(payload: dict[str, Any]) -> list[str]:
     Children that already failed their Stage-1 gate are omitted so EG-results
     does not overwrite their failing ``gated artifacts promoter`` check.
     """
+    if retired_outcome(payload):
+        return []
     urls: list[str] = []
     for index, entry in enumerate(payload.get("pull-requests") or []):
         if not isinstance(entry, dict):
@@ -711,6 +717,12 @@ def run_early_gate_results(
         root=root,
     )
     payload = load_state(state_path)
+    retired = retired_outcome(payload)
+    if retired:
+        return EarlyGateResultsResult(
+            state_path, retired, retired, False, False, None, dry_run,
+            reason="Leader retired; ignoring late Early Gate results",
+        )
     ensure_promotion_gates(payload)
     migrate_legacy_overall_status(payload)
     previous = derive_legacy_overall_status(payload)
