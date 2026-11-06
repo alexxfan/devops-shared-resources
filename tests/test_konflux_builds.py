@@ -514,3 +514,32 @@ def test_archived_run_missing_type_is_not_hidden_by_server_side_filtering():
         return {"metadata": {}, "items": [] if "type=build" in selector else [newer]}
     with pytest.raises(KonfluxQueryError, match="build type"):
         client(fetch).observe(repo=REPO, number=123, sha=SHA, components={COMPONENT})
+
+
+@pytest.mark.parametrize("status,expected", [("True", "success"), ("False", "failure"), ("Unknown", "pending")])
+def test_full_pac_annotation_matches_template_when_label_is_shortened(status, expected):
+    item = run(status=status)
+    full = "odh-data-science-pipelines-operator-controller-on-pull-request-54976"
+    key = "pipelinesascode.tekton.dev/original-prname"
+    item["metadata"]["annotations"][key] = full
+    item["metadata"]["labels"][key] = "ata-science-pipelines-operator-controller-on-pull-request-54976"
+    assert observe([item], pipeline_names={full}).status == expected
+
+
+def test_label_cannot_override_a_different_full_pipeline_annotation():
+    item = run()
+    key = "pipelinesascode.tekton.dev/original-prname"
+    item["metadata"]["labels"][key] = "expected"
+    item["metadata"]["annotations"][key] = "different-template"
+    assert observe([item], pipeline_names={"expected"}).status == "missing"
+
+
+def test_same_shortened_label_does_not_hide_distinct_pipeline_origins():
+    first = run()
+    second = run(name="r2", created="2026-11-05T11:00:00Z")
+    key = "pipelinesascode.tekton.dev/original-prname"
+    for item, prefix in [(first, "first"), (second, "second")]:
+        item["metadata"]["annotations"][key] = prefix + "-" + "x" * 65
+        item["metadata"]["labels"][key] = "x" * 60
+    with pytest.raises(KonfluxQueryError, match="pipeline identities"):
+        observe([first, second])
