@@ -1025,7 +1025,8 @@ def test_run_stage1_monitor_posts_leader_conclusion_status(
         return PublishResult(sha="published-sha-abc", committed=True)
 
     import scripts.gap_pr_monitor as mod
-    mod.publish_state = fake_publish  # type: ignore[assignment]
+    # Restore the real publisher after this test; rollover tests exercise real Git.
+    monkeypatch.setattr(mod, "publish_state", fake_publish)
     result = run_monitor_publish_and_signal(
         path,
         repo_root=tmp_path,
@@ -1149,7 +1150,8 @@ def test_run_stage1_monitor_three_children_all_success_posts_leader(
         return PublishResult(sha="published-sha-abc", committed=True)
 
     import scripts.gap_pr_monitor as mod
-    mod.publish_state = fake_publish  # type: ignore[assignment]
+    # Restore the real publisher after this test; rollover tests exercise real Git.
+    monkeypatch.setattr(mod, "publish_state", fake_publish)
     result = run_monitor_publish_and_signal(
         path,
         repo_root=tmp_path,
@@ -1270,7 +1272,8 @@ def test_run_stage1_monitor_all_success_without_leader_url_writes_overall(
         return PublishResult(sha="published-sha-abc", committed=True)
 
     import scripts.gap_pr_monitor as mod
-    mod.publish_state = fake_publish  # type: ignore[assignment]
+    # Restore the real publisher after this test; rollover tests exercise real Git.
+    monkeypatch.setattr(mod, "publish_state", fake_publish)
     result = run_monitor_publish_and_signal(
         path,
         repo_root=tmp_path,

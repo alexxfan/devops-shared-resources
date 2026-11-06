@@ -31,6 +31,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from lib.leader_lifecycle import retired_outcome
+
 from lib.gap_check_selection import DEFAULT_BUILD_APP_SLUG, default_build_producer
 from lib.konflux_builds import build_status_source, DEFAULT_UI
 from lib.github_check_runs import CheckQueryError, list_check_runs
@@ -835,6 +837,11 @@ def report_for_leader(
         allow_gap_dir_fallback=True,
     )
     payload = load_state(path)
+    if retired_outcome(payload):
+        return ReporterResult(
+            leader_pr_url, (), None, False, False, dry_run,
+            "Retired Leader: preserving the recorded failure summary.",
+        )
     options = {"reuse_monitor_evidence": True} if reuse_monitor_evidence else {}
     rows = collect_rows_from_state(payload, gh_runner=run, **options)
     try:

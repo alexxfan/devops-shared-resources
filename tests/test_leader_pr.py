@@ -104,7 +104,7 @@ def test_create_leader_pr_via_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert GAP_LABEL in create_cmd
     assert _leader_branch("gap-testtrigger002") in create_cmd
     push_cmd = next(cmd for cmd, _ in calls if cmd[:2] == ["git", "push"])
-    assert "--force" in push_cmd
+    assert "--force" not in push_cmd
 
 
 def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -229,7 +229,7 @@ def test_new_trigger_preserves_previous_leader_pr(monkeypatch: pytest.MonkeyPatc
     assert close_calls == []
     assert not any(cmd[:3] == ["gh", "pr", "comment"] for cmd in calls)
     push_cmd = next(cmd for cmd in calls if cmd[:2] == ["git", "push"])
-    assert "--force" in push_cmd
+    assert "--force" not in push_cmd
 
 
 def test_update_existing_does_not_close_current_leader(

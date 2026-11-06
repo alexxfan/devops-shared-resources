@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from lib.leader_lifecycle import retired_outcome
+
 GATE_COMPONENT_BUILDS = "component-builds"
 GATE_EARLY_GATE_BUILD = "early-gate-build"
 GATE_EARLY_GATE_TEST = "early-gate-test"
@@ -210,6 +212,8 @@ def children_ready_for_success_status(payload: dict[str, Any]) -> bool:
     - If either EG gate is ``required: true``, EG pair must be *success*
       before children green (future mandate).
     """
+    if retired_outcome(payload):
+        return False
     ensure_promotion_gates(payload)
     builds = get_gate_status(payload, GATE_COMPONENT_BUILDS)
     if builds == GATE_STATUS_PENDING:
@@ -230,7 +234,10 @@ def children_ready_for_success_status(payload: dict[str, Any]) -> bool:
 
 def should_trigger_early_gate(payload: dict[str, Any]) -> bool:
     """True when Stage-1 should comment ``/early-gate`` (all builds passed)."""
-    return get_gate_status(payload, GATE_COMPONENT_BUILDS) == GATE_STATUS_SUCCESS
+    return (
+        not retired_outcome(payload)
+        and get_gate_status(payload, GATE_COMPONENT_BUILDS) == GATE_STATUS_SUCCESS
+    )
 
 
 def should_green_leader_for_build_failure(payload: dict[str, Any]) -> bool:
