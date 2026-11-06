@@ -173,7 +173,9 @@ def select_latest(runs, *, repo, number, sha, components, namespace, ui_url=DEFA
         if key not in names or not _identity(run, repo, number, sha):
             continue
         if pipeline_names:
-            original = labels.get(PAC + "original-prname") or (metadata.get("annotations") or {}).get(PAC + "original-prname")
+            # PaC keeps the full template name in the annotation; its label is
+            # shortened for Kubernetes. Use the label only for legacy records.
+            original = (metadata.get("annotations") or {}).get(PAC + "original-prname") or labels.get(PAC + "original-prname")
             if not original:
                 raise KonfluxQueryError("Matching PipelineRun has no original PR pipeline identity")
             if original not in pipeline_names:
@@ -190,8 +192,8 @@ def select_latest(runs, *, repo, number, sha, components, namespace, ui_url=DEFA
     physical = {r[1]["metadata"]["labels"][COMPONENT] for r in selected.values()}
     if base_names and len(physical) > 1:
         raise KonfluxQueryError("Multiple version-specific Components match this snapshot key")
-    origins = {(r[1]["metadata"].get("labels") or {}).get(PAC + "original-prname")
-               or (r[1]["metadata"].get("annotations") or {}).get(PAC + "original-prname")
+    origins = {(r[1]["metadata"].get("annotations") or {}).get(PAC + "original-prname")
+               or (r[1]["metadata"].get("labels") or {}).get(PAC + "original-prname")
                for r in selected.values()}
     if not pipeline_names and len(origins - {None}) > 1:
         raise KonfluxQueryError("Multiple PR pipeline identities match this Component")
