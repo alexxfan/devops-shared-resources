@@ -206,6 +206,7 @@ class OpenLeaderPr:
     url: str
     head_ref: str
     labels: tuple[str, ...]
+    base_ref: str = ""
 
 
 def state_path_for_trigger(trigger_id: str, *, root: Path | None = None) -> Path:
@@ -963,7 +964,7 @@ def list_open_leader_prs(
             "--label",
             label_name,
             "--json",
-            "number,url,headRefName,labels",
+            "number,url,headRefName,labels,baseRefName",
             "--limit",
             "100",
         ]
@@ -998,9 +999,18 @@ def list_open_leader_prs(
                 url=url,
                 head_ref=head_ref,
                 labels=tuple(label_names),
+                base_ref=str(row.get("baseRefName") or ""),
             )
         )
     return leaders
+
+
+def require_clean_leader_checkout(repo_root: Path, *, git_runner) -> None:
+    """Do not carry another Leader's uncommitted files into a state publication."""
+    if git_runner(["status", "--porcelain", "--untracked-files=no"], cwd=repo_root).strip():
+        raise GapPrMonitorError(
+            "Leader checkout has uncommitted tracked changes; refusing to switch or retire it"
+        )
 
 
 def checkout_leader_branch(
@@ -1015,6 +1025,7 @@ def checkout_leader_branch(
     if not ref:
         raise GapPrMonitorError("Leader head ref is empty.")
     run = git_runner or (lambda args, cwd=repo_root: _run_git(args, cwd=cwd))
+    require_clean_leader_checkout(repo_root, git_runner=run)
     run(["fetch", remote, f"+refs/heads/{ref}:refs/remotes/{remote}/{ref}"], cwd=repo_root)
     run(["checkout", "-B", ref, f"{remote}/{ref}"], cwd=repo_root)
 
@@ -1051,8 +1062,23 @@ def publish_state(
     paths = [rel]
     if snapshot is not None:
         paths.append(state_path_for_output(snapshot, repo_root=repo_root))
+        if retired_outcome(load_state(state_path)):
+            # Keep one final dashboard record. Earlier outcomes remain in Git
+            # history when an unsuccessful run later succeeds before retirement.
+            history = repo_root / "GAP History"
+            folder, *relative = snapshot.relative_to(history).parts
+            other = "unsuccessful" if folder == "successful" else "successful"
+            obsolete = history / other / Path(*relative)
+            if obsolete.exists():
+                old_rel = state_path_for_output(obsolete, repo_root=repo_root)
+                if not run(["ls-files", "--", old_rel], cwd=repo_root).strip():
+                    raise GapPrMonitorError("Refusing to remove an untracked history snapshot")
+                obsolete.unlink()
+                paths.append(old_rel)
     run(["add", "--", *paths], cwd=repo_root)
     staged = run(["diff", "--cached", "--name-only"], cwd=repo_root)
+    if set(staged.splitlines()) - set(paths):
+        raise GapPrMonitorError("Refusing to publish staged changes outside this Leader record")
     committed = False
     if staged.strip():
         run(["commit", "-m", commit_message], cwd=repo_root)
@@ -1223,6 +1249,7 @@ def retire_previous_leader(
     git = git_runner or (lambda args, cwd: _run_git(args, cwd=cwd))
     ref = parse_pr_url(leader_pr_url)
     old = json.loads(runner(["api", f"repos/{ref.slug}/pulls/{ref.number}"]))
+    require_clean_leader_checkout(repo_root, git_runner=git)
     source_sha = git(["rev-parse", "HEAD"], cwd=repo_root)
     branch = head_ref or old.get("head", {}).get("ref")
     if (old.get("head", {}).get("sha") != source_sha
@@ -1451,30 +1478,41 @@ def run_monitor_publish_and_signal(
     )
 
 
-def latest_rollover_leader(leader_repo, *, gh_runner=None):
-    """Find the newest genuine Leader, including completed merged replacements."""
+def latest_rollover_leaders_by_base(leader_repo, *, gh_runner=None):
+    """Find the newest same-repository Leader for each target branch."""
     runner = gh_runner or _run_gh
     rows = json.loads(runner([
         "pr", "list", "--repo", leader_repo, "--state", "all",
         "--label", DEFAULT_LEADER_LABEL, "--limit", "100",
-        "--json", "number,url,headRefName,labels,state,isDraft",
+        "--json", "number,url,headRefName,baseRefName,labels,state,isDraft,isCrossRepository",
     ]))
     if not isinstance(rows, list):
         raise GapPrMonitorError("Invalid Leader inventory for daily rollover")
-    candidates = []
+    newest = {}
     for row in rows:
+        if not isinstance(row, dict):
+            continue
         branch = str(row.get("headRefName") or "")
-        labels = tuple(item["name"] for item in row.get("labels", []) if isinstance(item, dict) and item.get("name"))
+        base = row.get("baseRefName")
+        raw_labels = row.get("labels")
+        if not isinstance(raw_labels, list) or not isinstance(row.get("state"), str):
+            continue
+        labels = tuple(item["name"] for item in raw_labels
+                       if isinstance(item, dict) and isinstance(item.get("name"), str))
         if (
-            row.get("state") in {"OPEN", "MERGED"} and not row.get("isDraft")
+            row.get("state") in {"OPEN", "MERGED"} and row.get("isDraft") is False
+            and row.get("isCrossRepository") is False
+            and isinstance(base, str) and base
             and DEFAULT_LEADER_LABEL in labels
-            and isinstance(row.get("number"), int)
+            and type(row.get("number")) is int and row["number"] > 0
             and branch.startswith("gap-leader/gap-")
             and branch.removeprefix("gap-leader/") in labels
             and row.get("url") == f"https://github.com/{leader_repo}/pull/{row['number']}"
         ):
-            candidates.append(OpenLeaderPr(row["number"], row["url"], branch, labels))
-    return max(candidates, key=lambda item: item.number, default=None)
+            candidate = OpenLeaderPr(row["number"], row["url"], branch, labels, base)
+            if base not in newest or candidate.number > newest[base].number:
+                newest[base] = candidate
+    return newest
 
 
 def run_scheduled_monitors(
@@ -1515,7 +1553,14 @@ def run_scheduled_monitors(
     # Include a newer already-merged batch: a fast run must still retire older
     # pending Leaders. Closed, unmerged/abandoned PRs cannot be replacements.
     rollover = os.environ.get("GAP_RETIRE_PREVIOUS_LEADERS", "").lower() == "true"
-    newest = latest_rollover_leader(leader_repo, gh_runner=gh_runner) if rollover else None
+    newest_by_base = {}
+    if rollover:
+        try:
+            newest_by_base = latest_rollover_leaders_by_base(leader_repo, gh_runner=gh_runner)
+        except (GapPrMonitorError, GhCommandError, ValueError) as exc:
+            # Rollover is optional. A lookup outage must not prevent ordinary
+            # build evaluation and reporting for every open Leader.
+            print(f"WARNING: skipping daily rollover discovery: {exc}", file=sys.stderr)
 
     for leader in leaders:
         print(f"--- Leader #{leader.number} {leader.url} ({leader.head_ref}) ---")
@@ -1532,6 +1577,7 @@ def run_scheduled_monitors(
                 allow_gap_dir_fallback=True,
             )
             rollover_args = {}
+            newest = newest_by_base.get(leader.base_ref)
             if newest and leader.number < newest.number:
                 rollover_args["replacement_url"] = newest.url
             result = run_monitor_publish_and_signal(

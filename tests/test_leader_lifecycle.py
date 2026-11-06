@@ -287,31 +287,36 @@ def test_merged_replacement_is_valid_but_closed_unmerged_is_not():
 
 
 def test_latest_rollover_ignores_abandoned_draft_and_nonleader_prs():
-    def row(number, state="OPEN", draft=False, branch=None):
+    def row(number, state="OPEN", draft=False, branch=None, base="main", fork=False):
         return {
             "number": number, "url": f"https://github.com/acme/gap/pull/{number}",
-            "state": state, "isDraft": draft,
+            "state": state, "isDraft": draft, "baseRefName": base, "isCrossRepository": fork,
             "headRefName": branch or f"gap-leader/gap-{number}",
             "labels": [{"name": "gated-artifacts-promoter"}, {"name": f"gap-{number}"}],
         }
     calls = []
     def gh(args):
         calls.append(args)
-        return json.dumps([row(13, branch="feature"), row(12, draft=True),
+        return json.dumps([None, 7, {"labels": 3}, row(16, base="rhoai-3.6"),
+                           row(15, fork=True), row(14, base=""),
+                           row(13, branch="feature"), row(12, draft=True),
                            row(11, state="CLOSED"), row(10, state="MERGED"), row(9)])
-    newest = monitor.latest_rollover_leader("acme/gap", gh_runner=gh)
-    assert newest.number == 10
+    newest = monitor.latest_rollover_leaders_by_base("acme/gap", gh_runner=gh)
+    assert {base: leader.number for base, leader in newest.items()} == {"main": 10, "rhoai-3.6": 16}
     assert calls[0][calls[0].index("--state") + 1] == "all"
 
 
 @pytest.mark.parametrize("enabled", [True, False])
 def test_schedule_only_retires_older_leaders_when_enabled(tmp_path, monkeypatch, enabled):
-    old = monitor.OpenLeaderPr(9, OLD, "gap-leader/gap-9", ("gated-artifacts-promoter", "gap-9"))
-    new = monitor.OpenLeaderPr(10, NEW, "gap-leader/gap-10", ("gated-artifacts-promoter", "gap-10"))
+    old = monitor.OpenLeaderPr(9, OLD, "gap-leader/gap-9", ("gated-artifacts-promoter", "gap-9"), "main")
+    new = monitor.OpenLeaderPr(10, NEW, "gap-leader/gap-10", ("gated-artifacts-promoter", "gap-10"), "main")
+    other = monitor.OpenLeaderPr(11, "https://github.com/acme/gap/pull/11",
+                                 "gap-leader/gap-11", ("gated-artifacts-promoter", "gap-11"), "rhoai-3.6")
     calls = []
     monkeypatch.setenv("GAP_RETIRE_PREVIOUS_LEADERS", str(enabled).lower())
-    monkeypatch.setattr(monitor, "list_open_leader_prs", lambda *a, **k: [new, old])
-    monkeypatch.setattr(monitor, "latest_rollover_leader", lambda *a, **k: new)
+    monkeypatch.setattr(monitor, "list_open_leader_prs", lambda *a, **k: [new, old, other])
+    monkeypatch.setattr(monitor, "latest_rollover_leaders_by_base",
+                        lambda *a, **k: {"main": new, "rhoai-3.6": other})
     monkeypatch.setattr(monitor, "checkout_leader_branch", lambda *a, **k: None)
     monkeypatch.setattr(monitor, "resolve_state_file", lambda **k: tmp_path / "state.json")
     def execute(path, **kwargs):
@@ -321,6 +326,7 @@ def test_schedule_only_retires_older_leaders_when_enabled(tmp_path, monkeypatch,
     assert monitor.run_scheduled_monitors(tmp_path, leader_repo="acme/gap") == 0
     assert "replacement_url" not in calls[0]
     assert calls[1].get("replacement_url") == (NEW if enabled else None)
+    assert "replacement_url" not in calls[2]
 
 
 def test_creator_rejects_reusing_closed_trigger_before_any_git_changes():
@@ -412,3 +418,98 @@ def test_creator_resumes_orphaned_branch_without_force_push(monkeypatch):
     assert any(c[:2] == ["git", "fetch"] for c in commands)
     assert state.pull_requests[0].build_observations["head-sha"] == "b" * 40
     assert not any("--force" in c for c in commands if c[0] == "git")
+
+
+@pytest.mark.parametrize("response", [None, "not json", "{}"])
+def test_discovery_failure_still_monitors_every_open_leader(tmp_path, monkeypatch, capsys, response):
+    leaders = [
+        monitor.OpenLeaderPr(n, f"https://github.com/acme/gap/pull/{n}",
+                             f"gap-leader/gap-{n}", ("gated-artifacts-promoter", f"gap-{n}"), "main")
+        for n in (9, 10)
+    ]
+    monkeypatch.setenv("GAP_RETIRE_PREVIOUS_LEADERS", "true")
+    monkeypatch.setattr(monitor, "list_open_leader_prs", lambda *a, **k: leaders)
+    monkeypatch.setattr(monitor, "checkout_leader_branch", lambda *a, **k: None)
+    monkeypatch.setattr(monitor, "resolve_state_file", lambda **k: tmp_path / "state.json")
+    visited = []
+    def gh(args):
+        if response is None:
+            raise monitor.GhCommandError(args, 1, "GitHub unavailable")
+        return response
+    def execute(path, **kwargs):
+        assert "replacement_url" not in kwargs
+        visited.append(kwargs["leader_pr_url"])
+        return monitor.MonitorResult(path, [], [], [], [], False)
+    monkeypatch.setattr(monitor, "run_monitor_publish_and_signal", execute)
+    assert monitor.run_scheduled_monitors(tmp_path, leader_repo="acme/gap", gh_runner=gh) == 0
+    assert visited == [leader.url for leader in leaders]
+    assert "skipping daily rollover discovery" in capsys.readouterr().err
+
+
+def test_failed_commit_cannot_carry_staged_history_to_next_leader(git_leader):
+    root, path, git = git_leader
+    data = retired(json.loads(path.read_text()))
+    path.write_text(json.dumps(data))
+    before = git(["rev-parse", "HEAD"], root)
+    def fail_commit(args, cwd):
+        if args[0] == "commit":
+            raise monitor.GapPrMonitorError("commit hook failed")
+        return git(args, cwd)
+    with pytest.raises(monitor.GapPrMonitorError, match="hook failed"):
+        monitor.publish_state(root, path, "gap-leader/gap-9", git_runner=fail_commit)
+    assert "GAP History" in git(["diff", "--cached", "--name-only"], root)
+    with pytest.raises(monitor.GapPrMonitorError, match="uncommitted"):
+        monitor.checkout_leader_branch(root, "gap-leader/gap-10", git_runner=git)
+    assert git(["rev-parse", "HEAD"], root) == before
+    assert git(["branch", "--show-current"], root) == "gap-leader/gap-9"
+
+
+def test_retirement_rejects_dirty_checkout_without_discarding_changes(git_leader):
+    root, path, git = git_leader
+    sha = git(["rev-parse", "HEAD"], root)
+    path.write_text(path.read_text() + "\n")
+    before = path.read_bytes()
+    with pytest.raises(monitor.GapPrMonitorError, match="uncommitted"):
+        monitor.retire_previous_leader(
+            path, repo_root=root, head_ref="gap-leader/gap-9", leader_pr_url=OLD,
+            replacement_url=NEW, check_name="gap", dry_run=False, remote="origin",
+            gh_runner=lambda _: json.dumps(pull(sha=sha)), git_runner=git,
+        )
+    assert path.read_bytes() == before
+    assert not (root / "GAP History").exists()
+
+
+def test_publish_rejects_unrelated_staged_files(git_leader):
+    root, path, git = git_leader
+    unrelated = root / "other-leader.json"
+    unrelated.write_text("{}")
+    git(["add", "--", unrelated.name], root)
+    before = git(["rev-parse", "HEAD"], root)
+    with pytest.raises(monitor.GapPrMonitorError, match="outside this Leader record"):
+        monitor.publish_state(root, path, "gap-leader/gap-9", git_runner=git)
+    assert git(["rev-parse", "HEAD"], root) == before
+
+
+@pytest.mark.parametrize("old_outcome,new_outcome", [("failure", "success"), ("success", "failure")])
+def test_retirement_keeps_one_current_history_record_but_preserves_git_history(git_leader, old_outcome, new_outcome):
+    root, path, git = git_leader
+    data = json.loads(path.read_text())
+    for gate in data["promotion-gates"]:
+        gate["status"] = old_outcome
+    path.write_text(json.dumps(data))
+    old = monitor.publish_state(root, path, "gap-leader/gap-9", git_runner=git)
+    folders = {"success": "successful", "failure": "unsuccessful"}
+    obsolete = root / f"GAP History/{folders[old_outcome]}/2026-11-05_gap-9/state.json"
+    assert obsolete.exists()
+    for gate in data["promotion-gates"]:
+        gate["status"] = new_outcome
+    retire_leader(data, replacement_url=NEW, source_sha=old.sha)
+    path.write_text(json.dumps(data))
+    new = monitor.publish_state(root, path, "gap-leader/gap-9", git_runner=git)
+    assert not obsolete.exists()
+    current = root / f"GAP History/{folders[new_outcome]}/2026-11-05_gap-9/state.json"
+    assert json.loads(current.read_text()) == data
+    assert obsolete.relative_to(root).as_posix() not in git(["ls-tree", "-r", "--name-only", new.sha], root).splitlines()
+    historical = json.loads(git(["show", f"{old.sha}:{obsolete.relative_to(root)}"], root))
+    assert historical["promotion-gates"][0]["status"] == old_outcome
+    assert KEY not in historical
