@@ -32,6 +32,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from lib.leader_lifecycle import retired_outcome
+from lib.leader_history import history_state_outcome
 
 from lib.gap_check_selection import DEFAULT_BUILD_APP_SLUG, default_build_producer
 from lib.konflux_builds import build_status_source, DEFAULT_UI
@@ -871,7 +872,9 @@ def report_for_leader(
     gh_runner: Callable[[Sequence[str]], str] | None = None,
     git_runner: Callable[..., str] | None = None,
     reuse_monitor_evidence: bool = False,
+    allow_archived: bool = False,
 ) -> ReporterResult:
+    """Update the maintained summary, preserving finalized records unless explicitly requested."""
     run = gh_runner or _run_gh
     if head_ref:
         checkout_leader_branch(repo_root, head_ref, git_runner=git_runner)
@@ -884,7 +887,7 @@ def report_for_leader(
         allow_gap_dir_fallback=True,
     )
     payload = load_state(path)
-    if retired_outcome(payload):
+    if retired_outcome(payload) or (history_state_outcome(path) and not allow_archived):
         return ReporterResult(
             leader_pr_url, (), None, False, False, dry_run,
             "Retired Leader: preserving the recorded failure summary.",
