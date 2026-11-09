@@ -29,6 +29,10 @@ TRANSIENT = re.compile(
     r"no space left on device|temporary failure in name resolution", re.I)
 
 
+class RetryObservationChanged(KonfluxQueryError):
+    """The failed attempt is obsolete; never classify its replacement as failed."""
+
+
 def retries_enabled():
     """Explicit opt-in rollout; legacy monitors do not post retry comments."""
     return os.environ.get("GAP_AUTO_RETRY_BUILDS", "false").lower() == "true"
@@ -51,6 +55,9 @@ def classify_failure(observation, details="", *, push_healthy=False, task_eviden
 
 
 def _moment(value):
+    """Read an offset-aware receipt/controller time, rejecting malformed data."""
+    if not isinstance(value, str):
+        raise ValueError("Retry timestamp must be text")
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         raise ValueError("Retry receipt has no timezone")
@@ -61,6 +68,7 @@ class BuildRetryManager:
     """Apply retries only on the monitor's final, fresh batch evaluation."""
 
     def __init__(self, runner, payload, *, dry_run=False, client_factory=None, clock=None):
+        """Configure a serialized monitor writer and recover its saved receipts."""
         self.runner, self.dry_run = runner, dry_run
         self.client_factory = client_factory or KonfluxClient.from_environment
         self.clock = clock or (lambda: datetime.now(timezone.utc))
@@ -71,6 +79,7 @@ class BuildRetryManager:
             self.saved[entry.get("pr-url")] = deepcopy(receipt.get("retry-history", []))
 
     def _history(self, pr):
+        """Reconcile trusted child comments with state across leaders/restarts."""
         endpoint = f"repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments"
         comments = collect_github_pages(self.runner, endpoint, None, 100)
         history = list(self.saved.get(pr.url, []))
@@ -102,6 +111,7 @@ class BuildRetryManager:
         return list(unique.values())
 
     def _retry(self, pr, observation, history, client):
+        """Plan or send one targeted retry after identity and budget checks."""
         now = self.clock()
         records = [r for r in history if r["component"] == observation["component"] and r["sha"] == pr.head_sha]
         count = len(records)
@@ -111,7 +121,7 @@ class BuildRetryManager:
         if records:
             last = max(records, key=lambda r: _moment(r["requested_at"]))
             if (observation["uid"] == last["run_uid"]
-                    or _moment(observation["created_at"]) <= _moment(last["requested_at"])):
+                    or _moment(observation["created_at"]) < _moment(last["requested_at"])):
                 waiting = now - _moment(last["requested_at"]) < START_GRACE
                 info.update(status="build-retrigger-pending" if waiting else "retry-not-started",
                             reason="Waiting for a new Konflux attempt" if waiting else
@@ -147,10 +157,10 @@ class BuildRetryManager:
         fresh = client.observe(repo=f"{pr.owner}/{pr.repo}", number=pr.number, sha=pr.head_sha,
                                components={observation["component"]}, pipeline_names={pipeline}, refresh=True)
         if fresh.uid != observation["uid"] or fresh.status != observation["status"]:
-            raise KonfluxQueryError("Build attempt changed before retry; awaiting monitor refresh")
+            raise RetryObservationChanged("Build attempt changed before retry; awaiting monitor refresh")
         current = github_api_json(self.runner, f"repos/{pr.owner}/{pr.repo}/pulls/{pr.number}")
         if current.get("state") != "open" or (current.get("head") or {}).get("sha") != pr.head_sha:
-            raise KonfluxQueryError("PR closed or changed head before retry; awaiting monitor refresh")
+            raise RetryObservationChanged("PR closed or changed head before retry; awaiting monitor refresh")
         record = {"repository": f"{pr.owner}/{pr.repo}", "pr": pr.number,
                   "component": observation["component"], "sha": pr.head_sha,
                   "pipeline": pipeline, "run_uid": observation["uid"],
@@ -163,12 +173,17 @@ class BuildRetryManager:
                 f"<!-- gap-build-retry:v1 {json.dumps(record, sort_keys=True)} -->")
         # One external write for both command and audit receipt. Do not retry
         # this POST on errors: the next poll reads comments before acting again.
-        response = json.loads(self.runner(["api", f"repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments",
-                                           "--method", "POST", "-f", "body=" + body]))
-        if (response.get("user") or {}).get("login") != self.actor:
-            raise RuntimeError("Retry comment author differs from GAP_BUILD_RETRY_ACTOR; stop automatic retries")
-        record.update(comment_url=response["html_url"], comment_id=response["id"],
-                      requested_at=response["created_at"])
+        try:
+            response = json.loads(self.runner(["api", f"repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments",
+                                               "--method", "POST", "-f", "body=" + body]))
+            if (response.get("user") or {}).get("login") != self.actor:
+                raise RuntimeError("Retry comment author differs from GAP_BUILD_RETRY_ACTOR; stop automatic retries")
+            record.update(comment_url=response["html_url"], comment_id=response["id"],
+                          requested_at=response["created_at"])
+        except (RuntimeError, ValueError, TypeError, KeyError) as exc:
+            # A POST may have reached GitHub even if its response was lost or
+            # malformed. Stop publication; the next poll reconciles receipts.
+            raise RuntimeError("Could not confirm retry delivery; reconcile child comments on the next poll") from exc
         history.append(record)
         self.saved[pr.url] = deepcopy(history)
         info.update(status="build-retrigger-pending", retrigger_count=count + 1,
@@ -209,8 +224,19 @@ class BuildRetryManager:
                 # query must not exhaust every subsequent component's budget.
                 client = self.client_factory()
                 info, waiting = self._retry(pr, observation, history, client)
+            except RetryObservationChanged as exc:
+                info, waiting = {"status": "retry-observation-changed", "reason": str(exc)}, True
             except (KonfluxQueryError, ValueError, TypeError, KeyError) as exc:
-                info, waiting = {"status": "retry-evidence-unavailable", "reason": str(exc)}, True
+                # Retry eligibility is optional; a broken optional read must
+                # not hold a completed failure open forever. This timeout never
+                # converts a known newer attempt/head into an old failure.
+                try:
+                    age = self.clock() - _moment(observation.get("completed_at"))
+                    waiting = timedelta(0) <= age < START_GRACE
+                except ValueError:
+                    waiting = False
+                reason = str(exc) + ("" if waiting else "; retry evaluation window expired; manual investigation required")
+                info = {"status": "retry-evidence-unavailable", "reason": reason}
             observation["retry"] = info
             awaiting |= waiting
             # A cancelled attempt is terminal when its retry budget is spent.

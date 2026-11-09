@@ -510,7 +510,7 @@ def build_child_row(
                 expected_host = urlsplit(os.environ.get("KONFLUX_UI_URL", DEFAULT_UI)).netloc
                 verified = []
                 for record in evidence.get("runs", []):
-                    if not isinstance(record, dict) or record.get("status") not in {"failure", "timed_out"}:
+                    if not isinstance(record, dict) or record.get("status") not in {"failure", "timed_out", "cancelled"}:
                         continue
                     if record.get("head_sha") != head_sha:
                         continue
@@ -522,6 +522,15 @@ def build_child_row(
                         verified.append(BuildCheckLink(name=str(record.get("name") or record.get("component")),
                                                        conclusion=record["status"], url=link))
                 build_links = tuple(verified)
+                retry_details = [
+                    str(record.get("component", "?")) + ": " + str(record["retry"].get("status", "unknown"))
+                    + ": " + str(record["retry"].get("reason", ""))
+                    for record in evidence.get("runs", [])
+                    if isinstance(record, dict) and isinstance(record.get("retry"), dict)
+                    and record.get("status") != "success"
+                ]
+                if retry_details:
+                    evidence_reason = "; ".join(filter(None, [evidence_reason, *retry_details]))
     elif status_key in {"merge-failure", "build-pending", "new"}:
         build_links: tuple[BuildCheckLink, ...] = ()
     else:

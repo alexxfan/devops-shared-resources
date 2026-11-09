@@ -448,3 +448,175 @@ def test_human_quote_of_receipt_cannot_consume_the_retry_budget():
     gate, receipt = apply(manager(gh, client), client)
     assert gate.outcome == "pending"
     assert receipt["runs"][0]["retry"]["retrigger_count"] == 1
+
+
+def test_new_attempt_in_same_second_as_comment_is_not_treated_as_missing():
+    gh, client = FakeGitHub(), FakeKonflux()
+    apply(manager(gh, client), client)
+    client.items = [attempt(name="r2", created=NOW.isoformat())]
+    gate, receipt = apply(manager(gh, client, now=NOW + timedelta(minutes=20)), client)
+    assert len(gh.posts) == 2
+    assert receipt["runs"][0]["retry"]["retrigger_count"] == 2
+    assert gate.outcome == "pending"
+
+
+@pytest.mark.parametrize("reason", ["PipelineRunTimeout", "Cancelled"])
+@pytest.mark.parametrize("retry_status", ["retry-exhausted", "retry-not-started"])
+def test_leader_report_explains_terminal_retry_problem_and_links_attempt(reason, retry_status):
+    from scripts.gap_failure_reporter import build_child_row
+    gh, client = FakeGitHub(), FakeKonflux(attempt(reason))
+    _, evidence = evaluate(client)
+    evidence["pr-state"] = "OPEN"
+    evidence["runs"][0]["url"] = evidence["runs"][0]["url"].replace(
+        "https://konflux.example.com", "https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com")
+    evidence["runs"][0]["retry"] = {"status": retry_status, "retrigger_count": 2,
+        "reason": "Automatic retries stopped; manual investigation required"}
+    row = build_child_row({"repo": "foo", "pr-url": PR.url, "pr-status": "build-failure",
+                           "build-observations": evidence}, reuse_monitor_evidence=True)
+    assert retry_status in row.reason
+    assert "manual investigation required" in row.reason
+    assert len(row.build_links) == 1
+
+
+@pytest.mark.parametrize("initial,fresh_status,second_move", [
+    ("build-failure", "success", False),
+    ("build-failure", "build-pending", False),
+    ("build-failure", "build-failure", True),
+    ("success", "success", False),
+])
+def test_late_head_refresh_recomputes_hold_for_recovered_child_and_following_sibling(
+        tmp_path, monkeypatch, initial, fresh_status, second_move):
+    from scripts import gap_pr_monitor as monitor
+    from tests.test_gap_pr_monitor import FakeUpdater, _gate
+    from dataclasses import replace
+    urls = ["https://github.com/acme/one/pull/1", "https://github.com/acme/two/pull/2"]
+    path = tmp_path / "state.json"
+    payload = {"pull-requests": [
+        {"repo": str(n), "pr-url": url, "pr-status": "new", "head-sha": SHA}
+        for n, url in enumerate(urls)]}
+    if initial == "success":
+        # A passing EG result belongs to the old heads and cannot release the new one.
+        monitor.apply_overall_status(payload, "success")
+    path.write_text(json.dumps(payload))
+    calls = {url: 0 for url in urls}
+    def decide(url, **kwargs):
+        calls[url] += 1
+        if url == urls[0] and calls[url] <= 2:
+            return replace(_gate(url, initial, "failure" if initial == "build-failure" else "success"), head_sha=SHA)
+        status = fresh_status if url == urls[0] else "success"
+        cli_status = {"success": "success", "build-pending": "pending", "build-failure": "failure"}[status]
+        return replace(_gate(url, status, cli_status), head_sha="b" * 40 if url == urls[0] else SHA)
+    class MovedUpdater(FakeUpdater):
+        def post_status_for_pr(self, url, status, **kwargs):
+            result = super().post_status_for_pr(url, status, **kwargs)
+            if url == urls[0] and (kwargs["head_sha"] == SHA or second_move):
+                self.posts.pop()  # no stale status is actually published
+                return replace(result, deferred=True)
+            return result
+    updater = MovedUpdater(check_name="gated artifacts promoter")
+    monkeypatch.setenv("GAP_BUILD_STATUS_SOURCE", "konflux")
+    monkeypatch.setenv("GAP_AUTO_RETRY_BUILDS", "true")
+    monkeypatch.setattr(monitor, "fetch_component_repo_map", lambda _: {})
+    monkeypatch.setattr(monitor, "_decide_url", decide)
+    result = monitor.run_monitor(path, gh_runner=lambda *_: "", updater_factory=lambda **_: updater)
+    assert result.overall_status == ("early-gate-triggered" if fresh_status == "success" else None)
+    assert len(updater.posts) == (1 if second_move else 2)
+    assert all(status == "pending" for _, status, _ in updater.posts)
+    saved = json.loads(path.read_text())
+    gates = {gate["id"]: gate["status"] for gate in saved["promotion-gates"]}
+    assert gates["early-gate-build"] == gates["early-gate-test"] == "pending"
+
+
+@pytest.mark.parametrize("reason", ["PipelineRunTimeout", "Cancelled", "Failed"])
+@pytest.mark.parametrize("age,waiting", [(timedelta(hours=1), True), (timedelta(hours=2), False), (timedelta(days=2), False)])
+def test_optional_retry_evidence_failure_has_bounded_hold(reason, age, waiting):
+    gh, client = FakeGitHub(), FakeKonflux(attempt(reason))
+    completed = NOW - age
+    client.items[0]["status"]["completionTime"] = completed.isoformat()
+    def denied(*args, **kwargs):
+        raise KonfluxQueryError("HTTP 403 reading TaskRuns")
+    client._list_resources = denied
+    gate, receipt = apply(manager(gh, client), client)
+    assert not gh.posts
+    assert gate.outcome == ("pending" if waiting else "fail")
+    retry = receipt["runs"][0]["retry"]
+    assert retry["status"] == "retry-evidence-unavailable"
+    assert ("window expired" in retry["reason"]) is not waiting
+    assert receipt["runs"][0]["status"] == observe(client.items).status
+
+
+@pytest.mark.parametrize("problem", ["Archived PipelineRun pagination limit reached", "Cannot verify Component release branch"])
+def test_persistent_push_health_error_cannot_hide_generic_build_failure(problem, monkeypatch):
+    import lib.gap_build_retries as retries
+    gh, client = FakeGitHub(), FakeKonflux(attempt("Failed"))
+    client.tasks = [failed_task()]
+    def unavailable(*args, **kwargs):
+        raise KonfluxQueryError(problem)
+    monkeypatch.setattr(retries, "component_push_branch", unavailable)
+    gate, receipt = apply(manager(gh, client, now=NOW + timedelta(hours=1)), client)
+    assert gate.outcome == "fail" and not gh.posts
+    assert problem in receipt["runs"][0]["retry"]["reason"]
+
+
+@pytest.mark.parametrize("move", ["head", "attempt"])
+def test_new_identity_never_expires_into_failure_of_old_attempt(move):
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, receipt = evaluate(client)
+    if move == "head":
+        gh.sha = "b" * 40
+    else:
+        client.items.append(attempt(name="r2", created="2026-11-05T13:00:00Z"))
+    gate, receipt = manager(gh, client, now=NOW + timedelta(days=3)).apply(PR, gate, receipt)
+    assert gate.outcome == "pending" and not gh.posts
+    assert receipt["runs"][0]["retry"]["status"] == "retry-observation-changed"
+
+
+def test_malformed_post_response_does_not_archive_a_retry_that_was_delivered():
+    gh, client = FakeGitHub(), FakeKonflux()
+    def runner(args):
+        response = gh(args)
+        return "{" if "POST" in args else response
+    # The observed failed attempt is older than the optional-evidence window.
+    with pytest.raises(RuntimeError, match="Could not confirm retry delivery"):
+        apply(manager(runner, client, now=NOW + timedelta(days=2)), client)
+    assert len(gh.posts) == 1
+    gate, receipt = apply(manager(gh, client), client)
+    assert gate.outcome == "pending" and len(gh.posts) == 1
+    assert receipt["runs"][0]["retry"]["retrigger_count"] == 1
+
+
+def test_lost_retry_response_during_late_refresh_holds_following_siblings(tmp_path, monkeypatch):
+    from scripts import gap_pr_monitor as monitor
+    from tests.test_gap_pr_monitor import FakeUpdater, _gate
+    urls = ["https://github.com/acme/one/pull/1", "https://github.com/acme/two/pull/2"]
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"pull-requests": [
+        {"repo": str(n), "pr-url": url, "pr-status": "new", "head-sha": SHA}
+        for n, url in enumerate(urls)]}))
+    calls = {url: 0 for url in urls}
+    def decide(url, **kwargs):
+        calls[url] += 1
+        if url == urls[0]:
+            if calls[url] == 3:
+                raise RuntimeError("Could not confirm retry delivery")
+            return replace(_gate(url, "build-failure", "failure"), head_sha=SHA)
+        return replace(_gate(url, "success", "success"), head_sha=SHA)
+    class MovedUpdater(FakeUpdater):
+        def post_status_for_pr(self, url, status, **kwargs):
+            result = super().post_status_for_pr(url, status, **kwargs)
+            if url == urls[0]:
+                self.posts.pop()
+                return replace(result, deferred=True)
+            return result
+    updater = MovedUpdater(check_name="gated artifacts promoter")
+    monkeypatch.setenv("GAP_BUILD_STATUS_SOURCE", "konflux")
+    monkeypatch.setenv("GAP_AUTO_RETRY_BUILDS", "true")
+    monkeypatch.setattr(monitor, "fetch_component_repo_map", lambda _: {})
+    monkeypatch.setattr(monitor, "_decide_url", decide)
+    with pytest.raises(monitor.GapPrMonitorError, match="Could not confirm retry delivery"):
+        monitor.run_monitor(path, gh_runner=lambda *_: "", updater_factory=lambda **_: updater,
+                            continue_on_error=True)
+    assert [(url, status) for url, status, _ in updater.posts] == [(urls[1], "pending")]
+    saved = json.loads(path.read_text())
+    assert saved["pull-requests"][0]["pr-status"] == "build-pending"
+    assert monitor.compute_overall_status(saved) is None

@@ -2134,6 +2134,19 @@ def _publish_gate_decision(
         component_repo_map=component_repo_map,
         retry_manager=retry_manager,
     )
+    # The head changed after the batch refresh. Recompute the shared probe
+    # before posting this decision or any following sibling: an old terminal
+    # failure must not release greens when the new head is pending/recovered.
+    if payload is not None:
+        record_child_head_shas(payload, [fresh])
+        apply_pr_statuses(payload, {fresh.url: fresh.pr_status})
+        apply_component_builds_from_children(payload)
+        overall_status = derive_legacy_overall_status(payload)
+        batch_concluded = children_batch_concluded([
+            str(entry.get("pr-status") or "") for entry in payload.get("pull-requests", [])
+        ])
+    else:
+        batch_concluded, overall_status = False, None
     if fresh.skip_status_post:
         return fresh, None
     to_post = status_decision_for_post(
@@ -2145,6 +2158,9 @@ def _publish_gate_decision(
     assert isinstance(to_post, RepositoryGateDecision)
     result = _post_gate_status(updater, to_post, description)
     if result.deferred:
+        if payload is not None:
+            apply_pr_statuses(payload, {fresh.url: BUILD_PENDING_PR_STATUS})
+            apply_component_builds_from_children(payload)
         return None, result
     return fresh, result
 
@@ -2229,6 +2245,11 @@ def _publish_decisions(
             )
         except (ValueError, RuntimeError, GhCommandError, GapPrMonitorError) as exc:
             post_errors.append((url, str(exc)))
+            # A late refresh/action may have started a retry before its response
+            # was lost. Keep subsequent siblings held while this child is unknown.
+            status_updates[url] = BUILD_PENDING_PR_STATUS
+            apply_pr_statuses(probe, {url: BUILD_PENDING_PR_STATUS})
+            apply_component_builds_from_children(probe)
             if not continue_on_error:
                 if status_updates and not dry_run:
                     apply_pr_statuses(payload, status_updates)
