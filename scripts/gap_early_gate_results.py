@@ -37,7 +37,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from lib.leader_lifecycle import retired_outcome
-from lib.leader_history import history_state_outcome
+from lib.leader_history import history_state_outcome, is_history_state
 
 from lib.gap_promotion_gates import (
     GATE_COMPONENT_BUILDS,
@@ -886,6 +886,8 @@ def run_early_gate_results(
         payload,
         overall_status=new_overall,
         updater=updater,
+        # The first publication must honor the same frozen receipt as retries.
+        pinned_only=is_history_state(state_path),
     )
     return EarlyGateResultsResult(
         state_path=state_path,

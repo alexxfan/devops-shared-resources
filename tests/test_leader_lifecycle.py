@@ -923,3 +923,126 @@ def test_archived_retry_never_uses_a_failed_exact_url_alias():
     assert results.post_child_statuses_for_early_gate(
         data, overall_status="success", updater=Updater(), pinned_only=True,
     ) == (failed["pr-url"],)
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+@pytest.mark.parametrize("child_moved", [False, True])
+def test_first_archive_finalization_uses_evaluated_child_revision(git_leader, outcome, child_moved):
+    """The first archive publication must not approve code newer than its saved build receipt."""
+    root, path, git = git_leader
+    data = payload("success")
+    data["pull-requests"][0]["head-sha"] = "b" * 40
+    data["promotion-gates"][0]["status"] = "success"
+    path.write_text(json.dumps(data))
+    git(["add", "."], root)
+    git(["commit", "-m", "Component ready for EG"], root)
+    git(["push", "origin", "HEAD"], root)
+    posts = []
+
+    def gh(args):
+        """Emulate GitHub heads and statuses while real updater code enforces revision checks."""
+        if args[0] != "api":
+            return ""
+        endpoint = args[1] if args[1] != "--method" else args[3]
+        if endpoint.endswith("/pulls/9"):
+            if "--jq" in args:
+                return json.dumps({"sha": git(["rev-parse", "HEAD"], root),
+                                   "owner": "acme", "repo": "gap", "state": "open"})
+            return json.dumps(pull(sha=git(["rev-parse", "HEAD"], root)))
+        if endpoint.endswith("/pulls/3"):
+            return json.dumps({"sha": ("c" if child_moved else "b") * 40,
+                               "owner": "acme", "repo": "component", "state": "open"})
+        if "/statuses/" in endpoint:
+            posts.append(endpoint)
+            return "{}"
+        if "/commits/" in endpoint:
+            return ""
+        if "/comments" in endpoint:
+            return "[]"
+        return ""
+
+    def factory(**kwargs):
+        """Use the actual status updater with an offline GitHub transport."""
+        return results.PRStatusUpdater(
+            **kwargs, runner=lambda command: subprocess.CompletedProcess(command, 0, gh(command[1:]), ""),
+        )
+
+    labels = ["early-gate-build-successful", "early-gate-tests-successful"] if outcome == "success" else [
+        "early-gate-build-failed",
+    ]
+    result = results.run_early_gate_results(
+        repo_root=root, leader_pr_url=OLD, state_file=str(path), labels=labels,
+        head_ref="gap-leader/gap-9", publish=True, git_runner=git, gh_runner=gh,
+        updater_factory=factory,
+    )
+    assert result.overall_status == outcome
+    assert not path.exists() and result.state_path.parent.parent.name == (
+        "successful" if outcome == "success" else "unsuccessful"
+    )
+    child_posts = [endpoint for endpoint in posts if "/component/" in endpoint]
+    assert child_posts == ([] if child_moved else ["repos/acme/component/statuses/" + "b" * 40])
+    assert result.child_urls_posted == (() if child_moved else (data["pull-requests"][0]["pr-url"],))
+    assert json.loads(result.state_path.read_text())["pull-requests"][0]["head-sha"] == "b" * 40
+
+
+def test_active_monitor_still_refreshes_receipts_and_retriggers_eg(git_leader, monkeypatch):
+    """Exclusive history must not archive an active run or suppress its child-head retrigger."""
+    root, path, git = git_leader
+    child = payload()["pull-requests"][0]["pr-url"]
+    stage = {"status": "build-pending", "sha": "b" * 40}
+    comments, posts = [], []
+    monkeypatch.setenv("GAP_BUILD_STATUS_SOURCE", "konflux")
+    monkeypatch.setattr(monitor, "fetch_component_repo_map", lambda _: {"component": frozenset({"model"})})
+    monkeypatch.setattr(monitor, "_post_leader_failure_summary", lambda **kwargs: None)
+
+    def observe(url, **kwargs):
+        """Supply changing Konflux observations while keeping the monitor coordinator real."""
+        return monitor.RepositoryGateDecision(
+            url=url, pr_status=stage["status"], cli_status="completed" if stage["status"] == "success" else "pending",
+            description="build observation", reason="build observation", head_sha=stage["sha"],
+            build_observations={"source": "konflux", "head-sha": stage["sha"], "runs": []},
+        )
+
+    monkeypatch.setattr(monitor, "_decide_url", observe)
+
+    def gh(args):
+        """Record status and trigger writes without any real GitHub changes."""
+        if args[:2] == ["pr", "comment"]:
+            comments.append(args[args.index("--body") + 1])
+            return ""
+        if args[0] != "api":
+            raise AssertionError(args)
+        endpoint = args[1] if args[1] != "--method" else args[3]
+        if endpoint.endswith("/pulls/3"):
+            return json.dumps({"sha": stage["sha"], "owner": "acme", "repo": "component", "state": "open"})
+        if "/statuses/" in endpoint:
+            posts.append(args)
+            return "{}"
+        if "/commits/" in endpoint:
+            return ""
+        if "/comments" in endpoint:
+            return json.dumps([{"body": body} for body in comments])
+        raise AssertionError(args)
+
+    def factory(**kwargs):
+        """Exercise revision checks and the child-green hold in the real updater."""
+        return results.PRStatusUpdater(
+            **kwargs, runner=lambda command: subprocess.CompletedProcess(command, 0, gh(command[1:]), ""),
+        )
+
+    for status, sha, count in [("build-pending", "b" * 40, 0), ("success", "b" * 40, 1),
+                               ("success", "b" * 40, 1), ("success", "c" * 40, 2)]:
+        stage.update(status=status, sha=sha)
+        result = monitor.run_monitor_publish_and_signal(
+            path, repo_root=root, leader_pr_url=OLD, head_ref="gap-leader/gap-9",
+            publish=True, git_runner=git, gh_runner=gh, updater_factory=factory,
+        )
+        saved = json.loads(path.read_text())
+        assert result.state_path == path and not result.leader_status_posted
+        assert not list((root / "GAP History").rglob("state.json"))
+        assert saved["pull-requests"][0]["head-sha"] == sha
+        assert saved["pull-requests"][0]["build-observations"]["head-sha"] == sha
+        assert len(comments) == count
+        assert git(["rev-parse", "origin/gap-leader/gap-9"], root) == result.published_sha
+    assert all("state=pending" in command for command in posts)
+    assert all("/component/statuses/" in " ".join(command) for command in posts)
