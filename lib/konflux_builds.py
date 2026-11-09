@@ -238,14 +238,23 @@ def _observation(run, sha, namespace, ui_url):
             result = "unknown"
     if metadata.get("deletionTimestamp") and result not in {"success", "failure", "timed_out", "cancelled"}:
         result, reason = "unknown", "Latest PipelineRun is being deleted before a terminal observation"
+    # Optional display metadata must not change gate verdicts or attempt selection.
+    completed_at = ""
+    if result in {"success", "failure", "timed_out", "cancelled"}:
+        try:
+            completed = _timestamp(status.get("completionTime"))
+            if completed >= _timestamp(metadata.get("creationTimestamp")):
+                completed_at = completed.isoformat()
+        except (KonfluxQueryError, OverflowError):
+            pass
     ui = _endpoint(ui_url)
     return BuildObservation(labels[COMPONENT], result, reason, sha, metadata["name"],
                             metadata["uid"], namespace, metadata["creationTimestamp"],
                             f"{ui}/ns/{quote(namespace)}/pipelinerun/{quote(metadata['name'])}",
-                            str((metadata.get("annotations") or {}).get(PAC + "original-prname")
+                            pipeline_name=str((metadata.get("annotations") or {}).get(PAC + "original-prname")
                                 or labels.get(PAC + "original-prname") or ""),
-                            str(status.get("completionTime") or ""),
-                            str(conditions[0].get("message") or "")[:4000] if conditions else "")
+                            completed_at=completed_at,
+                            message=str(conditions[0].get("message") or "")[:4000] if conditions else "")
 
 
 class _NoRedirect(HTTPRedirectHandler):

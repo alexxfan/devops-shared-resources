@@ -24,6 +24,9 @@ PR = RepositoryPullRequest(url="https://github.com/acme/foo/pull/123", owner="ac
 def attempt(reason="PipelineRunTimeout", name="r1", created="2026-11-05T10:00:00Z", component=COMPONENT):
     item = run(status="False", reason=reason, name=name, created=created, component=component)
     item["metadata"]["annotations"][PAC + "original-prname"] = PIPELINE
+    # Each retry must complete after its own creation, not the default first attempt.
+    item["status"]["completionTime"] = (datetime.fromisoformat(created.replace("Z", "+00:00"))
+                                         + timedelta(minutes=1)).isoformat()
     return item
 
 
@@ -99,6 +102,18 @@ def test_targeted_retry_holds_batch_and_keeps_original_build_truth(reason):
     assert record["retry"]["retrigger_count"] == 1
     assert receipt["retry-history"][0]["run_uid"] == record["uid"]
     assert client.refreshes == 1
+
+
+@pytest.mark.parametrize("completion", ["invalid", "2026-11-05T09:00:00Z"])
+def test_unusable_completion_cannot_authorize_automatic_retry(completion):
+    """Malformed or pre-creation completion is unavailable, never retry authority."""
+    gh, client = FakeGitHub(), FakeKonflux()
+    client.items[0]["status"]["completionTime"] = completion
+    gate, receipt = apply(manager(gh, client), client)
+    assert not gh.posts
+    assert gate.outcome == "fail"
+    assert receipt["runs"][0]["completed_at"] == ""
+    assert receipt["runs"][0]["status"] == "timed_out"
 
 
 def test_crash_after_post_and_different_leader_cannot_reissue_same_attempt():
@@ -532,6 +547,7 @@ def test_late_head_refresh_recomputes_hold_for_recovered_child_and_following_sib
 def test_optional_retry_evidence_failure_has_bounded_hold(reason, age, waiting):
     gh, client = FakeGitHub(), FakeKonflux(attempt(reason))
     completed = NOW - age
+    client.items[0]["metadata"]["creationTimestamp"] = (completed - timedelta(minutes=1)).isoformat()
     client.items[0]["status"]["completionTime"] = completed.isoformat()
     def denied(*args, **kwargs):
         raise KonfluxQueryError("HTTP 403 reading TaskRuns")

@@ -705,30 +705,78 @@ def test_creator_cannot_recreate_archived_trigger(monkeypatch, branch_exists):
     assert not any(c[:2] == ["git", "push"] or c[:3] == ["gh", "pr", "create"] for c in calls)
 
 
-def test_active_failure_summary_remains_visible_without_archiving(git_leader, monkeypatch):
-    """The final build-failure summary remains publishable after its state moves."""
+# Failed Leaders remain active while accepted notifications/tracking survive optional hook failures.
+@pytest.mark.parametrize("hook_fails", [False, True])
+def test_active_failure_summary_and_notifications_remain_visible(git_leader, monkeypatch, hook_fails):
+    """Use published active evidence without prematurely archiving or concluding failure."""
+
     root, path, git = git_leader
     data = payload("build-failure")
+    data["pull-requests"][0]["merge-observations"] = {
+        "schema": 1, "conflict": {"status": "failure"}, "feasibility": {"status": "unknown"},
+    }
+    data["pull-requests"][0]["build-observations"] = {
+        "source": "konflux", "repository": "acme/demo", "pr": 42, "head-sha": SHA,
+        "runs": [], "expected-components": ["api"],
+        "required-pipelines": {"schema": 1, "source": "revision-pinned-tekton",
+            "repository": "acme/demo", "pr": 42, "head-sha": SHA,
+            "pipelines": [{"component": "api", "pipeline_name": "build"},
+                          {"component": "api", "pipeline_name": "test"}]},
+    }
     data["promotion-gates"][0]["status"] = "failure"
     def evaluate(state, **kwargs):
         """Provide a failed component evaluation for the final-summary path."""
         state.write_text(json.dumps(data))
-        return monitor.MonitorResult(state, [], [], [], [], False, overall_status="failure")
+        return monitor.MonitorResult(state, [], [], [], [], False, overall_status="failure",
+                                     notification_urls=(data["pull-requests"][0]["pr-url"],))
     monkeypatch.setattr(monitor, "run_monitor", evaluate)
     monkeypatch.setattr(monitor, "verify_leader_head", lambda *a, **k: None)
     monkeypatch.setattr(monitor, "post_leader_conclusion", lambda *a, **k: SimpleNamespace(skipped=False))
     monkeypatch.setattr(reporter, "collect_rows_from_state", lambda saved, **k: [])
     monkeypatch.setattr(reporter, "current_creator_outcomes", lambda *a, **k: [])
+    from lib.gap_notifications.monitor_hook import NotificationConfig
+    notifications = []
+    def notify(saved, **kwargs):
+        """Observe exactly the accepted, already-published active evidence."""
+        assert path.exists()
+        archive = kwargs["state_path"]
+        assert archive == path
+        assert monitor.load_state(archive) == saved
+        from lib.state_file import StatePullRequest
+        child = saved["pull-requests"][0]
+        assert StatePullRequest.from_mapping(child, index=0).to_dict()["merge-observations"] == child["merge-observations"]
+        assert child["build-observations"] == data["pull-requests"][0]["build-observations"]
+        assert StatePullRequest.from_mapping(child, index=0).to_dict()["build-observations"] == child["build-observations"]
+        assert kwargs["accepted_urls"] == (data["pull-requests"][0]["pr-url"],)
+        assert kwargs["published_sha"] == git(["rev-parse", "HEAD"], root)
+        notifications.append(archive)
+        if hook_fails:
+            raise RuntimeError("optional failure")
+        kwargs["tracking"].update(status="checked")
+        return {"status": "preview"}
+    monkeypatch.setattr("lib.gap_notifications.monitor_hook.notify_after_publish", notify)
+    tracking = []
+    original_render = reporter.render_summary_markdown
+    def render(*args, **kwargs):
+        tracking.append(kwargs["tracking"])
+        return original_render(*args, **kwargs)
+    monkeypatch.setattr(reporter, "render_summary_markdown", render)
     comments = []
     monkeypatch.setattr(reporter, "upsert_leader_summary_comment",
                         lambda url, body, **k: (comments.append(body) or (1, False, True)))
     result = monitor.run_monitor_publish_and_signal(
         path, repo_root=root, head_ref="gap-leader/gap-9", leader_pr_url=OLD,
         publish=True, git_runner=git, updater_factory=lambda **k: None,
+        notification_config=NotificationConfig("preview"),
     )
     assert path.exists()
     assert result.state_path == path
     assert not result.leader_status_posted
+    assert result.overall_status == "failure"
+    assert notifications == [result.state_path]
+    assert result.notification_result["status"] == ("error" if hook_fails else "preview")
+    assert tracking == [{"status": "unavailable" if hook_fails else "checked"}]
+
     assert len(comments) == 1
 
 
