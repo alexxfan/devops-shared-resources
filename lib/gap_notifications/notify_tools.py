@@ -790,19 +790,12 @@ def slack_message(observation, *, jira_url, reply=False, jira_environment="stage
         raise ValueError("Slack notifications require a definitive outcome")
     heading = success[category] if status == "success" else ("Failure update" if reply else failure[category])
     target = jira_target(jira_environment)
-    destination = "staging test" if target.name == "stage" else "production Jira"
-    lines = [f"{'🟢' if status == 'success' else '🔴'} *GAP · {heading} — {destination}*"]
-    if category == "build":
-        lines.append(f"*Component:* `{_slack_text(observation.get('component'))}`")
-    if not reply:
-        lines.append(f"*Repository:* `{_slack_text(observation.get('repository'))}`")
     run = evidence.get("selected-run")
     run = run if isinstance(run, dict) else {}
-    if category == "build":
-        lines.append(_slack_build_time(run, status))
     reason = evidence.get("reason") or run.get("reason")
+    reported_reason = None
     if isinstance(reason, str) and reason.strip() and reason.strip().lower() not in {"failed", "failure", "success", "succeeded", "completed"}:
-        lines.append(f"*Reported reason:* `{_slack_text(reason, 240)}`")
+        reported_reason = _slack_text(reason, 240)
     jira_key = re.search(r"/browse/(RHAI-[1-9][0-9]{0,15})$", jira_url) if isinstance(jira_url, str) else None
     jira = _slack_link(jira_url, f"Jira {jira_key[1]}" if jira_key else "Jira")
     if jira is None:
@@ -815,13 +808,17 @@ def slack_message(observation, *, jira_url, reply=False, jira_environment="stage
     ]
     if not reply:
         links.append(_slack_link(evidence.get("leader_url"), "GAP Leader"))
-    lines.extend(["", " · ".join(link for link in links if link)])
-    if evidence.get("synthetic") is True:
-        lines.extend(["", "Synthetic evidence"])
-    if status == "success":
-        lines.append("Staging result only; does not establish production recovery." if target.name == "stage"
-                     else "Reported component outcome only; not a claim that the whole promotion is healthy.")
-    return "\n".join(lines)
+    context = dict(
+        heading=heading, status=status, category=category, reply=reply,
+        jira_environment=target.name,
+        component=_slack_text(observation.get("component")),
+        repository=_slack_text(observation.get("repository")),
+        build_time=_slack_build_time(run, status), reason=reported_reason,
+        links=[link for link in links if link], synthetic=evidence.get("synthetic") is True,
+    )
+    template = files("lib.gap_notifications").joinpath("templates/slack.md.j2").read_text(encoding="utf-8")
+    return Environment(undefined=StrictUndefined, autoescape=False, trim_blocks=True,
+                       lstrip_blocks=True).from_string(template).render(**context).removesuffix("\n")
 
 
 def literal(value):
@@ -868,20 +865,13 @@ def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira
                    pipeline=literal(observation.get("pipeline") or run.get("pipeline")),
                    reason=literal(e.get("reason") or run.get("reason") or creator.get("reason")),
                    note=literal(e.get("note")),
-                   synthetic=literal(e.get("synthetic")), historical=literal(e.get("historical_snapshot")),
-                   revision=literal(e.get("head_sha") or e.get("head-sha")), targets=[], links=[],
+                   revision=literal(e.get("head_sha") or e.get("head-sha")), links=[],
                    discussion_url=https_url(discussion_url) if discussion_url else None,
                    metadata_url=https_url(metadata_url) if metadata_url else None)
-    targets = e.get("affected_targets", [])
-    if not isinstance(targets, list) or len(targets) > 40:
-        raise ValueError("affected_targets must be a list of at most 40 entries")
-    for target in targets:
-        if not isinstance(target, dict) or not re.fullmatch(r"rhoai-[A-Za-z0-9._-]+", str(target.get("branch", ""))):
-            raise ValueError("affected target requires an explicit rhoai-X branch")
-        context["targets"].append({k: literal(target.get(k)) for k in ("branch", "reason", "component", "pipeline")})
     for label, value in [("Child PR", e.get("pr_url")), ("Leader", e.get("leader_url")),
                          ("Build logs or PipelineRun", e.get("build_url")), ("State snapshot", e.get("state_url")),
-                         ("Creator workflow", e.get("workflow_url") or creator.get("workflow-url")),
+                         ("Feasibility run" if observation.get("category") == "feasibility" else "Creator workflow",
+                          e.get("workflow_url") or creator.get("workflow-url")),
                          ("Creator PR", creator.get("pr-url"))]:
         if value:
             context["links"].append({"label": label, "url": https_url(value)})
@@ -908,8 +898,19 @@ def section(url, *, metadata=False):
     content = [{"type": "text", "text": "View notification metadata (JSON — source of truth)" if metadata else "Open Slack discussion",
                 "marks": [{"type": "link", "attrs": {"href": url}}]}]
     if metadata:
-        content.append({"type": "text", "text": " Jira permissions required."})
+        content.append({"type": "text", "text": " (Jira permissions required)"})
     return [heading, {"type": "paragraph", "content": content}]
+
+
+def _matches_section(paragraph, url, *, metadata=False):
+    """Recognize exact managed content, including the original metadata suffix."""
+    expected = section(url, metadata=metadata)[1]
+    if paragraph == expected:
+        return True
+    if metadata:
+        expected["content"][-1]["text"] = " Jira permissions required."
+        return paragraph == expected
+    return False
 
 
 def _managed_indices(body, *, metadata=False, jira_environment="stage", channel=None):
@@ -929,7 +930,7 @@ def _managed_indices(body, *, metadata=False, jira_environment="stage", channel=
             url = paragraph["content"][0]["marks"][0]["attrs"]["href"]
             pattern = (re.escape(jira_target(jira_environment).url) + r"/rest/api/3/issue/RHAI-[1-9][0-9]*/properties/gap\.notification\.v1"
                        if metadata else re.escape(SLACK_ORIGIN) + r"/archives/" + re.escape(configured_channel(channel)) + r"/p[0-9]+")
-            if not re.fullmatch(pattern, url) or paragraph != section(url, metadata=metadata)[1]:
+            if not re.fullmatch(pattern, url) or not _matches_section(paragraph, url, metadata=metadata):
                 raise ValueError("edited discussion section")
         except (KeyError, IndexError, TypeError):
             raise ValueError("edited discussion section") from None
@@ -957,6 +958,6 @@ def visible_link_status(body, url, *, metadata=False, jira_environment="stage", 
         indices = _managed_indices(body, metadata=metadata, **routing_target(jira_environment, channel).options)
         if not indices:
             return "missing"
-        return "match" if body["content"][indices[0] + 1] == section(url, metadata=metadata)[1] else "mismatch"
+        return "match" if _matches_section(body["content"][indices[0] + 1], url, metadata=metadata) else "mismatch"
     except ValueError:
         return "ambiguous_or_edited"

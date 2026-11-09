@@ -5,7 +5,8 @@ Leader selection, monitor mutation from the standalone CLI, reopening of closed
 issues, or claim of exactly-once delivery. Staging issues retain the
 `[GAP STAGING TEST]` marker. Explicit production selection uses `[GAP PRODUCTION]`;
 this identifies the Jira destination, not proof of live production build health.
-Jira descriptions retain historical/synthetic provenance in both environments.
+Jira descriptions omit the historical/synthetic provenance boilerplate in both environments;
+the evidence fields remain available to callers without being displayed as raw flags.
 Slack keeps destination and synthetic-test labels without snapshot/check boilerplate.
 
 Slack build alerts show the selected PipelineRun's completion time in UTC, not the
@@ -75,8 +76,33 @@ stay outside this package. The issue template moves with identical content to
 
 ## Readable presentation
 
+Slack messages use the packaged `lib/gap_notifications/templates/slack.md.j2`
+Jinja2 template for Slack mrkdwn (not Jira Markdown). Like the Jira template, it
+uses StrictUndefined and loads independently of the current directory. Edit this
+file to change message layout and wording for roots, threaded updates and recovery
+notifications. The template receives only selected, escaped text, validated links
+and explicit outcome/routing flags; raw observations are not exposed and evidence
+is never evaluated as template source. Python retains evidence selection, URL
+validation, truncation and escaping. Template changes do not change delivery,
+threading or replay identity. Both templates are included by the existing
+`templates/*.md.j2` package-data rule.
+
+Feasibility failure roots reuse the Jira feasibility paragraph, explaining that
+the job dry-runs the normal sync from the current configured source branch to
+configured active release branches, without testing the proposed stable PR contents
+or pushing changes. They point readers to the feasibility job for merge conflicts
+or configuration/workflow errors; a failed result alone does not prove a merge
+conflict. Success roots retain only the neutral explanation, not failure claims or
+failure-specific guidance. Threaded updates omit this explanation to avoid repeating
+root context.
+
 Jira descriptions use the packaged `lib/gap_notifications/templates/issue.md.j2`
-with Jinja2 StrictUndefined, independent of the current directory. The restricted
+with Jinja2 StrictUndefined, independent of the current directory. Feasibility
+issues include a main-to-release dry-run explanation, distinguish it from testing
+the proposed stable PR contents, and direct failures to the feasibility job rather
+than assuming a merge conflict. They refer to the configured source branch without
+guessing its name, which is not yet carried in the notification evidence. Their
+workflow evidence link is labeled **Feasibility run**, not **Creator workflow**. The restricted
 Markdown converter supports headings, one-line paragraphs, flat bullets, explicit
 HTTPS links and inline code; no HTML, emphasis, tables, nested lists or code fences.
 Unsupported markup fails clearly. Evidence is escaped literal data, never a template.
@@ -89,10 +115,9 @@ Allowlisted text fields such as reason and note are rendered literally, without
 automatic secret detection or redaction. Only allowlisted diagnostic fields and
 evidence links appear, not full JSON.
 
-Optional `evidence.affected_targets` is a list (at most 40) of objects with an
-explicit `branch` matching `rhoai-[A-Za-z0-9._-]+`, plus optional `reason`,
-`component`, `pipeline`. Each supplied branch is displayed together with its details.
-Targets are never inferred from the actual promotion destination or arbitrary prose.
+Jira descriptions omit the affected-targets section: automatic observations do not
+supply authoritative release-impact data. Legacy `evidence.affected_targets` values
+are ignored by presentation; release impact is not inferred from promotion branches.
 The historical fixture fields `reason`, `head_sha`, `leader_url`, `pr_url`,
 `state_url`, `build_url`, `note`, `historical_snapshot`, `synthetic` are supported;
 collector `selected-run`, `creator-outcome`, and `head-sha` fields are also used.
@@ -111,6 +136,12 @@ intent is persisted, so deterministic presentation errors do not strand write in
 backfilled. Summary/registry identity and Slack lifecycle are unchanged.
 
 ## Discussion projection and read-only inspection
+
+The metadata link uses the suffix `(Jira permissions required)`. Managed-section
+validation recognizes both this wording and the original `Jira permissions required.`
+suffix, while still requiring exact link labels, URLs and section structure. Other
+edits and duplicate sections continue to fail closed. Cosmetic projection emits the
+new wording without changing notification delivery or incident identity.
 
 The managed **Slack discussion** section is a cosmetic projection of the confirmed
 root stored in the validated Jira `gap.notification.v1` property, not a routing

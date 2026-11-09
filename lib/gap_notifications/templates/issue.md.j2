@@ -2,8 +2,6 @@
 
 {{ destination_notice }}
 
-Historical snapshot: {{ historical }}; synthetic evidence: {{ synthetic }}. Missing flags are unavailable, not an assertion of live evidence.
-
 {{ note }}
 
 ## Failure
@@ -14,12 +12,12 @@ Historical snapshot: {{ historical }}; synthetic evidence: {{ synthetic }}. Miss
 - Reason: {{ reason }}
 - Component: {{ component }}
 - Pipeline: {{ pipeline }}
+{% if category == 'feasibility' %}
+## Main-to-release feasibility
 
-## Explicitly affected targets
+The main to release feasibility job has failed. This job dry-runs the normal sync from the current configured source branch to configured active release branches (It does not test the proposed stable PR contents or actually push changes). Please inspect the feasibility job for merge conflicts or configuration/workflow errors.
+{% endif %}
 
-{% for target in targets %}- {{ target.branch }}: {{ target.reason }}; component: {{ target.component }}; pipeline: {{ target.pipeline }}
-{% else %}Unavailable. No targets inferred from the promotion destination or prose.
-{% endfor %}
 ## Evidence links
 
 {% for link in links %}- [{{ link.label }}]({{ link.url }})
@@ -37,5 +35,5 @@ Historical snapshot: {{ historical }}; synthetic evidence: {{ synthetic }}. Miss
 {% if metadata_url %}
 ## Notification metadata
 
-[View notification metadata (JSON — source of truth)]({{ metadata_url }}) Jira permissions required.
+[View notification metadata (JSON — source of truth)]({{ metadata_url }}) (Jira permissions required)
 {% endif %}

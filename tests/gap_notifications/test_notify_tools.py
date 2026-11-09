@@ -702,19 +702,63 @@ def test_categories_labels_and_missing(category, setup):
     assert 'Unavailable' in render_markdown(obs)
 
 
-# Grouped targets must stay explicit, and injected Markdown or template text must remain
-# literal.
-def test_grouped_targets_and_literal_injection(monkeypatch, tmp_path):
+# Jira explains feasibility without confusing the promotion branch with the sync source,
+# labels the workflow link accurately, and keeps the explanation out of other categories.
+@pytest.mark.parametrize('category', ['build', 'conflict', 'feasibility'])
+@pytest.mark.parametrize('status', ['failure', 'success'])
+@pytest.mark.parametrize('environment', ['stage', 'production'])
+def test_jira_feasibility_explanation(category, status, environment):
+    workflow_url = 'https://github.com/acme/repo/actions/runs/123'
+    obs = observation(category=category, status=status, source_branch='promotion-source',
+                      evidence={'workflow_url': workflow_url})
+    markdown = render_markdown(obs, jira_environment=environment)
+    adf = _description(obs, jira_environment=environment)
+    JiraNotifier._validate_adf(adf)
+    text = json.dumps(adf)
+    explanation = ('The main to release feasibility job has failed. This job dry-runs the normal sync from the '
+                   'current configured source branch to configured active release branches (It does not test the '
+                   'proposed stable PR contents or actually push changes).')
+    guidance = 'Please inspect the feasibility job for merge conflicts or configuration/workflow errors.'
+    assert ('## Main-to-release feasibility' in markdown) == (category == 'feasibility')
+    assert (explanation in markdown) == (category == 'feasibility')
+    assert (explanation in text) == (category == 'feasibility')
+    assert (guidance in markdown) == (category == 'feasibility')
+    assert (guidance in text) == (category == 'feasibility')
+    label = 'Feasibility run' if category == 'feasibility' else 'Creator workflow'
+    assert f'[{label}]({workflow_url})' in markdown
+    assert f'"text": "{label}"' in text
+    assert workflow_url in text
+
+
+# Jira omits provenance boilerplate regardless of the evidence flags, without losing its
+# destination banner or evidence links.
+@pytest.mark.parametrize('environment', ['stage', 'production'])
+@pytest.mark.parametrize('flags', [{}, {'synthetic': False, 'historical_snapshot': False},
+                                   {'synthetic': True, 'historical_snapshot': True}])
+def test_jira_omits_provenance_boilerplate(environment, flags):
+    obs = observation(evidence=dict(flags, pr_url='https://github.com/acme/repo/pull/1'))
+    markdown = render_markdown(obs, jira_environment=environment)
+    adf = _description(obs, jira_environment=environment)
+    JiraNotifier._validate_adf(adf)
+    for text in (markdown, json.dumps(adf)):
+        assert 'Historical snapshot:' not in text
+        assert 'synthetic evidence:' not in text
+        assert 'Missing flags' not in text
+        assert 'https://github.com/acme/repo/pull/1' in text
+    assert markdown.startswith('# GAP STAGING TEST' if environment == 'stage' else '# GAP PRODUCTION')
+
+
+# Injected Markdown or template text must remain literal.
+def test_literal_injection(monkeypatch, tmp_path):
     obs = observation(evidence={'synthetic': True, 'reason': '# injected\n[evil](https://evil.test) <script> {{ missing }}',
-        'affected_targets': [{'branch': 'rhoai-3.2', 'reason': 'conflict'}, {'branch': 'rhoai-3.3', 'component': 'cpu'}],
         'leader_url': 'https://example.test/pr/1'})
     monkeypatch.chdir(tmp_path)
     md = render_markdown(obs)
     adf = _description(obs)
     JiraNotifier._validate_adf(adf)
     headings = [n for n in adf['content'] if n['type'] == 'heading']
-    assert len(headings) == 5
-    assert r'rhoai\-3' in md and 'Actual promotion stream: main → stable' in md
+    assert len(headings) == 4
+    assert 'Actual promotion stream: main → stable' in md
     raw = json.dumps(adf)
     assert '# injected [evil](https://evil.test) <script> {{ missing }}' in raw
     assert raw.count('"href"') == 1
@@ -728,17 +772,33 @@ def test_bad_urls_fail(url):
         _description(observation(evidence={'leader_url': url}))
 
 
-# Never invent affected targets; reject malformed or excessive target lists.
-def test_explicit_targets_only_and_bounded():
-    assert 'rhoai-' not in render_markdown(observation(destination_branch='stable', evidence={'reason': 'plain'}))
-    with pytest.raises(ValueError):
-        _description(observation(evidence={'affected_targets': [{'branch': 'stable'}]}))
+# The removed affected-targets section must not appear, even with legacy supplied evidence.
+@pytest.mark.parametrize('category', ['build', 'conflict', 'feasibility'])
+@pytest.mark.parametrize('evidence', [{}, {'affected_targets': []},
+                                   {'affected_targets': [{'branch': 'rhoai-3.2', 'reason': 'target-only reason'}]}])
+def test_jira_omits_affected_targets(category, evidence):
+    obs = observation(category=category, evidence=evidence)
+    markdown = render_markdown(obs)
+    adf = _description(obs)
+    JiraNotifier._validate_adf(adf)
+    for text in (markdown, json.dumps(adf)):
+        assert 'Explicitly affected targets' not in text
+        assert 'No targets inferred' not in text
+        assert 'rhoai' not in text
+        assert 'target-only reason' not in text
+        assert 'FEEDBACK' not in text
+        assert 'Evidence links' in text and 'Diagnostics' in text
+
+
+# Presentation text remains bounded after removal of affected-targets rendering.
+def test_jira_reason_is_bounded():
     with pytest.raises(ValueError):
         _description(observation(evidence={'reason': 'x' * 2001}))
 
 
 # Missing required template fields must fail instead of silently rendering incomplete content.
-def test_strict_template_missing_fields(monkeypatch):
+@pytest.mark.parametrize('renderer', [render_markdown, lambda obs: slack_message(obs, jira_url=JIRA)])
+def test_strict_template_missing_fields(monkeypatch, renderer):
     class MissingTemplate:
         def joinpath(self, path):
             return self
@@ -746,7 +806,7 @@ def test_strict_template_missing_fields(monkeypatch):
             return '# GAP STAGING TEST\n\n{{ required_missing }}'
     monkeypatch.setattr(presentation, 'files', lambda package: MissingTemplate())
     with pytest.raises(UndefinedError):
-        render_markdown(observation())
+        renderer(observation())
 
 
 # Invalid presentation must leave no write intent; corrected evidence may proceed safely.
@@ -853,6 +913,38 @@ def test_both_sections_preserve_body_idempotent_and_reject_edited_metadata():
         project_body(updated, slack, metadata=meta)
 
 
+# Exact old/new metadata suffixes are supported; unrelated edits still fail closed.
+@pytest.mark.parametrize('environment', ['stage', 'production'])
+@pytest.mark.parametrize('suffix', [' Jira permissions required.', ' (Jira permissions required)'])
+def test_metadata_wording_compatibility(environment, suffix):
+    meta = metadata_url('RHAI-123', jira_environment=environment)
+    obs = observation()
+    body = _description(obs, metadata_url=meta, jira_environment=environment)
+    assert body['content'][-1]['content'][-1]['text'] == ' (Jira permissions required)'
+    body['content'][-1]['content'][-1]['text'] = suffix
+    original = copy.deepcopy(body)
+    assert visible_link_status(body, meta, metadata=True, jira_environment=environment) == 'match'
+    other = metadata_url('RHAI-124', jira_environment=environment)
+    assert visible_link_status(body, other, metadata=True, jira_environment=environment) == 'mismatch'
+    projected = project_body(body, None, metadata=meta, jira_environment=environment)
+    assert body == original
+    assert projected['content'][:-2] == body['content'][:-2]
+    assert projected['content'][-2:] == section(meta, metadata=True)
+    assert project_body(projected, None, metadata=meta, jira_environment=environment) == projected
+    for field in ('suffix', 'label', 'extra'):
+        edited = copy.deepcopy(body)
+        content = edited['content'][-1]['content']
+        if field == 'suffix':
+            content[-1]['text'] += ' edited'
+        elif field == 'label':
+            content[0]['text'] = 'edited label'
+        else:
+            content.append({'type': 'text', 'text': 'extra text'})
+        assert visible_link_status(edited, meta, metadata=True, jira_environment=environment) == 'ambiguous_or_edited'
+        with pytest.raises(ValueError):
+            project_body(edited, None, metadata=meta, jira_environment=environment)
+
+
 # Cosmetic projection must preserve user nodes and refuse edited or duplicated managed sections.
 def test_projection_preserves_nodes_and_rejects_edited_duplicates():
     body = {'type': 'doc', 'version': 1, 'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': 'human'}]}]}
@@ -876,6 +968,70 @@ JIRA = "https://stage-redhat.atlassian.net/browse/RHAI-177"
 
 def render(**changes):
     return slack_message(observation(**changes), jira_url=JIRA)
+
+
+# The packaged Slack template preserves exact root/reply layout for every outcome and destination.
+@pytest.mark.parametrize("category", ["build", "conflict", "feasibility"])
+@pytest.mark.parametrize("status", ["failure", "success"])
+@pytest.mark.parametrize("reply", [False, True])
+@pytest.mark.parametrize("environment", ["stage", "production"])
+@pytest.mark.parametrize("synthetic", [False, True])
+def test_slack_template_layout(category, status, reply, environment, synthetic):
+    headings = {
+        "failure": {"build": "Build failed", "conflict": "Merge conflict", "feasibility": "Promotion blocked"},
+        "success": {"build": "Successful build observed", "conflict": "Conflict resolved", "feasibility": "Feasibility restored"},
+    }
+    heading = "Failure update" if reply and status == "failure" else headings[status][category]
+    destination = "staging test" if environment == "stage" else "production Jira"
+    expected = [f"{'🟢' if status == 'success' else '🔴'} *GAP · {heading} — {destination}*"]
+    if category == "build":
+        expected.append("*Component:* `cpu`")
+    if not reply:
+        expected.append("*Repository:* `acme/repo`")
+    if category == "build":
+        expected.append(f"*Build {'failed' if status == 'failure' else 'completed'} at:* Unavailable")
+    expected.append("*Reported reason:* `A useful reason`")
+    if category == "feasibility" and not reply:
+        explanation = ('This job dry-runs the normal sync from the current configured source branch to configured '
+                       'active release branches (It does not test the proposed stable PR contents or actually push changes).')
+        if status == "failure":
+            explanation = ('The main to release feasibility job has failed. ' + explanation
+                           + ' Please inspect the feasibility job for merge conflicts or configuration/workflow errors.')
+        expected.extend(["", "*Main-to-release feasibility:* " + explanation])
+    expected.extend(["", f"<{JIRA}|Jira RHAI-177>"])
+    if synthetic:
+        expected.extend(["", "Synthetic evidence"])
+    if status == "success":
+        expected.append("Staging result only; does not establish production recovery." if environment == "stage"
+                        else "Reported component outcome only; not a claim that the whole promotion is healthy.")
+    assert slack_message(observation(category=category, status=status,
+                         evidence={"reason": "A useful reason", "synthetic": synthetic}),
+                         jira_url=JIRA, reply=reply, jira_environment=environment) == "\n".join(expected)
+
+
+# Failure roots share the user's Jira paragraph verbatim; recovery does not report failure.
+@pytest.mark.parametrize('environment', ['stage', 'production'])
+def test_slack_feasibility_wording_matches_jira(environment):
+    obs = observation(category='feasibility')
+    markdown = render_markdown(obs, jira_environment=environment)
+    jira_paragraph = next(line for line in markdown.splitlines()
+                          if line.startswith('The main to release feasibility job has failed.'))
+    failure = slack_message(obs, jira_url=JIRA, jira_environment=environment)
+    assert '*Main-to-release feasibility:* ' + jira_paragraph in failure
+    assert 'usually' not in failure
+    recovery = slack_message(dict(obs, status='success'), jira_url=JIRA, jira_environment=environment)
+    assert 'This job dry-runs the normal sync from the current configured source branch' in recovery
+    assert 'has failed' not in recovery and 'Please inspect' not in recovery
+    for status in ('failure', 'success'):
+        reply = slack_message(dict(obs, status=status), jira_url=JIRA, reply=True, jira_environment=environment)
+        assert 'This job dry-runs' not in reply
+
+
+# Template expressions supplied as evidence remain literal, never a second rendering pass.
+def test_slack_template_evidence_is_not_evaluated():
+    text = render(component="{{ 7 * 7 }}", evidence={"reason": "{% if true %}literal{% endif %}"})
+    assert "`{{ 7 * 7 }}`" in text
+    assert "`{% if true %}literal{% endif %}`" in text
 
 
 # A root message must show useful context and provenance without dumping debug data or generic
@@ -1090,14 +1246,14 @@ def test_mutated_production_facade_revalidates_target_and_issue_type():
     assert not session.calls
 
 
-# Production content must retain synthetic labeling and avoid claiming global recovery.
+# Slack production content retains synthetic labeling and avoids claiming global recovery.
 def test_production_presentation_is_labeled_without_claiming_global_recovery():
     from lib.gap_notifications.notify_tools import jira_target, slack_message
     target = jira_target('production')
     obs = observation(environment=target.scope, evidence={'synthetic': True, 'historical_snapshot': True})
     markdown = render_markdown(obs, **target.options)
     assert markdown.startswith('# GAP PRODUCTION') and 'Staging notification only' not in markdown
-    assert 'synthetic evidence: True' in markdown
+    assert 'Historical snapshot:' not in markdown and 'synthetic evidence:' not in markdown
     text = slack_message(dict(obs, status='success'), jira_url=target.url + '/browse/RHAI-1', **target.options)
     assert 'production Jira' in text and 'staging test' not in text
     assert 'Synthetic evidence' in text and 'Recorded snapshot' not in text
