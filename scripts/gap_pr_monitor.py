@@ -75,6 +75,7 @@ from lib.gap_check_selection import (
 from lib.leader_lifecycle import retire_leader, retired_outcome, validate_replacement
 from lib.konflux_builds import build_status_source
 from lib.konflux_gate import evaluate_konflux_gate
+from lib.gap_build_retries import BuildRetryManager, retries_enabled
 from lib.gap_component_map import fetch_component_repo_map, repository_components
 from lib.gap_pr_gates import (
     PR_STATUS_BUILD_FAILURE,
@@ -1952,6 +1953,7 @@ def _decide_url(
     build_app_id: int | None,
     retry_unknown: bool,
     component_repo_map: dict[str, frozenset[str]],
+    retry_manager: BuildRetryManager | None = None,
 ) -> RepositoryGateDecision:
     pull_request = fetch_repository_pull_request(
         url, gh_runner=runner, retry_unknown=retry_unknown
@@ -2045,6 +2047,16 @@ def _decide_url(
         allowed_components=repository_components(component_repo_map, pull_request.repo),
         build_gate_override=build_gate_override,
     )
+    if (retry_manager is not None and observations is not None
+            and decision.pr_status != PR_STATUS_MERGE_FAILURE):
+        build_gate_override, observations = retry_manager.apply(pull_request, build_gate_override, observations)
+        decision = decide_repository_pr(
+            pull_request, tekton_documents=tekton_documents, tekton_error=tekton_error,
+            check_runs=check_runs, check_query_error=check_query_error, feasibility=feasibility,
+            now=now, build_app_slug=build_app_slug, build_app_id=build_app_id,
+            allowed_components=repository_components(component_repo_map, pull_request.repo),
+            build_gate_override=build_gate_override,
+        )
     if observations is None and build_status_source() == "konflux":
         # Merge/conflict decisions need no build query, but the immediately
         # following comment can still reuse their freshly evaluated PR facts.
@@ -2091,6 +2103,7 @@ def _publish_gate_decision(
     batch_concluded: bool,
     overall_status: str | None,
     payload: dict[str, Any] | None = None,
+    retry_manager: BuildRetryManager | None = None,
 ) -> tuple[RepositoryGateDecision | None, StatusUpdateResult | None]:
     """Publish a decision, or re-evaluate once when the head has moved.
 
@@ -2119,6 +2132,7 @@ def _publish_gate_decision(
         build_app_id=build_app_id,
         retry_unknown=retry_unknown,
         component_repo_map=component_repo_map,
+        retry_manager=retry_manager,
     )
     if fresh.skip_status_post:
         return fresh, None
@@ -2162,6 +2176,9 @@ def _publish_decisions(
     reports: list[str] = []
     post_errors: list[tuple[str, str]] = []
     evaluated_decisions: list[RepositoryGateDecision] = []
+    retry_manager = (BuildRetryManager(runner, payload, dry_run=dry_run)
+                     if retries_enabled() and build_status_source() == "konflux"
+                     and "GAP History" not in path.parts else None)
     ensure_promotion_gates(payload)
     migrate_legacy_overall_status(payload)
     if build_status_source() == "konflux":
@@ -2175,12 +2192,14 @@ def _publish_decisions(
                     decision.url, runner=runner, now=now, build_app_slug=build_app_slug,
                     build_app_id=build_app_id, retry_unknown=retry_unknown,
                     component_repo_map=component_repo_map,
+                    retry_manager=retry_manager,
                 )
                 for decision in decisions
             )
         except (GapPrMonitorError, GhCommandError, ValueError, RuntimeError) as exc:
-            # No status or state writes have happened: retain the prior batch
-            # rather than publishing a mix of refreshed and stale decisions.
+            # No commit status or state writes have happened: retain the prior
+            # batch. Any retry comments already sent carry their own recovery
+            # receipts, so the next poll cannot repeat them.
             raise GapPrMonitorError(f"Could not refresh child batch before publication: {exc}") from exc
     # One coherent batch decides both persisted outcomes and the child-green hold.
     child_head_changed = record_child_head_shas(payload, decisions)
@@ -2206,6 +2225,7 @@ def _publish_decisions(
                 batch_concluded=batch_concluded,
                 overall_status=overall_status,
                 payload=probe,
+                retry_manager=retry_manager,
             )
         except (ValueError, RuntimeError, GhCommandError, GapPrMonitorError) as exc:
             post_errors.append((url, str(exc)))
@@ -2229,6 +2249,9 @@ def _publish_decisions(
         for entry in payload.get("pull-requests", []):
             if (entry.get("pr-url") or entry.get("pr_url")) == url:
                 if decision.build_observations is not None:
+                    previous_history = (entry.get("build-observations") or {}).get("retry-history")
+                    if previous_history and "retry-history" not in decision.build_observations:
+                        decision.build_observations["retry-history"] = previous_history
                     entry["build-observations"] = decision.build_observations
                 elif build_status_source() == "github":
                     # An explicit rollback must not leave obsolete Konflux

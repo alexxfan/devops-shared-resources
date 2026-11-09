@@ -501,7 +501,8 @@ def build_child_row(
             if evidence.get("query-error"):
                 evidence_reason = "Konflux lookup unavailable: " + _clip(str(evidence["query-error"]))
             elif status_key in {"build-pending", "new"}:
-                pending = [str(r.get("component", "?")) + ": " + str(r.get("status", "unknown"))
+                pending = [str(r.get("component", "?")) + ": " + (str(r["retry"].get("status", "unknown")) + ": " + str(r["retry"].get("reason", ""))
+                            if r.get("retry") else str(r.get("status", "unknown")))
                            for r in evidence.get("runs", []) if isinstance(r, dict) and r.get("status") != "success"]
                 evidence_reason = "Konflux: " + "; ".join(pending) if pending else "Awaiting monitor refresh"
             if status_key == "build-failure":
