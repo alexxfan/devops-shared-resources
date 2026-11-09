@@ -21,6 +21,7 @@ SHA = "a" * 40
 
 @pytest.fixture(autouse=True)
 def enable_exclusive_history(monkeypatch):
+    """Exercise the deployment mode that keeps finalized state only in history."""
     monkeypatch.setenv("GAP_MOVE_FINAL_STATE", "true")
 
 
@@ -64,6 +65,7 @@ def pull(number=9, sha=SHA):
     (["success", "success", "success"], "success", "successful"),
 ])
 def test_retirement_preserves_actual_results_and_history(tmp_path, statuses, expected, folder):
+    """Retirement records the terminal outcome without altering child or gate evidence."""
     data = payload()
     for gate, status in zip(data["promotion-gates"], statuses):
         gate["status"] = status
@@ -179,6 +181,7 @@ def git_leader(tmp_path):
 
 @pytest.mark.parametrize("block_merge", [False, True])
 def test_rollover_publishes_durable_history_before_merge_and_can_retry(git_leader, block_merge):
+    """Persist retirement before requesting a merge and allow a retry after merge rejection."""
     root, path, git = git_leader
     calls, status_posts = [], []
     initial = json.loads(path.read_text())
@@ -189,6 +192,7 @@ def test_rollover_publishes_durable_history_before_merge_and_can_retry(git_leade
         return git(["rev-parse", "origin/gap-leader/gap-9"], root)
 
     def gh(args):
+        """Stub GitHub metadata and merge requests while preserving publication ordering."""
         calls.append(args)
         if args == ["api", "repos/acme/gap/pulls/9"]:
             return json.dumps(pull(sha=head()))
@@ -499,6 +503,7 @@ def test_publish_rejects_unrelated_staged_files(git_leader):
 
 @pytest.mark.parametrize("old_outcome,new_outcome", [("failure", "success"), ("success", "failure")])
 def test_retirement_keeps_one_current_history_record_but_preserves_git_history(git_leader, old_outcome, new_outcome):
+    """Remove obsolete live copies while preserving prior outcomes in Git history."""
     root, path, git = git_leader
     data = json.loads(path.read_text())
     for gate in data["promotion-gates"]:
@@ -527,7 +532,8 @@ def test_retirement_keeps_one_current_history_record_but_preserves_git_history(g
     assert KEY not in historical
 
 
-def test_active_updates_remove_legacy_copy_without_finalizing(git_leader):
+def test_reset_active_updates_remove_stale_legacy_copy_without_finalizing(git_leader):
+    """A run explicitly reset to pending must not inherit a previous attempt outcome."""
     root, path, git = git_leader
     data = json.loads(path.read_text())
     data["promotion-gates"][0]["status"] = "failure"
@@ -535,6 +541,9 @@ def test_active_updates_remove_legacy_copy_without_finalizing(git_leader):
     legacy = write_history_snapshot(root, path, move=False)
     git(["add", "."], root)
     git(["commit", "-m", "Legacy snapshot"], root)
+    data["promotion-gates"][0]["status"] = "pending"
+    data["pull-requests"][0]["head-sha"] = "c" * 40
+    path.write_text(json.dumps(data))
     result = monitor.publish_state(root, path, "gap-leader/gap-9", git_runner=git)
     assert result.state_path == path
     assert path.exists() and not legacy.exists()
@@ -542,6 +551,7 @@ def test_active_updates_remove_legacy_copy_without_finalizing(git_leader):
 
 
 def test_legacy_layout_stays_compatible_until_consumers_are_enabled(git_leader, monkeypatch):
+    """Leave active paths readable until both consumers enable archive moves."""
     root, path, git = git_leader
     monkeypatch.delenv("GAP_MOVE_FINAL_STATE")
     data = retired(json.loads(path.read_text()))
@@ -553,6 +563,7 @@ def test_legacy_layout_stays_compatible_until_consumers_are_enabled(git_leader, 
 
 
 def test_untracked_history_is_not_overwritten_or_deleted(git_leader):
+    """Do not overwrite a local untracked archive during state publication."""
     root, path, git = git_leader
     archive = root / "GAP History/unsuccessful/2026-11-05_gap-9/state.json"
     archive.parent.mkdir(parents=True)
@@ -567,6 +578,7 @@ def test_untracked_history_is_not_overwritten_or_deleted(git_leader):
 
 @pytest.mark.parametrize("outcome", ["success", "failure"])
 def test_eg_finalization_and_retry_use_one_frozen_record(git_leader, monkeypatch, outcome):
+    """Retry a blocked history merge without reinterpreting comments or approving newer heads."""
     root, path, git = git_leader
     data = payload("success")
     data["pull-requests"][0]["head-sha"] = "b" * 40
@@ -578,6 +590,7 @@ def test_eg_finalization_and_retry_use_one_frozen_record(git_leader, monkeypatch
     monkeypatch.setattr(results, "checkout_leader_branch", lambda *a, **k: None)
     monkeypatch.setattr(results, "list_leader_pr_comments", lambda *a, **k: [])
     def decide(**kwargs):
+        """Simulate terminal EG evidence without fetching live comments."""
         for gate in kwargs["payload"]["promotion-gates"][1:]:
             gate["status"] = outcome
         return outcome, "completed", {"early-gate-build": outcome, "early-gate-test": outcome}
@@ -593,6 +606,7 @@ def test_eg_finalization_and_retry_use_one_frozen_record(git_leader, monkeypatch
             return SimpleNamespace(skipped=False, deferred=False)
     blocked = True
     def gh(args):
+        """Stub GitHub metadata and merge requests while preserving publication ordering."""
         if args == ["api", "repos/acme/gap/pulls/9"]:
             return json.dumps(pull(sha=git(["rev-parse", "HEAD"], root)))
         if args[:2] == ["pr", "merge"] and blocked:
@@ -609,6 +623,7 @@ def test_eg_finalization_and_retry_use_one_frozen_record(git_leader, monkeypatch
     before, sha = archive.read_bytes(), git(["rev-parse", "HEAD"], root)
     assert not posts
     def forbidden(*args, **kwargs):
+        """Fail if a finalized-record retry starts a fresh evaluation."""
         pytest.fail("An archive retry must not reinterpret comments or reevaluate builds")
     monkeypatch.setattr(results, "list_leader_pr_comments", forbidden)
     monkeypatch.setattr(results, "decide_overall_from_comments", forbidden)
@@ -634,6 +649,7 @@ def test_eg_finalization_and_retry_use_one_frozen_record(git_leader, monkeypatch
 
 
 def test_archived_retry_never_grants_approval_without_a_pinned_child_revision():
+    """Skip status updates when archived evidence cannot identify the evaluated revision."""
     data = payload("success")
     data["pull-requests"][0].pop("build-observations")
     class Updater:
@@ -645,6 +661,7 @@ def test_archived_retry_never_grants_approval_without_a_pinned_child_revision():
 
 
 def test_archived_retry_defers_changed_child_head():
+    """Do not count a status deferred because the child revision changed as posted."""
     data = payload("success")
     class Updater:
         def post_status_for_pr(self, url, state, **kwargs):
@@ -658,12 +675,14 @@ def test_archived_retry_defers_changed_child_head():
 
 @pytest.mark.parametrize("branch_exists", [True, False])
 def test_creator_cannot_recreate_archived_trigger(monkeypatch, branch_exists):
+    """An archived trigger cannot be reused even after its Leader branch was deleted."""
     from pathlib import Path
     from lib.leader_pr import LeaderPRManager
     from lib.state_file import build_state
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     calls = []
     def run(command, cwd):
+        """Simulate archived state discovery with or without the original remote branch."""
         calls.append(command)
         out = ""
         if command[:3] == ["gh", "pr", "list"]:
@@ -685,10 +704,12 @@ def test_creator_cannot_recreate_archived_trigger(monkeypatch, branch_exists):
 
 
 def test_final_failure_summary_is_not_lost_after_archiving(git_leader, monkeypatch):
+    """The final build-failure summary remains publishable after its state moves."""
     root, path, git = git_leader
     data = payload("build-failure")
     data["promotion-gates"][0]["status"] = "failure"
     def evaluate(state, **kwargs):
+        """Provide a failed component evaluation for the final-summary path."""
         state.write_text(json.dumps(data))
         return monitor.MonitorResult(state, [], [], [], [], False, overall_status="failure")
     monkeypatch.setattr(monitor, "run_monitor", evaluate)
@@ -709,6 +730,7 @@ def test_final_failure_summary_is_not_lost_after_archiving(git_leader, monkeypat
 
 
 def test_archive_retry_does_not_delete_an_untracked_active_copy(git_leader):
+    """Preserve unexpected local active files when retrying archive publication."""
     root, path, git = git_leader
     path.write_text(json.dumps(retired()))
     result = monitor.publish_state(root, path, "gap-leader/gap-9", git_runner=git)
@@ -718,3 +740,186 @@ def test_archive_retry_does_not_delete_an_untracked_active_copy(git_leader):
     with pytest.raises(monitor.GapPrMonitorError, match="untracked active"):
         monitor.publish_state(root, archive, "gap-leader/gap-9", git_runner=git)
     assert path.exists() and archive.exists()
+
+
+@pytest.mark.parametrize("consumer", ["monitor", "eg"])
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+def test_rollout_preserves_completed_legacy_state_before_child_scan(git_leader, monkeypatch, consumer, outcome):
+    """A copied terminal record is migrated before a newer child head can reset its gates."""
+    root, path, git = git_leader
+    data = payload("success")
+    data["pull-requests"][0]["head-sha"] = "b" * 40
+    data["promotion-gates"][0]["status"] = "success"
+    for gate in data["promotion-gates"][1:]:
+        gate["status"] = outcome
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    archive = write_history_snapshot(root, path, move=False)
+    git(["add", "."], root)
+    git(["commit", "-m", "Legacy EG conclusion with duplicate history"], root)
+    git(["push", "origin", "HEAD"], root)
+    previous_sha = git(["rev-parse", "HEAD"], root)
+    recorded = archive.read_bytes()
+    posts = []
+
+    def no_scan(*args, **kwargs):
+        """Any rescan could observe a new child revision and reopen the finished run."""
+        pytest.fail("A completed legacy record must not scan children or re-read EG comments")
+
+    monkeypatch.setattr(monitor, "run_monitor", no_scan)
+    monkeypatch.setattr(monitor, "_post_leader_failure_summary", lambda **k: None)
+    monkeypatch.setattr(results, "list_leader_pr_comments", no_scan)
+
+    class Updater:
+        dry_run = False
+        def __init__(self, **kwargs): pass
+        def get_pull_head(self, ref):
+            return SimpleNamespace(sha=git(["rev-parse", "HEAD"], root))
+        def post_status_for_pr(self, url, state, **kwargs):
+            if url != OLD:
+                # The collaborator has moved since the archived receipt.
+                assert kwargs["head_sha"] == "b" * 40
+                assert kwargs["defer_if_head_moved"] is True
+                return SimpleNamespace(skipped=False, deferred=True)
+            posts.append((url, state, kwargs))
+            return SimpleNamespace(skipped=False, deferred=False)
+
+    def gh(args):
+        """Keep all GitHub interactions offline while checking the published Leader head."""
+        if args == ["api", "repos/acme/gap/pulls/9"]:
+            return json.dumps(pull(sha=git(["rev-parse", "HEAD"], root)))
+        if args[:2] == ["pr", "diff"]:
+            return "\n".join(str(item.relative_to(root)) for item in (path, archive))
+        return ""
+
+    common = dict(repo_root=root, leader_pr_url=OLD, head_ref="gap-leader/gap-9",
+                  publish=True, git_runner=git, gh_runner=gh, updater_factory=Updater)
+    if consumer == "monitor":
+        result = monitor.run_monitor_publish_and_signal(path, **common)
+    else:
+        result = results.run_early_gate_results(state_file=str(path), labels=[], **common)
+    assert result.overall_status == outcome
+    assert result.state_path == archive
+    assert result.published_sha != previous_sha
+    assert archive.read_bytes() == recorded
+    assert not path.exists()
+    assert posts and posts[0][2]["head_sha"] == result.published_sha
+    assert git(["rev-parse", "origin/gap-leader/gap-9"], root) == result.published_sha
+    assert git(["ls-tree", "-r", "--name-only", result.published_sha], root).splitlines() == [
+        archive.relative_to(root).as_posix()
+    ]
+    # The move must leave an archive-only retry able to finish the same outcome.
+    retried = monitor.run_monitor_publish_and_signal(path, **common)
+    assert retried.published_sha == result.published_sha
+    assert archive.read_bytes() == recorded and not path.exists()
+
+
+def test_archived_retry_normalizes_child_urls_and_processes_remaining_children():
+    """Whitespace in a stored URL must not abort status publication for other children."""
+    data = payload("success")
+    first = data["pull-requests"][0]
+    first["pr-url"] = "  https://github.com/acme/component/pull/3 \n"
+    data["pull-requests"].append({
+        "pr-url": "https://github.com/acme/other/pull/4", "pr-status": "success", "head-sha": "c" * 40,
+    })
+    posts = []
+    class Updater:
+        def post_status_for_pr(self, url, state, **kwargs):
+            posts.append((url, kwargs["head_sha"]))
+            return SimpleNamespace(skipped=False, deferred=False)
+    result = results.post_child_statuses_for_early_gate(
+        data, overall_status="success", updater=Updater(), pinned_only=True,
+    )
+    assert posts == [
+        ("https://github.com/acme/component/pull/3", "b" * 40),
+        ("https://github.com/acme/other/pull/4", "c" * 40),
+    ]
+    assert result == tuple(url for url, _ in posts)
+
+
+def test_archived_retry_preserves_exact_passing_url_match():
+    """A normalized alias must not override the SHA of an exact build-passing match."""
+    data = payload("success")
+    exact = data["pull-requests"][0]
+    alias = copy.deepcopy(exact)
+    alias["pr-url"] = " " + exact["pr-url"] + " "
+    alias["head-sha"] = "c" * 40
+    data["pull-requests"].insert(0, alias)
+    class Updater:
+        def post_status_for_pr(self, url, state, **kwargs):
+            assert kwargs["head_sha"] == "b" * 40
+            return SimpleNamespace(skipped=False, deferred=False)
+    results.post_child_statuses_for_early_gate(
+        data, overall_status="success", updater=Updater(), pinned_only=True,
+    )
+
+
+def test_archived_retry_missing_url_match_does_not_abort_remaining_children(monkeypatch):
+    """If no stored revision matches a requested child, skip it and continue safely."""
+    data = payload("success")
+    known = data["pull-requests"][0]["pr-url"]
+    monkeypatch.setattr(results, "child_pass_pr_urls", lambda _: ["https://github.com/acme/missing/pull/7", known])
+    posts = []
+    class Updater:
+        def post_status_for_pr(self, url, state, **kwargs):
+            posts.append(url)
+            return SimpleNamespace(skipped=False, deferred=False)
+    assert results.post_child_statuses_for_early_gate(
+        data, overall_status="success", updater=Updater(), pinned_only=True,
+    ) == (known,)
+    assert posts == [known]
+
+
+@pytest.mark.parametrize("mode", ["publish", "dry-run", "disabled", "disagree", "untracked"])
+def test_legacy_migration_respects_rollout_and_preserves_conflicting_records(git_leader, monkeypatch, mode):
+    """Migration moves only tracked matching conclusions, and dry runs never alter files."""
+    root, path, git = git_leader
+    data = payload("success")
+    for gate in data["promotion-gates"]:
+        gate["status"] = "success"
+    path.write_text(json.dumps(data))
+    archive = write_history_snapshot(root, path, move=False)
+    git(["add", "--", str(path.relative_to(root))], root)
+    if mode != "untracked":
+        git(["add", "--", str(archive.relative_to(root))], root)
+    git(["commit", "-m", "Legacy finalized record"], root)
+    git(["push", "origin", "HEAD"], root)
+    if mode == "disabled":
+        monkeypatch.delenv("GAP_MOVE_FINAL_STATE")
+    if mode == "disagree":
+        data["pull-requests"][0]["head-sha"] = "c" * 40
+        path.write_text(json.dumps(data))
+    before = (path.read_bytes(), archive.read_bytes())
+    sha = git(["rev-parse", "HEAD"], root)
+    if mode in {"untracked", "disagree"}:
+        with pytest.raises(monitor.GapPrMonitorError, match="untracked|disagree"):
+            monitor.publish_state(root, path, "gap-leader/gap-9", git_runner=git)
+        assert (path.read_bytes(), archive.read_bytes()) == before
+        assert git(["rev-parse", "HEAD"], root) == sha
+        return
+    result = monitor.publish_state(
+        root, path, "gap-leader/gap-9", git_runner=git, dry_run=mode == "dry-run",
+    )
+    if mode == "publish":
+        assert result.state_path == archive and not path.exists()
+        assert archive.read_bytes() == before[1] and result.sha != sha
+    elif mode == "dry-run":
+        assert (path.read_bytes(), archive.read_bytes()) == before and result.sha == sha
+    else:
+        assert result.state_path == path and json.loads(path.read_text()) == json.loads(archive.read_text())
+
+
+def test_archived_retry_never_uses_a_failed_exact_url_alias():
+    """Only a build-passing entry may supply a revision, even when another URL matches exactly."""
+    data = payload("success")
+    passing = data["pull-requests"][0]
+    failed = copy.deepcopy(passing)
+    failed.update({"pr-status": "build-failure", "head-sha": "c" * 40})
+    passing["pr-url"] = " " + passing["pr-url"] + " "
+    data["pull-requests"].insert(0, failed)
+    class Updater:
+        def post_status_for_pr(self, url, state, **kwargs):
+            assert kwargs["head_sha"] == "b" * 40
+            return SimpleNamespace(skipped=False, deferred=False)
+    assert results.post_child_statuses_for_early_gate(
+        data, overall_status="success", updater=Updater(), pinned_only=True,
+    ) == (failed["pr-url"],)

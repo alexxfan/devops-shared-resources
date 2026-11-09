@@ -651,7 +651,12 @@ def post_child_statuses_for_early_gate(
     for url in urls:
         options = {}
         if pinned_only:
-            entry = next(item for item in payload["pull-requests"] if item.get("pr-url") == url)
+            eligible = [item for item in payload["pull-requests"]
+                        if str(item.get("pr-status") or "").strip() in CHILD_PASS_PR_STATUSES]
+            entry = next((item for item in eligible if item.get("pr-url") == url), None)
+            if entry is None:
+                entry = next((item for item in eligible
+                              if str(item.get("pr-url") or "").strip() == url), {})
             sha = str(entry.get("head-sha") or (entry.get("build-observations") or {}).get("head-sha") or "")
             if not re.fullmatch(r"[0-9a-f]{40}", sha):
                 print(f"WARNING: archived child {url} has no evaluated SHA; leaving its check unchanged.", file=sys.stderr)
@@ -727,6 +732,7 @@ def run_early_gate_results(
         labels=resolved_labels,
         root=root,
     )
+    state_path = gpm.resolve_finalized_state(root, state_path, git_runner=git_runner)
     payload = load_state(state_path)
     retired = retired_outcome(payload)
     if retired:

@@ -95,7 +95,7 @@ from lib.pr_status_updater import (
     parse_pr_url,
 )
 from lib.leader_history import (
-    canonical_state_path, history_state_outcome, is_history_state,
+    HISTORY_FOLDERS, canonical_state_path, history_state_outcome, is_history_state, state_outcome,
     prepare_leader_history_merge, resolve_existing_state_path, write_history_snapshot,
 )
 from lib.state_file import (
@@ -1060,6 +1060,38 @@ def checkout_leader_branch(
     run(["checkout", "-B", ref, f"{remote}/{ref}"], cwd=repo_root)
 
 
+def resolve_finalized_state(
+    repo_root: Path, state_path: Path, *, git_runner: Callable[..., str] | None = None,
+) -> Path:
+    """Recognize a tracked legacy conclusion before a scan can reset its gates.
+
+    Only identical, terminal active/history records are migration candidates.
+    A genuinely active retry may have stale history; conflicting terminal
+    records instead require investigation without changing either copy.
+    """
+    path = resolve_existing_state_path(repo_root, state_path)
+    if is_history_state(path) or os.environ.get("GAP_MOVE_FINAL_STATE", "").lower() != "true":
+        return path
+    payload = load_state(path)
+    if retired_outcome(payload):
+        return path  # Retirement may have just added metadata to the active record.
+    folder = HISTORY_FOLDERS.get(state_outcome(payload))
+    if folder is None:
+        return path
+    canonical = canonical_state_path(repo_root, path)
+    snapshot = repo_root.resolve() / "GAP History" / folder / canonical.parent.name / "state.json"
+    if not snapshot.is_file():
+        return path
+    run = git_runner or (lambda args, cwd: _run_git(args, cwd=cwd))
+    relative = state_path_for_output(snapshot, repo_root=repo_root)
+    if not run(["ls-files", "--", relative], cwd=repo_root).strip():
+        raise GapPrMonitorError("Refusing to use an untracked history snapshot")
+    history_state_outcome(snapshot)
+    if load_state(snapshot) != payload:
+        raise GapPrMonitorError("Active and archived Leader records disagree; refusing to change either")
+    return snapshot
+
+
 def publish_state(
     repo_root: Path,
     state_path: Path,
@@ -1079,7 +1111,8 @@ def publish_state(
     """
     repo_root = repo_root.expanduser().resolve()
     run = git_runner or (lambda args, cwd=repo_root: _run_git(args, cwd=cwd))
-    state_path = resolve_existing_state_path(repo_root, state_path)
+    state_path = (resolve_existing_state_path(repo_root, state_path) if archive
+                  else resolve_finalized_state(repo_root, state_path, git_runner=run))
     rel = state_path_for_output(state_path, repo_root=repo_root)
     archive = archive or bool(retired_outcome(load_state(state_path))) or is_history_state(state_path)
     if dry_run:
@@ -1423,7 +1456,7 @@ def run_monitor_publish_and_signal(
       if required builds failed: post Leader green on the published SHA;
       always (when Leader URL known): upsert failure/pending/closed summary comment.
     """
-    state_path = resolve_existing_state_path(repo_root, state_path)
+    state_path = resolve_finalized_state(repo_root, state_path, git_runner=git_runner)
     if publish and leader_pr_url and (
         replacement_url or is_history_state(state_path) or retired_outcome(load_state(state_path))
     ):
@@ -2454,6 +2487,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the scheduled or single-Leader monitor and expose its final published state path."""
     args = build_parser().parse_args(argv)
     repo_root = Path(args.repo_root)
 

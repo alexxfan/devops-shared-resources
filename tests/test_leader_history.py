@@ -138,6 +138,7 @@ def test_incomplete_runs_have_no_history_snapshot(tmp_path, outcome):
 
 @pytest.mark.parametrize("outcome,folder", [("success", "successful"), ("failure", "unsuccessful")])
 def test_snapshot_moves_canonical_and_preserves_child_outcome(tmp_path, outcome, folder):
+    """Move terminal state once without changing child decisions, including on retry."""
     state = tmp_path / "GAP Leaders" / "2026-11-04_gap-test" / "state.json"
     state.parent.mkdir(parents=True)
     payload = {"overall-status": outcome, "pull-requests": [
@@ -165,6 +166,7 @@ def test_snapshot_moves_canonical_and_preserves_child_outcome(tmp_path, outcome,
     pytest.param(["failure", "pending", "pending"], "unsuccessful", id="component-failure"),
 ])
 def test_snapshot_uses_canonical_gates_without_changing_payload(tmp_path, statuses, folder, legacy):
+    """Gate outcomes override stale legacy status without rewriting the saved payload."""
     state = tmp_path / "GAP Leaders" / "2026-11-04_gap-test" / "state.json"
     state.parent.mkdir(parents=True)
     gate_ids = ("component-builds", "early-gate-build", "early-gate-test")
@@ -295,6 +297,7 @@ def test_result_label_does_not_shadow_leader_trigger(outcome, result_first):
 
 @pytest.mark.parametrize("outcome,folder", [("success", "successful"), ("failure", "unsuccessful")])
 def test_archive_lookup_by_old_path_and_trigger(tmp_path, outcome, folder):
+    """Old paths and trigger IDs continue to resolve after finalization moves a record."""
     from lib.state_file import find_existing_state_path
     from scripts.gap_pr_monitor import resolve_state_file, state_path_for_trigger
     path = tmp_path / "GAP Leaders/2026-11-04_gap-test/state.json"
@@ -307,6 +310,7 @@ def test_archive_lookup_by_old_path_and_trigger(tmp_path, outcome, folder):
 
 
 def test_ambiguous_or_mismatched_history_cannot_be_used(tmp_path):
+    """Reject conflicting archive locations and outcomes instead of guessing."""
     from lib.leader_history import resolve_existing_state_path, history_state_outcome
     from lib.state_file import find_existing_state_path
     path = tmp_path / "GAP Leaders/2026-11-04_gap-test/state.json"

@@ -864,6 +864,7 @@ def report_for_leader(
     reuse_monitor_evidence: bool = False,
     allow_archived: bool = False,
 ) -> ReporterResult:
+    """Update the maintained summary, preserving finalized records unless explicitly requested."""
     run = gh_runner or _run_gh
     if head_ref:
         checkout_leader_branch(repo_root, head_ref, git_runner=git_runner)

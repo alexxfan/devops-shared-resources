@@ -29,6 +29,7 @@ def state_outcome(payload: dict) -> str | None:
 
 
 def is_history_state(path: Path) -> bool:
+    """Recognize state files beneath an outcome-specific history directory."""
     return (path.name == "state.json" and path.parent.parent.name in HISTORY_FOLDERS.values()
             and path.parent.parent.parent.name == str(HISTORY_ROOT))
 
@@ -44,6 +45,7 @@ def history_state_outcome(path: Path) -> str | None:
 
 
 def canonical_state_path(repo_root: Path, state_path: Path) -> Path:
+    """Validate record layout and return its original active path within the repo."""
     relative = state_path.resolve().relative_to(repo_root.resolve())
     if is_history_state(state_path):
         if len(relative.parts) != 4 or relative.parts[0] != str(HISTORY_ROOT):
