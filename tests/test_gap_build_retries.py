@@ -377,13 +377,17 @@ def test_wrong_retry_actor_cannot_cause_repeated_unrecorded_comments():
 
 @pytest.mark.usefixtures("pac_cel_binary")
 def test_archived_state_cannot_trigger_retry(tmp_path, monkeypatch):
-    from tests.test_gap_repository_gates import _GitHub, _state, _run, _passing_check_runs
+    from tests.test_gap_repository_gates import _GitHub, _state, _Updater, _passing_check_runs
+    from scripts.gap_pr_monitor import run_monitor
     from lib.konflux_builds import BuildObservation
     github = _GitHub()
     github.check_runs = _passing_check_runs()
     path = _state(tmp_path)
     archived = tmp_path / "GAP History" / "unsuccessful" / "record" / "state.json"
     archived.parent.mkdir(parents=True)
+    payload = json.loads(path.read_text())
+    payload["overall-status"] = "failure"
+    path.write_text(json.dumps(payload))
     path.rename(archived)
     class Client:
         def observe(self, **kw):
@@ -392,7 +396,7 @@ def test_archived_state_cannot_trigger_retry(tmp_path, monkeypatch):
     monkeypatch.setenv("GAP_AUTO_RETRY_BUILDS", "true")
     monkeypatch.setattr(KonfluxClient, "from_environment", lambda **_: Client())
     # The fake GH runner rejects every unexpected comment/API mutation.
-    _run(archived, github)
+    run_monitor(archived, gh_runner=github, updater_factory=_Updater, now=NOW)
 
 
 def test_pr_stable_branch_does_not_replace_component_release_branch():
