@@ -369,7 +369,7 @@ def test_ambiguous_pipeline_identity_does_not_send_a_broad_retest():
 def test_wrong_retry_actor_cannot_cause_repeated_unrecorded_comments():
     gh, client = FakeGitHub(), FakeKonflux()
     apply(manager(gh, client), client)
-    gh.comments[0]["user"]["login"] = "previous-app[bot]"
+    gh.comments[0]["user"].update(login="previous-app[bot]", type="Bot")
     with pytest.raises(ValueError, match="author differs"):
         apply(manager(gh, client), client)
     assert len(gh.posts) == 1
@@ -435,3 +435,12 @@ def test_success_after_post_crash_still_recovers_state_audit():
     client.items[0]["status"]["conditions"][0].update(status="True", reason="Succeeded")
     gate, evidence = apply(manager(gh, client), client)  # no saved local receipt
     assert gate.outcome == "pass" and len(evidence["retry-history"]) == 1
+
+
+def test_human_quote_of_receipt_cannot_consume_the_retry_budget():
+    gh, client = FakeGitHub(), FakeKonflux()
+    apply(manager(gh, client), client)
+    gh.comments[0]["user"] = {"login": "a-human", "type": "User"}
+    gate, receipt = apply(manager(gh, client), client)
+    assert gate.outcome == "pending"
+    assert receipt["runs"][0]["retry"]["retrigger_count"] == 1

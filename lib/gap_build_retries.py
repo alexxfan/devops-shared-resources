@@ -75,7 +75,15 @@ class BuildRetryManager:
         comments = collect_github_pages(self.runner, endpoint, None, 100)
         history = list(self.saved.get(pr.url, []))
         for comment in comments:
-            for match in MARKER.finditer(str(comment.get("body") or "")):
+            user = comment.get("user") or {}
+            body = str(comment.get("body") or "")
+            if user.get("login") != self.actor:
+                # Ignore human quotes/spoofed markers. A bot-issued retry with
+                # a different identity may be a changed deployment actor; stop
+                # rather than silently resetting its cross-leader budget.
+                if user.get("type") != "Bot" or not body.startswith("/retest "):
+                    continue
+            for match in MARKER.finditer(body):
                 record = json.loads(match[1])
                 if record.get("repository") == f"{pr.owner}/{pr.repo}" and record.get("pr") == pr.number:
                     if (comment.get("user") or {}).get("login") != self.actor:
