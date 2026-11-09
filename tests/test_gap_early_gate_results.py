@@ -185,6 +185,7 @@ def _state(tmp_path: Path, *, overall: str | None, trigger: str = "gap-egtest01"
         "pull-requests": [
             {
                 "repo": "kserve-branch",
+                "head-sha": "b" * 40,
                 "pr-url": "https://github.com/example/kserve-branch/pull/1",
                 "pr-status": "success",
                 "builds": [],
@@ -927,11 +928,11 @@ def test_post_child_statuses_eg_failure_leaves_build_failure_alone() -> None:
         payload, overall_status="failure", updater=updater
     )
     assert posted == ("https://github.com/ex/ok/pull/1",)
-    # Phase-1: children still get GitHub success so auto-merge can proceed.
+    # EG failure is a blocking child status.
     assert updater.posts == [
         (
             "https://github.com/ex/ok/pull/1",
-            "success",
+            "failure",
             {"description": eg.CHILD_EG_FAILURE_DESCRIPTION},
         )
     ]
@@ -947,6 +948,7 @@ def test_run_publish_eg_failure_fails_build_ok_children(
         "pull-requests": [
             {
                 "repo": "ok",
+                "head-sha": "b" * 40,
                 "pr-url": "https://github.com/ex/ok/pull/1",
                 "pr-status": "success",
                 "builds": [],
@@ -990,11 +992,11 @@ def test_run_publish_eg_failure_fails_build_ok_children(
         updater_factory=factory,
     )
     assert result.overall_status == "failure"
-    assert result.child_check_state == "success"
+    assert result.child_check_state == "failure"
     assert result.child_urls_posted == ("https://github.com/ex/ok/pull/1",)
-    # Phase-1: EG failure still posts GitHub success so auto-merge proceeds.
+    # Failed EG must block child merging.
     assert [p[:2] for p in holder["u"].posts] == [
-        ("https://github.com/ex/ok/pull/1", "success")
+        ("https://github.com/ex/ok/pull/1", "failure")
     ]
     assert holder["u"].posts[0][2].get("description") == eg.CHILD_EG_FAILURE_DESCRIPTION
 
@@ -1092,3 +1094,20 @@ def test_second_run_idempotent(
     assert first.applied is True
     assert second.applied is False
     assert second.overall_status == "success"
+
+
+
+def test_failed_eg_can_recover_after_a_successful_rerun():
+    """Keeping a failed Leader open must allow newer EG evidence to recover it."""
+    payload = {"promotion-gates": [
+        {"id": "component-builds", "status": "success", "required": True},
+        {"id": "early-gate-build", "status": "failure", "required": False},
+        {"id": "early-gate-test", "status": "failure", "required": False},
+    ]}
+    outcome, _, _ = eg.decide_overall_from_comments(
+        payload=payload, eg_already_concluded=True,
+        comments=[_bot_comment(PASSED_BARE_MARKER, cid=2), _bot_comment(TESTS_PASSED, cid=3)],
+        labels=["early-gate-build-successful", "early-gate-tests-successful"],
+    )
+    assert outcome == "success"
+    assert eg.derive_legacy_overall_status(payload) == "success"

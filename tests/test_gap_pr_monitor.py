@@ -741,7 +741,7 @@ def test_run_stage1_monitor_posts_success_and_merge_failure(tmp_path: Path) -> N
     assert ("https://github.com/rhoai-rhtap/kserve-branch/pull/15", "failure") in [
         (u, s) for u, s, _ in posts
     ]
-    assert ("https://github.com/rhoai-rhtap/kubeflow/pull/85", "completed") in [
+    assert ("https://github.com/rhoai-rhtap/kubeflow/pull/85", "pending") in [
         (u, s) for u, s, _ in posts
     ]
     saved = json.loads(path.read_text(encoding="utf-8"))
@@ -1931,7 +1931,7 @@ def test_coordinator_posts_leader_only_after_publish(
     assert "eg_comment" in order
 
 
-def test_coordinator_failure_publishes_and_greens_leader(
+def test_coordinator_failure_publishes_without_merging_leader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1976,13 +1976,10 @@ def test_coordinator_failure_publishes_and_greens_leader(
         updater_factory=factory,
     )
     assert result.overall_status == "failure"
-    assert result.leader_status_posted is True
+    assert result.leader_status_posted is False
     assert result.published_sha == "published-sha-abc"
-    assert leader in result.updated_urls
-    leader_post = next(p for p in holder["u"].posts if p[0] == leader)
-    assert leader_post[1] == "completed"
-    assert leader_post[2].get("head_sha") == "published-sha-abc"
-    assert leader_post[2].get("description") == "GAP: overall failure"
+    assert leader not in result.updated_urls
+
 
 
 def test_coordinator_calls_failure_summary_after_publish(
@@ -2081,7 +2078,7 @@ def test_coordinator_failure_summary_errors_do_not_fail_gate(
     assert result.published_sha == "published-sha-abc"
 
 
-def test_coordinator_mixed_children_failure_greens_leader(
+def test_coordinator_mixed_failure_keeps_leader_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2141,11 +2138,10 @@ def test_coordinator_mixed_children_failure_greens_leader(
         updater_factory=factory,
     )
     assert result.overall_status == "failure"
-    assert result.leader_status_posted is True
+    assert result.leader_status_posted is False
     assert result.published_sha == "published-sha-abc"
-    leader_post = next(p for p in holder["u"].posts if p[0] == leader)
-    assert leader_post[1] == "completed"
-    assert leader_post[2].get("description") == "GAP: overall failure"
+    assert leader not in result.updated_urls
+
 
 
 def test_post_leader_conclusion_rejects_non_terminal_overall() -> None:
@@ -2392,11 +2388,11 @@ def test_children_batch_concluded_helpers() -> None:
     ("pr_status", "batch_concluded", "overall_status", "expected"),
     [
         ("success", False, None, True),
-        ("success", True, None, False),
+        ("success", True, None, True),
         # Builds success / EG not done → hold child green for EG note.
         ("success", True, "early-gate-triggered", True),
         ("success", True, "success", False),
-        ("success", True, "failure", False),
+        ("success", True, "failure", True),
         ("build-success", True, "early-gate-triggered", True),
         ("merge-failure", False, None, False),
         ("build-failure", False, None, False),
@@ -2438,7 +2434,7 @@ def test_status_decision_for_post_defers_success_when_batch_open() -> None:
     assert decision.cli_status == "success"
 
 
-def test_status_decision_for_post_keeps_success_when_batch_done_overall_failure() -> None:
+def test_status_decision_for_post_blocks_success_when_batch_done_overall_failure() -> None:
     decision = RepositoryGateDecision(
         url="https://github.com/org/a/pull/1",
         pr_status="success",
@@ -2450,8 +2446,9 @@ def test_status_decision_for_post_keeps_success_when_batch_done_overall_failure(
     posted = status_decision_for_post(
         decision, batch_concluded=True, overall_status="failure"
     )
-    assert posted is decision
-    assert posted.cli_status == "success"
+    assert posted is not decision
+    assert posted.cli_status == "pending"
+    assert posted.description == "GAP: batch failed; merge held until a retry recovers it or a newer Leader replaces it"
 
 
 def test_status_decision_for_post_defers_when_early_gate_triggered() -> None:
@@ -2589,7 +2586,7 @@ def test_run_monitor_defers_success_while_sibling_pending(
     assert "overall-status" not in saved
 
 
-def test_run_monitor_greens_only_good_children_when_batch_fails(
+def test_run_monitor_holds_good_children_when_batch_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2634,9 +2631,9 @@ def test_run_monitor_greens_only_good_children_when_batch_fails(
     assert set(result.success_urls) == {good}
     assert set(result.build_failure_urls) == {bad}
     posts = {(u, s) for u, s, _ in holder["u"].posts}
-    assert (good, "success") in posts
+    assert (good, "success") not in posts
     assert (bad, "failure") in posts
-    assert (good, "pending") not in posts
+    assert (good, "pending") in posts
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert "overall-status" not in saved
     gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
@@ -2853,7 +2850,7 @@ def test_coordinator_defers_child_green_until_batch_then_greens_leader(
     assert all(u != leader for u, _s, _k in holder["u"].posts)
 
 
-def test_coordinator_greens_good_children_and_leader_on_mixed_failure(
+def test_coordinator_blocks_children_and_leader_on_mixed_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2913,13 +2910,11 @@ def test_coordinator_greens_good_children_and_leader_on_mixed_failure(
         gh_runner=lambda *_: "",
     )
     assert result.overall_status == "failure"
-    assert result.leader_status_posted is True
+    assert result.leader_status_posted is False
     posts = {(u, s) for u, s, _ in all_posts}
-    assert (good, "success") in posts
+    assert (good, "pending") in posts
     assert (bad, "failure") in posts
-    assert (leader, "completed") in posts
-    leader_kw = next(kw for u, s, kw in all_posts if u == leader and s == "completed")
-    assert leader_kw.get("description") == "GAP: overall failure"
+    assert (leader, "completed") not in posts
 
 
 # ---------------------------------------------------------------------------
