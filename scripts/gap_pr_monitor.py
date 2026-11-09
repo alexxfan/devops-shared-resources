@@ -58,7 +58,6 @@ from lib.gap_promotion_gates import (
     ensure_promotion_gates,
     get_gate_status,
     migrate_legacy_overall_status,
-    should_green_leader_for_build_failure,
     should_trigger_early_gate,
     set_gate_status,
     strip_legacy_overall_status,
@@ -130,6 +129,10 @@ CHILD_PASS_PR_STATUSES = frozenset({SUCCESS_PR_STATUS, BUILD_SUCCESS_PR_STATUS})
 # RHAI-8261: hold green on good children until every sibling has concluded.
 DEFERRED_CHILD_GREEN_DESCRIPTION = (
     "GAP: waiting for other component PRs to conclude (RHAI-8261)"
+)
+# A concluded failed batch remains open only for retry or replacement.
+BATCH_FAILURE_CHILD_PENDING_DESCRIPTION = (
+    "GAP: batch failed; merge held until a retry recovers it or a newer Leader replaces it"
 )
 # Hold child green after all-success until Early Gate concludes (EG status note).
 WAITING_FOR_EARLY_GATE_DESCRIPTION = (
@@ -533,9 +536,7 @@ def should_defer_child_success_status(
         return not children_ready_for_success_status(payload)
     if not batch_concluded:
         return True
-    if overall_status == OVERALL_STATUS_EARLY_GATE_TRIGGERED:
-        return True
-    return False
+    return overall_status != OVERALL_STATUS_SUCCESS
 
 
 def child_success_defer_description(
@@ -549,6 +550,8 @@ def child_success_defer_description(
         return WAITING_FOR_EARLY_GATE_DESCRIPTION
     if batch_concluded and overall_status == OVERALL_STATUS_EARLY_GATE_TRIGGERED:
         return WAITING_FOR_EARLY_GATE_DESCRIPTION
+    if batch_concluded and overall_status != OVERALL_STATUS_SUCCESS:
+        return BATCH_FAILURE_CHILD_PENDING_DESCRIPTION
     return DEFERRED_CHILD_GREEN_DESCRIPTION
 
 
@@ -1061,6 +1064,26 @@ def checkout_leader_branch(
     run(["checkout", "-B", ref, f"{remote}/{ref}"], cwd=repo_root)
 
 
+def resume_unsuccessful_leader(repo_root, state_path, *, git_runner=None):
+    """Resume a legacy failed archive that has no verified retirement receipt."""
+    path = resolve_existing_state_path(repo_root, state_path)
+    if not is_history_state(path) or history_state_outcome(path) != "failure":
+        return path
+    payload = load_state(path)
+    if retired_outcome(payload):
+        return path
+    run = git_runner or (lambda args, cwd: _run_git(args, cwd=cwd))
+    relative = state_path_for_output(path, repo_root=repo_root)
+    if not run(["ls-files", "--", relative], cwd=repo_root).strip():
+        raise GapPrMonitorError("Refusing to resume an untracked history snapshot")
+    active = canonical_state_path(repo_root, path)
+    if active.exists() and load_state(active) != payload:
+        raise GapPrMonitorError("Active and archived Leader records disagree")
+    active.parent.mkdir(parents=True, exist_ok=True)
+    save_state(active, payload)
+    return active
+
+
 def resolve_finalized_state(
     repo_root: Path, state_path: Path, *, git_runner: Callable[..., str] | None = None,
 ) -> Path:
@@ -1074,6 +1097,8 @@ def resolve_finalized_state(
     if is_history_state(path) or os.environ.get("GAP_MOVE_FINAL_STATE", "").lower() != "true":
         return path
     payload = load_state(path)
+    if state_outcome(payload) == "failure" and not retired_outcome(payload):
+        return path  # Failure is retryable until a newer Leader replaces it.
     if retired_outcome(payload):
         return path  # Retirement may have just added metadata to the active record.
     folder = HISTORY_FOLDERS.get(state_outcome(payload))
@@ -1130,7 +1155,7 @@ def publish_state(
     # pinned consumers cannot resolve a state file after it moves to history.
     exclusive = os.environ.get("GAP_MOVE_FINAL_STATE", "").lower() == "true" or is_history_state(state_path)
     if not exclusive:
-        snapshot = write_history_snapshot(repo_root, state_path, move=False)
+        snapshot = write_history_snapshot(repo_root, state_path, move=False) if archive else None
         published_path = state_path
         paths = [rel]
         if snapshot is not None:
@@ -1255,13 +1280,11 @@ def post_leader_conclusion(
     overall_status: str,
     updater: PRStatusUpdater,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
+    replacement_verified: bool = False,
 ) -> StatusUpdateResult:
-    """Post Leader green on the published SHA once overall-status is set (RHAI-8079).
-
-    GitHub auto-merge only needs a successful required check. We still green the
-    Leader for ``failure`` so run history can land on ``main`` after every child
-    has concluded (not while any child is still pending).
-    """
+    """Authorize successful run history or verified replacement retirement."""
+    if overall_status in {OVERALL_STATUS_FAILURE, "superseded"} and not replacement_verified:
+        raise GapPrMonitorError("Unsuccessful Leader requires a verified newer replacement before merge")
     if overall_status == OVERALL_STATUS_SUCCESS:
         description = "GAP: overall success"
     elif overall_status == OVERALL_STATUS_FAILURE:
@@ -1385,7 +1408,7 @@ def retire_previous_leader(
         recorded_ref = parse_pr_url(expected)
         if recorded_ref.slug != ref.slug or recorded_ref.number <= ref.number:
             raise GapPrMonitorError("Invalid recorded replacement Leader identity")
-    if outcome is None:
+    if outcome is None or (outcome != "success" and retired is None):
         if not replacement_url:
             raise GapPrMonitorError("Missing replacement Leader")
         replacement_ref = parse_pr_url(replacement_url)
@@ -1395,8 +1418,7 @@ def retire_previous_leader(
     if dry_run:
         print(f"[dry-run] would preserve {leader_pr_url} as {outcome}, without child statuses")
         return MonitorResult(state_path, [], [], [], [], True, overall_status=outcome)
-    if not is_history_state(state_path):
-        save_state(state_path, payload)
+    save_state(state_path, payload)
     published = publish_state(
         repo_root, state_path, branch, remote=remote, git_runner=git_runner,
         commit_message=f"Preserve replaced GAP Leader ({outcome})",
@@ -1410,10 +1432,10 @@ def retire_previous_leader(
     verify_leader_head(leader_pr_url, published.sha, updater=updater)
     posted = post_leader_conclusion(
         leader_pr_url, published.sha, overall_status=outcome,
-        updater=updater, gh_runner=runner,
+        updater=updater, gh_runner=runner, replacement_verified=True,
     )
     if retired is None:
-        if early_gate_concluded(payload):
+        if early_gate_concluded(payload) and not replacement_url:
             from scripts.gap_early_gate_results import post_child_statuses_for_early_gate
             post_child_statuses_for_early_gate(
                 payload, overall_status=outcome, updater=updater, pinned_only=True,
@@ -1454,9 +1476,11 @@ def run_monitor_publish_and_signal(
     Ordering (RHOAIENG-97052 / RHAI-8079 / RHAI-10942):
       evaluate children → write ``promotion-gates`` → commit/push →
       if ``component-builds`` success: comment ``/early-gate`` on the Leader once;
-      if required builds failed: post Leader green on the published SHA;
+      if required builds failed: retain the active Leader for retry/replacement;
       always (when Leader URL known): upsert failure/pending/closed summary comment.
     """
+    if publish and not dry_run and not replacement_url:
+        state_path = resume_unsuccessful_leader(repo_root, state_path, git_runner=git_runner)
     state_path = resolve_finalized_state(repo_root, state_path, git_runner=git_runner)
     if publish and leader_pr_url and (
         replacement_url or is_history_state(state_path) or retired_outcome(load_state(state_path))
@@ -1489,7 +1513,7 @@ def run_monitor_publish_and_signal(
     branch = (head_ref or "").strip() or current_git_branch(
         repo_root, git_runner=git_runner
     )
-    finalizing = bool(leader_pr_url and should_green_leader_for_build_failure(load_state(result.state_path)))
+    finalizing = False  # Only replacement retirement may finalize a failed batch.
     published = publish_state(
         repo_root,
         result.state_path,
@@ -1516,7 +1540,6 @@ def run_monitor_publish_and_signal(
     early_gate = should_trigger_early_gate(
         state_payload
     ) and not early_gate_concluded(state_payload)
-    concluded = should_green_leader_for_build_failure(state_payload)
     # Keep MonitorResult.overall_status aligned with gates for callers/tests.
     result_overall = derive_legacy_overall_status(state_payload)
 
@@ -1540,37 +1563,6 @@ def run_monitor_publish_and_signal(
             f"WARNING: component-builds=success but no Leader PR URL "
             f"was provided (--leader-pr-url / {ENV_LEADER_PR_URL}); "
             "skipped Early Gate trigger comment.",
-            file=sys.stderr,
-        )
-
-    if concluded and leader_url:
-        factory = updater_factory or PRStatusUpdater
-        updater = factory(check_name=check_name, dry_run=dry_run)
-        if not dry_run:
-            verify_leader_head(leader_url, published.sha, updater=updater)
-        try:
-            leader_result = post_leader_conclusion(
-                leader_url,
-                published.sha,
-                overall_status=OVERALL_STATUS_FAILURE,
-                updater=updater,
-                gh_runner=gh_runner,
-            )
-            leader_status_posted = not leader_result.skipped
-            if leader_status_posted:
-                updated.append(leader_url)
-            else:
-                skipped.append(leader_url)
-        except (ValueError, RuntimeError, GhCommandError) as exc:
-            raise GapPrMonitorError(
-                f"Failed to post Leader conclusion status for {leader_url} "
-                f"on {published.sha}: {exc}"
-            ) from exc
-    elif concluded and not leader_url:
-        print(
-            f"WARNING: component-builds=failure but no Leader PR URL "
-            f"was provided (--leader-pr-url / {ENV_LEADER_PR_URL}); "
-            "skipped Leader self-status.",
             file=sys.stderr,
         )
 
@@ -2461,9 +2453,8 @@ def build_parser() -> argparse.ArgumentParser:
             f"{LATEST_LEADER_PR_SENTINEL} to discover the newest open Leader "
             f"labeled {DEFAULT_LEADER_LABEL!r}. With --publish-state, after "
             "the state commit is pushed: comment /early-gate when "
-            "overall-status is early-gate-triggered (RHAI-10942); post a green "
-            f"{DEFAULT_CHECK_NAME!r} status when overall-status is success or "
-            "failure (RHOAIENG-97052 / RHAI-8079). Also accepted via "
+            "overall-status is early-gate-triggered (RHAI-10942); failed Leaders "
+            "remain active until replaced. Also accepted via "
             f"{ENV_LEADER_PR_URL}."
         ),
     )
@@ -2473,7 +2464,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "RHOAIENG-97052 / RHAI-8079 / RHAI-10942: commit and push state.json, "
             "then comment /early-gate when overall-status is early-gate-triggered, "
-            "or post Leader green when overall-status is success or failure "
+            "or preserve unsuccessful Leaders until a newer batch replaces them "
             "(never while children are pending)."
         ),
     )
