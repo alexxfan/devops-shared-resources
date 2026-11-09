@@ -30,7 +30,19 @@ def _bot_comment(
     cid: int = 1,
     created: str = "2026-10-29T12:00:00Z",
     login: str = "rhods-ci-bot",
+    leader_commit: str | None = None,
 ) -> dict[str, Any]:
+    token = leader_commit or DEFAULT_TEST_LEADER_COMMIT
+    if "GAP_PR_COMMIT=" not in body:
+        body = body.replace(
+            "<!-- early-gate-build-complete",
+            f"<!-- early-gate-build-complete GAP_PR_COMMIT={token}",
+            1,
+        ).replace(
+            "<!-- early-gate-job-complete",
+            f"<!-- early-gate-job-complete GAP_PR_COMMIT={token}",
+            1,
+        )
     return {
         "id": cid,
         "created_at": created,
@@ -197,6 +209,15 @@ def _state(tmp_path: Path, *, overall: str | None, trigger: str = "gap-egtest01"
     path = folder / "state.json"
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return path
+
+
+DEFAULT_TEST_LEADER_COMMIT = "d" * 40
+FETCH_LEADER_HEAD_SHA = eg.fetch_leader_head_sha
+
+
+@pytest.fixture(autouse=True)
+def mock_current_leader_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(eg, "fetch_leader_head_sha", lambda *a, **k: DEFAULT_TEST_LEADER_COMMIT)
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +651,27 @@ def test_fetch_leader_head_ref_empty_raises() -> None:
         )
 
 
+def test_fetch_leader_head_sha_reads_current_commit() -> None:
+    expected = "a" * 40
+
+    def fake_gh(args: list[str]) -> str:  # type: ignore[type-arg]
+        assert args == ["api", "repos/acme/gap/pulls/9", "--jq", ".head.sha"]
+        return expected
+
+    assert FETCH_LEADER_HEAD_SHA(
+        "https://github.com/acme/gap/pull/9",
+        gh_runner=fake_gh,
+    ) == expected
+
+
+def test_fetch_leader_head_sha_rejects_invalid_commit() -> None:
+    with pytest.raises(eg.GapPrMonitorError, match="Could not resolve current Leader commit"):
+        FETCH_LEADER_HEAD_SHA(
+            "https://github.com/acme/gap/pull/9",
+            gh_runner=lambda args: "not-a-sha",
+        )
+
+
 # ---------------------------------------------------------------------------
 # run_early_gate_results
 # ---------------------------------------------------------------------------
@@ -666,6 +708,85 @@ def test_run_applies_success_without_publish(
     assert gates["component-builds"] == "success"
     assert gates["early-gate-build"] == "success"
     assert gates["early-gate-test"] == "success"
+
+
+def test_run_ignores_terminal_results_from_old_leader_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _state(tmp_path, overall="early-gate-triggered")
+    stale = "b" * 40
+    comments = [
+        _bot_comment(
+            PASSED_BARE_MARKER,
+            cid=10,
+            leader_commit=stale,
+        ),
+        _bot_comment(
+            TESTS_PASSED,
+            cid=11,
+            leader_commit=stale,
+        ),
+        _bot_comment(
+            PASSED_BARE_MARKER,
+            cid=12,
+            leader_commit=DEFAULT_TEST_LEADER_COMMIT,
+        ),
+    ]
+    monkeypatch.setattr(eg, "list_leader_pr_comments", lambda *a, **k: comments)
+
+    result = eg.run_early_gate_results(
+        repo_root=tmp_path,
+        leader_pr_url="https://github.com/acme/gap/pull/9",
+        trigger_id="gap-egtest01",
+        labels=[eg.LABEL_EG_TEST_SUCCESS],
+        publish=False,
+    )
+
+    assert result.applied is False
+    assert result.eg_build_status == "success"
+    assert result.eg_test_status is None
+    saved = json.loads(path.read_text())
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["early-gate-build"] == "success"
+    assert gates["early-gate-test"] == "pending"
+
+
+def test_commit_scopes_latest_terminal_comment() -> None:
+    expected = "a" * 40
+    comments = [
+        _bot_comment(
+            PASSED_BARE_MARKER,
+            cid=1,
+            leader_commit=expected,
+        ),
+        _bot_comment(FAILED_BARE_MARKER, cid=2),
+    ]
+
+    selected = eg.select_latest_early_gate_outcome(
+        comments, leader_commit=expected
+    )
+
+    assert selected is not None
+    assert selected.overall_status == "success"
+
+
+def test_labels_do_not_fall_back_without_current_commit_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _state(tmp_path, overall="early-gate-triggered")
+    monkeypatch.setattr(eg, "list_leader_pr_comments", lambda *a, **k: [])
+
+    result = eg.run_early_gate_results(
+        repo_root=tmp_path,
+        leader_pr_url="https://github.com/acme/gap/pull/9",
+        trigger_id="gap-egtest01",
+        labels=[eg.LABEL_EG_BUILD_SUCCESS, eg.LABEL_EG_TEST_SUCCESS],
+        publish=False,
+    )
+
+    assert result.applied is False
+    assert result.eg_build_status is None
+    assert result.eg_test_status is None
 
 
 def test_run_applies_failure_without_publish(
@@ -971,7 +1092,10 @@ def test_run_publish_eg_failure_fails_build_ok_children(
     monkeypatch.setattr(
         eg,
         "list_leader_pr_comments",
-        lambda *a, **k: [_bot_comment(FAILED_BARE_MARKER), _bot_comment(TESTS_FAILED)],
+        lambda *a, **k: [
+            _bot_comment(FAILED_BARE_MARKER),
+            _bot_comment(TESTS_FAILED),
+        ],
     )
     monkeypatch.setattr(eg, "checkout_leader_branch", lambda *a, **k: None)
     monkeypatch.setattr(

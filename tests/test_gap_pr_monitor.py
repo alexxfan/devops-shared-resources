@@ -3075,6 +3075,45 @@ def test_post_early_gate_trigger_comment_allows_retrigger() -> None:
     assert comments == [EARLY_GATE_COMMENT_BODY]
 
 
+def test_post_early_gate_trigger_comment_is_idempotent_per_leader_commit() -> None:
+    leader = "https://github.com/org/gap/pull/9"
+    leader_commit = "a" * 40
+    calls: list[list[str]] = []
+
+    def gh(args):
+        calls.append(list(args))
+        if args[0] == "api":
+            assert "check-runs" in args[1]
+            return json.dumps(["check-run-id"])
+        raise AssertionError(f"same Leader commit must not post again: {args}")
+
+    assert post_early_gate_trigger_comment(
+        leader, leader_commit=leader_commit, gh_runner=gh
+    ) is False
+    assert len(calls) == 1
+
+
+def test_post_early_gate_trigger_comment_posts_for_new_leader_commit() -> None:
+    leader = "https://github.com/org/gap/pull/9"
+    leader_commit = "b" * 40
+    calls: list[list[str]] = []
+
+    def gh(args):
+        calls.append(list(args))
+        if args[0] == "api":
+            assert "check-runs" in args[1]
+            return "[]"
+        if args[:2] == ["pr", "comment"]:
+            return ""
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    assert post_early_gate_trigger_comment(
+        leader, leader_commit=leader_commit, gh_runner=gh
+    ) is True
+    comment = next(c for c in calls if c[:2] == ["pr", "comment"])
+    assert comment[comment.index("--body") + 1] == EARLY_GATE_COMMENT_BODY
+
+
 def test_record_child_head_shas_detects_change() -> None:
     child = "https://github.com/org/repo/pull/1"
     payload = {
@@ -3130,7 +3169,7 @@ def test_coordinator_all_success_comments_early_gate_no_leader_green(
 
     monkeypatch.setattr(
         "scripts.gap_pr_monitor.publish_state",
-        lambda *a, **k: PublishResult(sha="published-sha-abc", committed=True),
+        lambda *a, **k: PublishResult(sha="a" * 40, committed=True),
     )
     _fake_child_monitor(monkeypatch, statuses={child: "success"}, overall="early-gate-triggered")
 
@@ -3187,16 +3226,18 @@ def test_coordinator_early_gate_skips_duplicate_comment(
 
     monkeypatch.setattr(
         "scripts.gap_pr_monitor.publish_state",
-        lambda *a, **k: PublishResult(sha="published-sha-abc", committed=True),
+        lambda *a, **k: PublishResult(sha="a" * 40, committed=True),
     )
     _fake_child_monitor(
-        monkeypatch, statuses={child: "success"}, overall="early-gate-triggered"
+        monkeypatch,
+        statuses={child: "success"},
+        overall="early-gate-triggered",
     )
 
     def gh(args):
         nonlocal comment_posts
         if args[0] == "api":
-            return json.dumps([{"body": "/early-gate"}])
+            return json.dumps(["existing-check-run"])
         if args[:2] == ["pr", "comment"]:
             comment_posts += 1
             return ""
@@ -3214,6 +3255,55 @@ def test_coordinator_early_gate_skips_duplicate_comment(
     assert result.early_gate_comment_posted is False
     assert result.leader_status_posted is False
     assert comment_posts == 0
+
+
+def test_coordinator_includes_published_leader_commit_in_trigger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.json"
+    child = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    payload = {
+        "pull-requests": [
+            {
+                "repo": "kserve-branch",
+                "pr-url": child,
+                "pr-status": "success",
+                "builds": [],
+                "head-sha": "a" * 40,
+            }
+        ],
+        "overall-status": "early-gate-triggered",
+    }
+    save_state(path, payload)
+    expected = "c" * 40
+    comments: list[str] = []
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.publish_state",
+        lambda *a, **k: PublishResult(sha=expected, committed=True),
+    )
+    _fake_child_monitor(
+        monkeypatch, statuses={child: "success"}, overall="early-gate-triggered"
+    )
+
+    def gh(args):
+        if args[0] == "api":
+            return "[]"
+        if args[:2] == ["pr", "comment"]:
+            comments.append(args[args.index("--body") + 1])
+            return ""
+        return ""
+
+    result = run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url="https://github.com/org/gap/pull/9",
+        publish=True,
+        gh_runner=gh,
+    )
+
+    assert result.early_gate_comment_posted is True
+    assert comments == [EARLY_GATE_COMMENT_BODY]
 
 
 def test_coordinator_retriggers_after_child_head_changes(
@@ -3251,7 +3341,7 @@ def test_coordinator_retriggers_after_child_head_changes(
     def gh(args):
         nonlocal comment_posts
         if args[0] == "api":
-            return json.dumps([{"body": "/early-gate"}])
+            return "[]"
         if args[:2] == ["pr", "comment"]:
             comment_posts += 1
             return ""
