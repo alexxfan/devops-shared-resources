@@ -31,6 +31,23 @@ REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 SHA = re.compile(r"[0-9a-f]{40}")
 RELEASE_SUFFIX = re.compile(r"-v[0-9]+-[0-9]+(?:-ea-[0-9]+)?$")
 
+# PaC labels that authorize a PR-associated build attempt.
+# Keep this tight: same repo/PR/SHA/type=build checks still apply below.
+# Only add GitOps "all pipelines" siblings of already-allowed single-pipeline
+# comments (Leader #101: retest-all-comment was rejected and froze children).
+PR_ASSOCIATED_EVENTS = frozenset(
+    {
+        "pull_request",
+        "on-comment",
+        "retest-comment",
+        "retest-all-comment",  # /retest  (was missing → unknown trigger)
+        "test-comment",
+        "test-all-comment",  # /test   (pair of already-allowed test-comment)
+    }
+)
+# Cancel ops are PR-scoped but must not be selected as build evidence.
+CANCEL_EVENTS = frozenset({"cancel", "cancel-comment", "cancel-all-comment"})
+
 
 class KonfluxQueryError(RuntimeError):
     """Unavailable or ambiguous evidence must never authorize promotion."""
@@ -149,8 +166,14 @@ def _identity(run, repo, number, sha):
         raise KonfluxQueryError("PR-associated PipelineRun has no verifiable build type")
     if build_type != "build":
         return False
-    if event not in {"pull_request", "on-comment", "retest-comment", "test-comment"}:
-        raise KonfluxQueryError("PR-associated PipelineRun has an unknown trigger event")
+    if event in CANCEL_EVENTS:
+        return False
+    if event not in PR_ASSOCIATED_EVENTS:
+        run_name = metadata.get("name") or "unknown"
+        raise KonfluxQueryError(
+            "PR-associated PipelineRun "
+            f"{run_name!r} has an unknown trigger event {event!r}"
+        )
     return True
 
 
