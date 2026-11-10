@@ -28,7 +28,11 @@ def hook(tmp_path):
     def slack_factory(token, channel):
         assert channel == "C0883L8FARE"
         return slack
-    defaults = dict(accepted_urls=[PR], leader_url=LEADER_URL, published_sha="b" * 40,
+    def ownership_fetch(name):
+        if name == 'automerge_team_mapping.yaml':
+            return 'repo_to_component: {}\nrepo_to_slack_handle: {}'
+        return "_default: DevOps\nmappings: {api: [API, Serving]}" if name.startswith("konflux") else "components:\n  default:\n    slack_team_handle: devops"
+    defaults = dict(ownership_fetch=ownership_fetch, accepted_urls=[PR], leader_url=LEADER_URL, published_sha="b" * 40,
                     state_path=root / "state.json", repo_root=root,
                     config=NotificationConfig("write", str(tmp_path / "journal.json"), "monitor-test", "41"),
                     jira_factory=jira_factory, slack_factory=slack_factory,
@@ -39,6 +43,51 @@ def hook(tmp_path):
     return invoke, jira, slack, defaults, calls
 
 
+@pytest.mark.parametrize('explicit,expected', [(None, '/fake/env-ca.pem'), ('/fake/explicit.pem', '/fake/explicit.pem')])
+def test_ca_setting_forwarded_without_preview_credentials(hook, monkeypatch, explicit, expected):
+    from lib.gap_notifications.ownership import OwnershipPolicy
+    invoke, _, _, opts, _ = hook
+    original = OwnershipPolicy.load
+    seen = []
+    def load(fetch=None, *, ca_bundle=None):
+        seen.append(ca_bundle)
+        return original(fetch)
+    monkeypatch.setattr(OwnershipPolicy, 'load', load)
+    class Environment:
+        def get(self, key):
+            assert key == 'GAP_OWNERSHIP_CA_BUNDLE'
+            return '/fake/env-ca.pem'
+    assert invoke(config=replace(opts['config'], mode='preview'), environ=Environment(),
+                  ownership_ca_bundle=explicit)['status'] == 'preview'
+    assert seen == [expected]
+
+
+def test_mapping_failure_isolated_and_no_services(hook):
+    invoke, jira, slack, _, calls = hook
+    def fail(name):
+        raise OSError('offline')
+    assert invoke(ownership_fetch=fail)['status'] == 'error'
+    assert not calls and not jira.calls and not slack.calls
+
+
+@pytest.mark.parametrize('mode,dry_run', [('disabled', False), ('write', True)])
+def test_disabled_dry_run_no_mapping_fetch(hook, mode, dry_run):
+    invoke, _, _, opts, _ = hook
+    def fail(name):
+        pytest.fail('mapping fetch on inactive path')
+    invoke(config=replace(opts['config'], mode=mode), dry_run=dry_run, ownership_fetch=fail)
+
+
+def test_creation_fields_and_existing_ownership_unchanged(hook):
+    invoke, jira, slack, _, _ = hook
+    assert invoke()['status'] == 'settled'
+    assert jira.issues['RHAI-1']['fields']['components'] == [{'name': 'API'}, {'name': 'Serving'}]
+    jira.issues['RHAI-1']['fields']['components'] = [{'name': 'Manual'}]
+    invoke()
+    assert jira.issues['RHAI-1']['fields']['components'] == [{'name': 'Manual'}]
+    assert len(slack.calls) == 1
+
+
 # The monitor must deduplicate failure, ignore unknown outcomes and close only on explicit
 # recovery.
 def test_real_collector_failure_dedup_unknown_explicit_recovery(hook):
@@ -46,6 +95,13 @@ def test_real_collector_failure_dedup_unknown_explicit_recovery(hook):
     assert invoke()["status"] == "settled"
     assert len(jira.issues) == len(slack.calls) == 1
     root = slack.calls[0]
+    assert root[1]['blocks'][1]['text'] == {'type': 'mrkdwn', 'text': '*Owning team:* @devops\n', 'verbatim': False}
+    assert root[1]['blocks'][0]['text']['verbatim'] is True
+    assert all(b['text']['verbatim'] for b in root[1]['blocks'][2:-1])
+    assert all('fields' not in block for block in root[1]['blocks'])
+    assert root[1]['blocks'][-1]['type'] == 'context'
+    assert 'Ownership mappings:' in root[1]['blocks'][-1]['elements'][0]['text']
+    assert 'link_names' not in root[1] and '@devops' not in root[0]
     assert invoke()["status"] == "settled"
     assert len(slack.calls) == 1
     for payload in [state(expected_components=["api"], runs=[], pr_status="success"),
@@ -55,6 +111,7 @@ def test_real_collector_failure_dedup_unknown_explicit_recovery(hook):
     result = invoke(state(expected_components=["api"], runs=[run("api", "success", uid="recovery")]))
     assert result["status"] == "settled"
     assert jira.closed("RHAI-1") and len(slack.calls) == 2
+    assert all(b['text']['verbatim'] for b in slack.calls[1][1]['blocks'])
     assert slack.calls[1][1]["thread_ts"] == jira.properties["RHAI-1"]["delivery"]["root"]["ts"]
     invoke(state(expected_components=["api"], runs=[run("api", "success", uid="recovery")]))
     invoke()  # historical failure replay cannot create a successor
@@ -83,6 +140,8 @@ def test_preview_no_clients_credentials_or_journal(hook):
 
 class Bomb:
     def get(self, *a):
+        if a == ('GAP_OWNERSHIP_CA_BUNDLE',):
+            return None
         raise AssertionError("must not access credentials")
 
 
@@ -421,3 +480,21 @@ def test_default_composite_hook_conflict_recovery_never_closes_build(hook):
     receipt['conflict'] = {'status': 'failure', 'mergeable': 'CONFLICTING', 'merge-state-status': 'DIRTY'}
     invoke(payload)
     assert len(jira.issues) == 2  # old pre-recovery replay is not recurrence
+
+@pytest.mark.parametrize('category', ['conflict', 'feasibility'])
+def test_repository_ownership_hook_and_replay(hook, category):
+    from gap_notification_fakes import observation
+    invoke, jira, slack, _, _ = hook
+    def fetch(name):
+        if name == 'automerge_team_mapping.yaml':
+            return 'repo_to_component: {notebooks: [Images, Server]}\nrepo_to_slack_handle: {notebooks: redhat-ai-notebooks}'
+        return 'mappings: {}' if name.startswith('konflux') else 'components: {default: {slack_team_handle: devops}}'
+    def collector(*args, **kwargs):
+        return [observation(category=category, repository='red-hat-data-services/notebooks')]
+    assert invoke(collector=collector, ownership_fetch=fetch)['status'] == 'settled'
+    assert jira.issues['RHAI-1']['fields']['components'] == [{'name': 'Images'}, {'name': 'Server'}]
+    assert '@redhat-ai-notebooks' in str(slack.calls[0][1]['blocks'])
+    jira.issues['RHAI-1']['fields']['components'] = [{'name': 'Manual'}]
+    assert invoke(collector=collector, ownership_fetch=fetch)['status'] == 'settled'
+    assert jira.issues['RHAI-1']['fields']['components'] == [{'name': 'Manual'}]
+    assert len(slack.calls) == 1
