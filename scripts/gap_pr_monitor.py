@@ -1565,6 +1565,9 @@ def run_monitor_publish_and_signal(
     previous_payload = load_state(Path(state_path))
     ensure_promotion_gates(previous_payload)
     migrate_legacy_overall_status(previous_payload)
+    previous_component_build_status = get_gate_status(
+        previous_payload, GATE_COMPONENT_BUILDS
+    )
     result = run_monitor(
         state_path,
         check_name=check_name,
@@ -1615,10 +1618,17 @@ def run_monitor_publish_and_signal(
 
     if early_gate and leader_url:
         try:
+            # State publication may create a new commit for timestamp-only
+            # changes. Idempotency is based on the semantic child batch, not
+            # that bookkeeping commit: allow a repeat only when a child SHA
+            # changed or the previous build gate was not already successful.
             early_gate_comment_posted = post_early_gate_trigger_comment(
                 leader_url,
                 dry_run=dry_run,
-                leader_commit=published.sha,
+                allow_repeat=(
+                    result.child_head_changed
+                    or previous_component_build_status != GATE_STATUS_SUCCESS
+                ),
                 gh_runner=gh_runner,
             )
         except (GhCommandError, ValueError, RuntimeError) as exc:

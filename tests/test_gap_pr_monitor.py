@@ -3379,7 +3379,7 @@ def test_coordinator_early_gate_skips_duplicate_comment(
     def gh(args):
         nonlocal comment_posts
         if args[0] == "api":
-            return json.dumps(["existing-check-run"])
+            return json.dumps([[{"body": "/early-gate"}]])
         if args[:2] == ["pr", "comment"]:
             comment_posts += 1
             return ""
@@ -3399,7 +3399,7 @@ def test_coordinator_early_gate_skips_duplicate_comment(
     assert comment_posts == 0
 
 
-def test_coordinator_includes_published_leader_commit_in_trigger(
+def test_coordinator_does_not_retrigger_for_timestamp_only_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "state.json"
