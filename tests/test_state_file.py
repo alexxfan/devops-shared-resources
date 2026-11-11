@@ -34,6 +34,7 @@ def test_build_and_validate_stage1_state() -> None:
         "pr-url": "https://github.com/rhoai-rhtap/kserve/pull/2",
         "pr-status": "new",
         "builds": [],
+        "ignore": False,
     }
     assert validate_state(payload)["pull-requests"][0]["pr-status"] == PR_STATUS_NEW
 
@@ -71,9 +72,68 @@ def test_write_and_load_state_file(tmp_path: Path) -> None:
                 "pr-url": "https://github.com/rhoai-rhtap/kubeflow/pull/81",
                 "pr-status": "new",
                 "builds": [],
+                "ignore": False,
             }
         ]
     }
+
+
+def test_ignore_flag_round_trip_and_default() -> None:
+    plain = validate_state(
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve",
+                    "pr-url": "https://github.com/acme/kserve/pull/1",
+                    "pr-status": "build-failure",
+                }
+            ]
+        }
+    )
+    # Absent on input still normalizes to an explicit false for easy flipping.
+    assert plain["pull-requests"][0]["ignore"] is False
+
+    ignored = validate_state(
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve",
+                    "pr-url": "https://github.com/acme/kserve/pull/1",
+                    "pr-status": "build-failure",
+                    "ignore": True,
+                }
+            ]
+        }
+    )
+    assert ignored["pull-requests"][0]["ignore"] is True
+
+    explicit_false = validate_state(
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve",
+                    "pr-url": "https://github.com/acme/kserve/pull/1",
+                    "pr-status": "success",
+                    "ignore": False,
+                }
+            ]
+        }
+    )
+    assert explicit_false["pull-requests"][0]["ignore"] is False
+
+    with pytest.raises(StateFileError, match="ignore must be a boolean"):
+        validate_state(
+            {
+                "pull-requests": [
+                    {
+                        "repo": "kserve",
+                        "pr-url": "https://github.com/acme/kserve/pull/1",
+                        "pr-status": "new",
+                        "ignore": "yes",
+                    }
+                ]
+            }
+        )
 
 
 def test_write_and_load_state_file_preserves_child_head_sha(tmp_path: Path) -> None:
