@@ -3139,6 +3139,18 @@ def test_early_gate_comment_already_present_detects_variants() -> None:
 
 
 # Unrelated comments must not be mistaken for an existing early-gate trigger.
+def test_early_gate_comment_already_present_flattens_paginated_pages() -> None:
+    leader = "https://github.com/org/gap/pull/9"
+    pages = json.dumps([[{"body": "unrelated"}], [{"body": "/early-gate"}]])
+
+    def gh(args):
+        assert "--paginate" in args
+        assert "--slurp" in args
+        return pages
+
+    assert early_gate_comment_already_present(leader, gh_runner=gh) is True
+
+
 def test_early_gate_comment_already_present_false_when_missing() -> None:
     leader = "https://github.com/org/gap/pull/9"
 

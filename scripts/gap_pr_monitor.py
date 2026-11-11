@@ -676,18 +676,27 @@ def early_gate_comment_already_present(
         return bool(matches)
     endpoint = f"repos/{ref.owner}/{ref.repo}/issues/{ref.number}/comments"
     try:
-        raw = run(["api", endpoint, "--paginate"])
+        # --slurp makes gh return one JSON array containing all pages. Without
+        # it, gh emits one array per page and json.loads() rejects the result;
+        # once a busy Leader has more than one page of comments, the existing
+        # /early-gate trigger becomes invisible and is posted again.
+        raw = run(["api", endpoint, "--paginate", "--slurp"])
     except GhCommandError:
         return False
     text = (raw or "").strip()
     if not text:
         return False
     try:
-        comments = json.loads(text)
+        pages = json.loads(text)
     except json.JSONDecodeError:
         return False
-    if not isinstance(comments, list):
+    if not isinstance(pages, list):
         return False
+    # Keep compatibility with test doubles and gh versions that return a
+    # single page array even when --slurp is present.
+    comments = [comment for page in pages for comment in page] if pages and all(
+        isinstance(page, list) for page in pages
+    ) else pages
     for comment in comments:
         if not isinstance(comment, dict):
             continue
