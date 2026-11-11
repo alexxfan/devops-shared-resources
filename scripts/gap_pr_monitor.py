@@ -679,7 +679,12 @@ def early_gate_comment_already_present(
     # it, gh emits one array per page and json.loads() rejects the result;
     # once a busy Leader has more than one page of comments, the existing
     # /early-gate trigger becomes invisible and is posted again.
-    raw = run(["api", endpoint, "--paginate", "--slurp"])
+    try:
+        raw = run(["api", endpoint, "--paginate", "--slurp"])
+    except GhCommandError as exc:
+        raise GapPrMonitorError(
+            f"Could not read Early Gate comments for {leader_pr_url}: {exc}"
+        ) from exc
     text = (raw or "").strip()
     if not text:
         raise GapPrMonitorError(
