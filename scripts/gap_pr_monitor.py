@@ -675,23 +675,26 @@ def early_gate_comment_already_present(
             )
         return bool(matches)
     endpoint = f"repos/{ref.owner}/{ref.repo}/issues/{ref.number}/comments"
-    try:
-        # --slurp makes gh return one JSON array containing all pages. Without
-        # it, gh emits one array per page and json.loads() rejects the result;
-        # once a busy Leader has more than one page of comments, the existing
-        # /early-gate trigger becomes invisible and is posted again.
-        raw = run(["api", endpoint, "--paginate", "--slurp"])
-    except GhCommandError:
-        return False
+    # --slurp makes gh return one JSON array containing all pages. Without
+    # it, gh emits one array per page and json.loads() rejects the result;
+    # once a busy Leader has more than one page of comments, the existing
+    # /early-gate trigger becomes invisible and is posted again.
+    raw = run(["api", endpoint, "--paginate", "--slurp"])
     text = (raw or "").strip()
     if not text:
-        return False
+        raise GapPrMonitorError(
+            f"Empty Early Gate comment response for {leader_pr_url}."
+        )
     try:
         pages = json.loads(text)
-    except json.JSONDecodeError:
-        return False
+    except json.JSONDecodeError as exc:
+        raise GapPrMonitorError(
+            f"Invalid Early Gate comment response for {leader_pr_url}: {exc}"
+        ) from exc
     if not isinstance(pages, list):
-        return False
+        raise GapPrMonitorError(
+            f"Unexpected Early Gate comment response for {leader_pr_url}."
+        )
     # Keep compatibility with test doubles and gh versions that return a
     # single page array even when --slurp is present.
     comments = [comment for page in pages for comment in page] if pages and all(

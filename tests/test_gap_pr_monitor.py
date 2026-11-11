@@ -3151,6 +3151,16 @@ def test_early_gate_comment_already_present_flattens_paginated_pages() -> None:
     assert early_gate_comment_already_present(leader, gh_runner=gh) is True
 
 
+def test_early_gate_comment_lookup_fails_closed() -> None:
+    leader = "https://github.com/org/gap/pull/9"
+
+    def gh(args):
+        raise GhCommandError(["gh", *args], 1, "temporary GitHub error")
+
+    with pytest.raises(GapPrMonitorError, match="temporary GitHub error"):
+        early_gate_comment_already_present(leader, gh_runner=gh)
+
+
 def test_early_gate_comment_already_present_false_when_missing() -> None:
     leader = "https://github.com/org/gap/pull/9"
 
