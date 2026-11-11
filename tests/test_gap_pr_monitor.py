@@ -3139,6 +3139,28 @@ def test_early_gate_comment_already_present_detects_variants() -> None:
 
 
 # Unrelated comments must not be mistaken for an existing early-gate trigger.
+def test_early_gate_comment_already_present_flattens_paginated_pages() -> None:
+    leader = "https://github.com/org/gap/pull/9"
+    pages = json.dumps([[{"body": "unrelated"}], [{"body": "/early-gate"}]])
+
+    def gh(args):
+        assert "--paginate" in args
+        assert "--slurp" in args
+        return pages
+
+    assert early_gate_comment_already_present(leader, gh_runner=gh) is True
+
+
+def test_early_gate_comment_lookup_fails_closed() -> None:
+    leader = "https://github.com/org/gap/pull/9"
+
+    def gh(args):
+        raise GhCommandError(["gh", *args], 1, "temporary GitHub error")
+
+    with pytest.raises(GapPrMonitorError, match="temporary GitHub error"):
+        early_gate_comment_already_present(leader, gh_runner=gh)
+
+
 def test_early_gate_comment_already_present_false_when_missing() -> None:
     leader = "https://github.com/org/gap/pull/9"
 
@@ -3367,7 +3389,7 @@ def test_coordinator_early_gate_skips_duplicate_comment(
     def gh(args):
         nonlocal comment_posts
         if args[0] == "api":
-            return json.dumps(["existing-check-run"])
+            return json.dumps([[{"body": "/early-gate"}]])
         if args[:2] == ["pr", "comment"]:
             comment_posts += 1
             return ""
@@ -3387,7 +3409,7 @@ def test_coordinator_early_gate_skips_duplicate_comment(
     assert comment_posts == 0
 
 
-def test_coordinator_includes_published_leader_commit_in_trigger(
+def test_coordinator_does_not_retrigger_for_timestamp_only_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "state.json"

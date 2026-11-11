@@ -167,8 +167,10 @@ def test_hook_after_publish_and_applicable_signal(tmp_path, monkeypatch, signal,
     monkeypatch.setattr(monitor, 'should_trigger_early_gate', lambda *a: signal == 'early')
     monkeypatch.setattr(monitor, 'early_gate_concluded', lambda *a: False)
     def signal_callback(*a, **kw):
-        signal_shas.append(kw['leader_commit'])
-        assert kw['leader_commit'] == 'b' * 40
+        # The coordinator now uses the semantic child batch and comment
+        # history for idempotency; it does not pass a bookkeeping commit.
+        signal_shas.append(kw.get('leader_commit'))
+        assert 'leader_commit' not in kw
         order.append('signal')
         return True
     monkeypatch.setattr(monitor, 'post_early_gate_trigger_comment', signal_callback)
@@ -180,7 +182,7 @@ def test_hook_after_publish_and_applicable_signal(tmp_path, monkeypatch, signal,
         assert saved == monitor.load_state(published_path)
         assert kw['accepted_urls'] == accepted and kw['published_sha'] == 'b' * 40
         assert path.exists() is (not relocated)
-        assert signal_shas == ([kw['published_sha']] if signal == 'early' else [])
+        assert signal_shas == ([None] if signal == 'early' else [])
         order.append('notify')
         if broken:
             raise RuntimeError('fixture')

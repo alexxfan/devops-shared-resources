@@ -675,19 +675,36 @@ def early_gate_comment_already_present(
             )
         return bool(matches)
     endpoint = f"repos/{ref.owner}/{ref.repo}/issues/{ref.number}/comments"
+    # --slurp makes gh return one JSON array containing all pages. Without
+    # it, gh emits one array per page and json.loads() rejects the result;
+    # once a busy Leader has more than one page of comments, the existing
+    # /early-gate trigger becomes invisible and is posted again.
     try:
-        raw = run(["api", endpoint, "--paginate"])
-    except GhCommandError:
-        return False
+        raw = run(["api", endpoint, "--paginate", "--slurp"])
+    except GhCommandError as exc:
+        raise GapPrMonitorError(
+            f"Could not read Early Gate comments for {leader_pr_url}: {exc}"
+        ) from exc
     text = (raw or "").strip()
     if not text:
-        return False
+        raise GapPrMonitorError(
+            f"Empty Early Gate comment response for {leader_pr_url}."
+        )
     try:
-        comments = json.loads(text)
-    except json.JSONDecodeError:
-        return False
-    if not isinstance(comments, list):
-        return False
+        pages = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise GapPrMonitorError(
+            f"Invalid Early Gate comment response for {leader_pr_url}: {exc}"
+        ) from exc
+    if not isinstance(pages, list):
+        raise GapPrMonitorError(
+            f"Unexpected Early Gate comment response for {leader_pr_url}."
+        )
+    # Keep compatibility with test doubles and gh versions that return a
+    # single page array even when --slurp is present.
+    comments = [comment for page in pages for comment in page] if pages and all(
+        isinstance(page, list) for page in pages
+    ) else pages
     for comment in comments:
         if not isinstance(comment, dict):
             continue
@@ -1556,6 +1573,9 @@ def run_monitor_publish_and_signal(
     previous_payload = load_state(Path(state_path))
     ensure_promotion_gates(previous_payload)
     migrate_legacy_overall_status(previous_payload)
+    previous_component_build_status = get_gate_status(
+        previous_payload, GATE_COMPONENT_BUILDS
+    )
     result = run_monitor(
         state_path,
         check_name=check_name,
@@ -1606,10 +1626,17 @@ def run_monitor_publish_and_signal(
 
     if early_gate and leader_url:
         try:
+            # State publication may create a new commit for timestamp-only
+            # changes. Idempotency is based on the semantic child batch, not
+            # that bookkeeping commit: allow a repeat only when a child SHA
+            # changed or the previous build gate was not already successful.
             early_gate_comment_posted = post_early_gate_trigger_comment(
                 leader_url,
                 dry_run=dry_run,
-                leader_commit=published.sha,
+                allow_repeat=(
+                    result.child_head_changed
+                    or previous_component_build_status != GATE_STATUS_SUCCESS
+                ),
                 gh_runner=gh_runner,
             )
         except (GhCommandError, ValueError, RuntimeError) as exc:

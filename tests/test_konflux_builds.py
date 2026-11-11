@@ -372,7 +372,8 @@ def test_missing_credentials_are_an_error(monkeypatch):
 def test_creator_roundtrip_preserves_build_evidence():
     evidence = {"source": "konflux", "head-sha": SHA, "runs": [observe([run()]).to_dict()]}
     original = {"repo": "foo", "pr-url": "https://github.com/acme/foo/pull/123",
-                "pr-status": "build-failure", "builds": [], "build-observations": evidence}
+                "pr-status": "build-failure", "builds": [], "build-observations": evidence,
+                "ignore": False}
     assert StatePullRequest.from_mapping(original, index=0).to_dict() == original
 
 @pytest.mark.parametrize("konflux_status,mirror_status,expected_status", [

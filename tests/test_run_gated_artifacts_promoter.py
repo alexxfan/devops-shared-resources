@@ -293,6 +293,7 @@ def test_run_promoter_collects_prs(tmp_path: Path) -> None:
                 "pr-url": "https://github.com/rhoai-rhtap/kserve/pull/2",
                 "pr-status": "new",
                 "builds": [],
+                "ignore": False,
             }
         ]
     }
