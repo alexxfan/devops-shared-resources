@@ -352,6 +352,19 @@ def test_no_expected_build_needs_no_cluster_access():
     gate, evidence = evaluate_konflux_gate(repo=REPO, number=123, sha=SHA, expected=[])
     assert gate.outcome == "pass"
     assert evidence["runs"] == []
+    assert evidence["cel-evaluated"] is True
+
+
+def test_no_expected_build_with_failed_cel_evaluation_is_not_authoritative():
+    gate, evidence = evaluate_konflux_gate(
+        repo=REPO, number=123, sha=SHA, expected=[],
+        query_error="could not read PipelineRun configuration",
+        cel_evaluated=False,
+        cel_error="could not read PipelineRun configuration",
+    )
+    assert gate.outcome == "pending"
+    assert evidence["cel-evaluated"] is False
+    assert evidence["cel-error"] == "could not read PipelineRun configuration"
 
 
 def test_explicit_rollout_source_has_no_silent_fallback(monkeypatch):
