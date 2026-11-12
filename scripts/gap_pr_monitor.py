@@ -641,58 +641,63 @@ def provisional_payload_with_updates(
 
 
 CHILD_PRS_HEADING = "### Child PRs"
-_EMPTY_CHILD_PRS_NOTE = (
-    "_No child PRs were created (targets already up to date)._"
+_CHILD_PR_BULLET_RE = re.compile(
+    r"^(\s*[-*]\s+)\[([^\]]+)\]\((https?://[^)\s]+)\)(.*)$"
 )
 
 
-def format_leader_child_pr_line(entry: dict[str, Any]) -> str:
-    """One Leader-body bullet matching ``LeaderPRManager._default_body``."""
-    repo = str(entry.get("repo") or "").strip() or "unknown"
-    pr_url = str(entry.get("pr-url") or entry.get("pr_url") or "").strip()
-    status = str(entry.get("pr-status") or entry.get("pr_status") or "new").strip()
-    return f"- [{repo}]({pr_url}) (`{status}`)"
-
-
-def non_ignored_child_pr_lines(payload: dict[str, Any]) -> list[str]:
-    """Body bullets for children that are not ``ignore: true``.
-
-    Status text is taken as-is from state; ignored children are omitted entirely
-    so Early Gate collaborator discovery does not see them.
-    """
-    lines: list[str] = []
+def ignored_child_pr_urls(payload: dict[str, Any]) -> set[str]:
+    """PR URLs from state entries with ``ignore: true``."""
+    urls: set[str] = set()
     for entry in payload.get("pull-requests") or []:
-        if not isinstance(entry, dict) or child_entry_ignored(entry):
+        if not isinstance(entry, dict) or not child_entry_ignored(entry):
             continue
-        lines.append(format_leader_child_pr_line(entry))
-    return lines
+        url = str(entry.get("pr-url") or entry.get("pr_url") or "").strip()
+        if url:
+            urls.add(url.rstrip("/"))
+    return urls
 
 
 def render_leader_body_omit_ignored(
     body: str,
     payload: dict[str, Any],
 ) -> str:
-    """Rewrite the Leader ``### Child PRs`` section from non-ignored state entries.
+    """Drop ``ignore: true`` child links from the Leader body; touch nothing else.
 
-    Leaves the preamble (title, trigger id, state path) unchanged. Does not
-    rewrite remaining children to pending/success — only drops ignored links.
+    Remaining ``### Child PRs`` bullets keep their existing status text (usually
+    ``new``). Statuses are not rewritten from ``state.json``.
     """
-    child_lines = non_ignored_child_pr_lines(payload)
-    section_lines = [CHILD_PRS_HEADING, ""]
-    if child_lines:
-        section_lines.extend(child_lines)
-    else:
-        section_lines.append(_EMPTY_CHILD_PRS_NOTE)
-    section = "\n".join(section_lines).rstrip() + "\n"
-
     text = body if isinstance(body, str) else ""
-    heading_at = text.find(CHILD_PRS_HEADING)
-    if heading_at < 0:
-        base = text.rstrip()
-        if base:
-            return base + "\n\n" + section
-        return section
-    return text[:heading_at].rstrip() + "\n\n" + section
+    ignored = ignored_child_pr_urls(payload)
+    if not ignored or not text:
+        return text
+
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    in_child_section = False
+    changed = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(CHILD_PRS_HEADING):
+            in_child_section = True
+            out.append(line)
+            continue
+        if in_child_section and stripped.startswith("### ") and not stripped.startswith(
+            CHILD_PRS_HEADING
+        ):
+            in_child_section = False
+        if in_child_section:
+            match = _CHILD_PR_BULLET_RE.match(line.rstrip("\n"))
+            if match:
+                url = match.group(3).rstrip("/")
+                if url in ignored:
+                    changed = True
+                    continue
+        out.append(line)
+
+    if not changed:
+        return text
+    return "".join(out)
 
 
 def fetch_leader_pr_body(
@@ -758,11 +763,10 @@ def sync_leader_body_omit_ignored(
     dry_run: bool = False,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> bool:
-    """Omit ``ignore: true`` children from the Leader body; return True if edited.
+    """Drop ``ignore: true`` child links from the Leader body; return True if edited.
 
-    Reads full ``state.json`` payload, rebuilds ``### Child PRs`` from non-ignored
-    entries only, and updates the PR description when it differs. Runs before
-    ``/early-gate`` so collaborator discovery matches gating.
+    Only removes those bullets from the existing PR description. Does not rewrite
+    remaining status labels. Runs before ``/early-gate``.
     """
     current = fetch_leader_pr_body(leader_pr_url, gh_runner=gh_runner)
     desired = render_leader_body_omit_ignored(current, payload)
@@ -1751,9 +1755,8 @@ def run_monitor_publish_and_signal(
     ensure_promotion_gates(state_payload)
     migrate_legacy_overall_status(state_payload)
 
-    # Drop ignore:true children from the Leader body before /early-gate so EG
-    # collaborator discovery matches component-builds gating. Status labels on
-    # remaining bullets stay as recorded in state (no pending rewrite).
+    # Drop ignore:true child links from the Leader body before /early-gate.
+    # Do not rewrite remaining bullet status text.
     if leader_url:
         try:
             sync_leader_body_omit_ignored(

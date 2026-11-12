@@ -3606,21 +3606,22 @@ def test_run_monitor_greens_children_when_overall_already_success(
     assert holder["u"].posts[0][:2] == (only, "success")
 
 
-def test_render_leader_body_omit_ignored_drops_ignored_keeps_status() -> None:
+def test_render_leader_body_omit_ignored_drops_ignored_keeps_existing_status() -> None:
+    """Only drop ignored links; never rewrite remaining (`new`) from state success."""
     body = (
         "## Gated Artifacts Promoter leader\n\n"
         "- Trigger ID: `gap-test`\n"
         "- State file: `GAP Leaders/2026-11-12_gap-test/state.json`\n\n"
         "### Child PRs\n\n"
         "- [keep](https://github.com/org/keep/pull/1) (`new`)\n"
-        "- [drop](https://github.com/org/drop/pull/2) (`build-failure`)\n"
+        "- [drop](https://github.com/org/drop/pull/2) (`new`)\n"
     )
     payload = {
         "pull-requests": [
             {
                 "repo": "keep",
                 "pr-url": "https://github.com/org/keep/pull/1",
-                "pr-status": "new",
+                "pr-status": "success",
                 "ignore": False,
                 "builds": [],
             },
@@ -3637,11 +3638,11 @@ def test_render_leader_body_omit_ignored_drops_ignored_keeps_status() -> None:
     assert "### Child PRs" in rendered
     assert "- [keep](https://github.com/org/keep/pull/1) (`new`)" in rendered
     assert "drop" not in rendered
-    assert "pending" not in rendered
+    assert "success" not in rendered
     assert "Trigger ID: `gap-test`" in rendered
 
 
-def test_render_leader_body_omit_ignored_all_ignored_uses_empty_note() -> None:
+def test_render_leader_body_omit_ignored_all_ignored_leaves_empty_section() -> None:
     body = "## Leader\n\n### Child PRs\n\n- [a](https://github.com/org/a/pull/1) (`new`)\n"
     payload = {
         "pull-requests": [
@@ -3655,16 +3656,17 @@ def test_render_leader_body_omit_ignored_all_ignored_uses_empty_note() -> None:
         ]
     }
     rendered = render_leader_body_omit_ignored(body, payload)
-    assert "_No child PRs were created (targets already up to date)._" in rendered
+    assert "### Child PRs" in rendered
     assert "github.com/org/a" not in rendered
+    assert "(`new`)" not in rendered
 
 
 def test_sync_leader_body_omit_ignored_edits_when_changed() -> None:
     calls: list[list[str]] = []
     body = (
         "## Leader\n\n### Child PRs\n\n"
-        "- [keep](https://github.com/org/keep/pull/1) (`success`)\n"
-        "- [drop](https://github.com/org/drop/pull/2) (`build-failure`)\n"
+        "- [keep](https://github.com/org/keep/pull/1) (`new`)\n"
+        "- [drop](https://github.com/org/drop/pull/2) (`new`)\n"
     )
     payload = {
         "pull-requests": [
@@ -3701,8 +3703,9 @@ def test_sync_leader_body_omit_ignored_edits_when_changed() -> None:
     assert any(c[:2] == ["pr", "edit"] for c in calls)
     edit = next(c for c in calls if c[:2] == ["pr", "edit"])
     edited_body = edit[edit.index("--body") + 1]
-    assert "- [keep](https://github.com/org/keep/pull/1) (`success`)" in edited_body
+    assert "- [keep](https://github.com/org/keep/pull/1) (`new`)" in edited_body
     assert "drop" not in edited_body
+    assert "success" not in edited_body
 
 
 def test_sync_leader_body_omit_ignored_noop_when_already_trimmed() -> None:
@@ -3715,7 +3718,7 @@ def test_sync_leader_body_omit_ignored_noop_when_already_trimmed() -> None:
             {
                 "repo": "keep",
                 "pr-url": "https://github.com/org/keep/pull/1",
-                "pr-status": "new",
+                "pr-status": "success",
                 "ignore": False,
                 "builds": [],
             },

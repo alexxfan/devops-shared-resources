@@ -169,8 +169,8 @@ With `--publish-state`, ordering is: evaluate children → write `state.json` �
 commit/push → sync Leader PR body → then, when a Leader PR URL is provided
 (`GAP_LEADER_PR_URL` / `--leader-pr-url`):
 
-- rewrite `### Child PRs` so children with `ignore: true` are omitted (remaining
-  bullets keep their existing status text; no pending rewrite)
+- drop `### Child PRs` bullets whose child has `ignore: true` (other bullets and
+  their status text are left unchanged)
 - `early-gate-triggered` → comment `/early-gate` on that Leader (idempotent)
 - `success` or `failure` → post `gated artifacts promoter` = **success** on the
   **published** Leader head SHA (RHAI-8079)
