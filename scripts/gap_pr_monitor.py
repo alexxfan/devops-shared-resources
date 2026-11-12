@@ -92,6 +92,7 @@ from lib.gap_pr_gates import (
     expected_builds_for_pr,
 )
 from lib.github_check_runs import CheckQueryError, github_api_json, list_check_runs
+from lib.github_cli import run_gh as execute_gh
 from lib.pr_status_updater import (
     GhCommandError,
     PRStatusUpdater,
@@ -756,20 +757,8 @@ def post_early_gate_trigger_comment(
 
 
 def _run_gh(args: Sequence[str]) -> str:
-    command = ["gh", *args]
-    try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError as exc:
-        raise GhCommandError(command, 127, "gh executable not found") from exc
-    if completed.returncode != 0:
-        output = (completed.stderr or completed.stdout or "").strip()
-        raise GhCommandError(command, completed.returncode, output)
-    return completed.stdout
+    """Run a GitHub CLI command using the shared transient-retry policy."""
+    return execute_gh(args)
 
 
 def fetch_pr_merge_info(
