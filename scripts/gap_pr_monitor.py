@@ -640,6 +640,134 @@ def provisional_payload_with_updates(
     return probe
 
 
+CHILD_PRS_HEADING = "### Child PRs"
+_EMPTY_CHILD_PRS_NOTE = (
+    "_No child PRs were created (targets already up to date)._"
+)
+
+
+def format_leader_child_pr_line(entry: dict[str, Any]) -> str:
+    """One Leader-body bullet matching ``LeaderPRManager._default_body``."""
+    repo = str(entry.get("repo") or "").strip() or "unknown"
+    pr_url = str(entry.get("pr-url") or entry.get("pr_url") or "").strip()
+    status = str(entry.get("pr-status") or entry.get("pr_status") or "new").strip()
+    return f"- [{repo}]({pr_url}) (`{status}`)"
+
+
+def non_ignored_child_pr_lines(payload: dict[str, Any]) -> list[str]:
+    """Body bullets for children that are not ``ignore: true``.
+
+    Status text is taken as-is from state; ignored children are omitted entirely
+    so Early Gate collaborator discovery does not see them.
+    """
+    lines: list[str] = []
+    for entry in payload.get("pull-requests") or []:
+        if not isinstance(entry, dict) or child_entry_ignored(entry):
+            continue
+        lines.append(format_leader_child_pr_line(entry))
+    return lines
+
+
+def render_leader_body_omit_ignored(
+    body: str,
+    payload: dict[str, Any],
+) -> str:
+    """Rewrite the Leader ``### Child PRs`` section from non-ignored state entries.
+
+    Leaves the preamble (title, trigger id, state path) unchanged. Does not
+    rewrite remaining children to pending/success — only drops ignored links.
+    """
+    child_lines = non_ignored_child_pr_lines(payload)
+    section_lines = [CHILD_PRS_HEADING, ""]
+    if child_lines:
+        section_lines.extend(child_lines)
+    else:
+        section_lines.append(_EMPTY_CHILD_PRS_NOTE)
+    section = "\n".join(section_lines).rstrip() + "\n"
+
+    text = body if isinstance(body, str) else ""
+    heading_at = text.find(CHILD_PRS_HEADING)
+    if heading_at < 0:
+        base = text.rstrip()
+        if base:
+            return base + "\n\n" + section
+        return section
+    return text[:heading_at].rstrip() + "\n\n" + section
+
+
+def fetch_leader_pr_body(
+    leader_pr_url: str,
+    *,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> str:
+    """Return the current Leader PR body markdown."""
+    run = gh_runner or _run_gh
+    ref = parse_pr_url(leader_pr_url)
+    raw = run(
+        [
+            "pr",
+            "view",
+            str(ref.number),
+            "-R",
+            f"{ref.owner}/{ref.repo}",
+            "--json",
+            "body",
+            "--jq",
+            ".body // \"\"",
+        ]
+    )
+    return raw if isinstance(raw, str) else ""
+
+
+def update_leader_pr_body(
+    leader_pr_url: str,
+    body: str,
+    *,
+    dry_run: bool = False,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> None:
+    """Replace the Leader PR body via ``gh pr edit``."""
+    if dry_run:
+        print(f"[dry-run] would update Leader PR body on {leader_pr_url}")
+        return
+    run = gh_runner or _run_gh
+    ref = parse_pr_url(leader_pr_url)
+    run(
+        [
+            "pr",
+            "edit",
+            str(ref.number),
+            "-R",
+            f"{ref.owner}/{ref.repo}",
+            "--body",
+            body,
+        ]
+    )
+
+
+def sync_leader_body_omit_ignored(
+    leader_pr_url: str,
+    payload: dict[str, Any],
+    *,
+    dry_run: bool = False,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> bool:
+    """Omit ``ignore: true`` children from the Leader body; return True if edited.
+
+    Reads full ``state.json`` payload, rebuilds ``### Child PRs`` from non-ignored
+    entries only, and updates the PR description when it differs. Runs before
+    ``/early-gate`` so collaborator discovery matches gating.
+    """
+    current = fetch_leader_pr_body(leader_pr_url, gh_runner=gh_runner)
+    desired = render_leader_body_omit_ignored(current, payload)
+    if desired == current or desired.rstrip() == (current or "").rstrip():
+        return False
+    update_leader_pr_body(
+        leader_pr_url, desired, dry_run=dry_run, gh_runner=gh_runner
+    )
+    return True
+
+
 def early_gate_comment_already_present(
     leader_pr_url: str,
     *,
@@ -1550,10 +1678,11 @@ def run_monitor_publish_and_signal(
     git_runner: Callable[..., str] | None = None,
     notification_config=None,
 ) -> MonitorResult:
-    """Coordinator: monitor → publish state → EG comment and/or Leader green.
+    """Coordinator: monitor → publish state → body sync → EG comment / summary.
 
     Ordering (RHOAIENG-97052 / RHAI-8079 / RHAI-10942):
       evaluate children → write ``promotion-gates`` → commit/push →
+      sync Leader body so ``ignore: true`` children are omitted from ``### Child PRs`` →
       if ``component-builds`` success: comment ``/early-gate`` on the Leader once;
       if required builds failed: retain the active Leader for retry/replacement;
       always (when Leader URL known): upsert failure/pending/closed summary comment.
@@ -1605,8 +1734,6 @@ def run_monitor_publish_and_signal(
 
     result = replace(result, state_path=published.state_path or result.state_path)
 
-
-
     leader_url = (leader_pr_url or "").strip() or None
     leader_status_posted = False
     early_gate_comment_posted = False
@@ -1617,6 +1744,24 @@ def run_monitor_publish_and_signal(
     state_payload = load_state(result.state_path)
     ensure_promotion_gates(state_payload)
     migrate_legacy_overall_status(state_payload)
+
+    # Drop ignore:true children from the Leader body before /early-gate so EG
+    # collaborator discovery matches component-builds gating. Status labels on
+    # remaining bullets stay as recorded in state (no pending rewrite).
+    if leader_url:
+        try:
+            sync_leader_body_omit_ignored(
+                leader_url,
+                state_payload,
+                dry_run=dry_run,
+                gh_runner=gh_runner,
+            )
+        except (GhCommandError, ValueError, RuntimeError) as exc:
+            raise GapPrMonitorError(
+                f"Failed to sync Leader PR body for ignored children on "
+                f"{leader_url}: {exc}"
+            ) from exc
+
     # /early-gate only while builds passed and EG has not finished yet.
     early_gate = should_trigger_early_gate(
         state_payload
