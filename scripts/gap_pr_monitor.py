@@ -2197,6 +2197,7 @@ def _decide_url(
     build_gate_override, observations = None, None
     if not blocking_merge and build_status_source() == "konflux":
         configuration_error = None
+        cel_evaluated = False
         try:
             if tekton_error is not None:
                 raise TriggerParseError(tekton_error)
@@ -2204,12 +2205,14 @@ def _decide_url(
                 pull_request, tekton_documents, app_slug=build_app_slug, app_id=build_app_id,
                 allowed_components=repository_components(component_repo_map, pull_request.repo),
             )
+            cel_evaluated = True
         except TriggerParseError as exc:
             expected, configuration_error = (), str(exc) or "Expected Konflux build configuration could not be verified"
         build_gate_override, observations = evaluate_konflux_gate(
             repo=f"{pull_request.owner}/{pull_request.repo}",
             number=pull_request.number, sha=pull_request.head_sha, expected=expected,
-            query_error=configuration_error,
+            query_error=configuration_error, cel_evaluated=cel_evaluated,
+            cel_error=configuration_error,
         )
 
     decision = decide_repository_pr(

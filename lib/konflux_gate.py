@@ -6,12 +6,15 @@ from lib.github_check_runs import CheckFinding, GateResult, OUTCOME_FAIL, OUTCOM
 from lib.konflux_builds import KonfluxClient, KonfluxQueryError
 
 
-def evaluate_konflux_gate(*, repo, number, sha, expected, client=None, query_error=None):
+def evaluate_konflux_gate(*, repo, number, sha, expected, client=None, query_error=None, cel_evaluated=True, cel_error=None):
     """Translate expected Konflux builds into a gate verdict and evidence receipt."""
     evidence = {"source": "konflux", "head-sha": sha, "repository": repo, "pr": number,
                 "observed-at": datetime.now(timezone.utc).isoformat(),
                 "expected-components": sorted({item.key for item in expected}),
+                "cel-evaluated": bool(cel_evaluated),
                 "runs": []}
+    if cel_error:
+        evidence["cel-error"] = str(cel_error)
     evidence["required-pipelines"] = {
         "schema": 1, "source": "revision-pinned-tekton", "repository": repo,
         "pr": number, "head-sha": sha,
