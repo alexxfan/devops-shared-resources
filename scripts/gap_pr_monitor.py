@@ -713,10 +713,16 @@ def fetch_leader_pr_body(
             "--json",
             "body",
             "--jq",
-            ".body // \"\"",
+            ".body",
         ]
     )
-    return raw if isinstance(raw, str) else ""
+    if raw is None:
+        return ""
+    text = raw if isinstance(raw, str) else str(raw)
+    # gh --jq may print a JSON null for a missing body.
+    if text.strip() in {"", "null"}:
+        return ""
+    return text
 
 
 def update_leader_pr_body(
