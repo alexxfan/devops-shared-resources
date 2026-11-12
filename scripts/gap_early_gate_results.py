@@ -42,6 +42,7 @@ from lib.gap_promotion_gates import (
     GATE_EARLY_GATE_BUILD,
     GATE_EARLY_GATE_TEST,
     GATE_STATUS_FAILURE,
+    GATE_STATUS_PENDING,
     GATE_STATUS_SUCCESS,
     LABEL_EG_BUILD_FAILED,
     LABEL_EG_BUILD_SUCCESS,
@@ -826,16 +827,41 @@ def run_early_gate_results(
     derived = derive_legacy_overall_status(payload)
 
     if new_overall is None:
-        # Persist partial promotion-gates progress (e.g. build done, test pending).
+        # Persist partial promotion-gates progress (for example, a child SHA
+        # changed while EG was running). A local save is insufficient when the
+        # merge-orchestrator is running in a fresh checkout: the next monitor
+        # cycle would lose the pending transition and may reconsider stale EG
+        # results. Publish the pending state, but never post a merge/conclusion.
+        published_sha = None
         if not dry_run:
             save_state(state_path, payload)
+            # Only publish a pending state when Stage 1 itself is pending.
+            # That is the child-SHA invalidation case. During a normal EG test
+            # wait, component-builds is still successful; publishing a
+            # bookkeeping commit there would advance the Leader SHA and make
+            # the in-flight test result look stale.
+            if publish and get_gate_status(payload, GATE_COMPONENT_BUILDS) == GATE_STATUS_PENDING:
+                assert branch is not None
+                published = publish_state(
+                    root,
+                    state_path,
+                    branch,
+                    remote=remote,
+                    dry_run=False,
+                    commit_message="Record GAP pending state after Early Gate invalidation",
+                    rebase_on_conflict=False,
+                    git_runner=git_runner,
+                    archive=False,
+                )
+                state_path = published.state_path or state_path
+                published_sha = published.sha
         return EarlyGateResultsResult(
             state_path=state_path,
             previous_overall=previous,
             overall_status=derived,
             applied=False,
             leader_status_posted=False,
-            published_sha=None,
+            published_sha=published_sha,
             dry_run=dry_run,
             reason=reason,
             eg_build_status=gate_snap.get(GATE_EARLY_GATE_BUILD),
