@@ -156,13 +156,15 @@ def test_hook_after_publish_and_applicable_signal(tmp_path, monkeypatch, signal,
     order = []
     signal_shas = []
     published_path = tmp_path / 'GAP History/unsuccessful/fixture/state.json' if relocated else path
+    source_bytes = path.read_bytes()
     def publish(*a, **kw):
         assert kw['archive'] is False  # Actual failed-batch policy remains active.
         order.append('publish')
         if relocated:
             published_path.parent.mkdir(parents=True, exist_ok=True)
-            published_path.write_bytes(path.read_bytes())
-            path.unlink()
+            published_path.write_bytes(source_bytes)
+            if path.exists():
+                path.unlink()
         return monitor.PublishResult('b' * 40, True, state_path=published_path)
     monkeypatch.setattr(monitor, 'publish_state', publish)
     monkeypatch.setattr(monitor, 'should_trigger_early_gate', lambda *a: signal == 'early')
