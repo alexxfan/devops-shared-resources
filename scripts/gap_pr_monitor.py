@@ -153,6 +153,9 @@ EARLY_GATE_COMMENT_RE = re.compile(
 EARLY_GATE_BUILD_IN_PROGRESS_LABEL = "early-gate-build-in-progress"
 EARLY_GATE_BUILD_LINK_MARKER = "<!-- gap-early-gate-build-link -->"
 EARLY_GATE_TRIGGERED_BATCH_KEY = "early-gate-triggered-batch"
+EARLY_GATE_RETRY_COUNT_KEY = "early-gate-retry-count"
+EARLY_GATE_RETRY_BATCH_KEY = "early-gate-retry-batch"
+MAX_EARLY_GATE_RETRIES = 1
 # overall-status values that allow Leader green (final).
 FINAL_OVERALL_STATUSES = frozenset(
     {OVERALL_STATUS_SUCCESS, OVERALL_STATUS_FAILURE}
@@ -878,6 +881,48 @@ def early_gate_comment_already_present(
                 continue
         return True
     return False
+
+
+def early_gate_check_state(
+    leader_pr_url: str,
+    leader_commit: str,
+    *,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> tuple[bool, bool]:
+    """Return ``(active, failed)`` for Early Gate checks on one Leader commit.
+
+    A failed Early Gate result is retryable only when no check for the current
+    Leader commit is still queued or running. Missing checks are treated as
+    inactive; the persisted failed gate remains the reason to retry.
+    """
+    run = gh_runner or _run_gh
+    ref = parse_pr_url(leader_pr_url)
+    endpoint = (
+        f"repos/{ref.owner}/{ref.repo}/commits/{leader_commit}/check-runs"
+        "?per_page=100"
+    )
+    payload = github_api_json(run, endpoint)
+    active = False
+    failed = False
+    for check in payload.get("check_runs", []) if isinstance(payload, dict) else []:
+        if not isinstance(check, dict):
+            continue
+        app = check.get("app") or {}
+        name = str(check.get("name") or "")
+        if app.get("slug") != "konflux-internal-p02" or name.split(" / ")[-1] != "early-gate-ci-build":
+            continue
+        status = str(check.get("status") or "")
+        conclusion = str(check.get("conclusion") or "")
+        if status != "completed":
+            active = True
+        elif conclusion in {"failure", "timed_out", "cancelled", "action_required"}:
+            failed = True
+    return active, failed
+
+
+def early_gate_retry_identity(batch_id: str, retry_count: int) -> str:
+    """Return a stable marker for one bounded Early Gate retry."""
+    return hashlib.sha256(f"{batch_id}:early-gate-retry:{retry_count}".encode()).hexdigest()
 
 
 def set_early_gate_build_in_progress_label(
@@ -1833,13 +1878,37 @@ def run_monitor_publish_and_signal(
     )
 
     trigger_batch = False
+    retry_early_gate = False
+    retry_batch_id = None
     trigger_payload = load_state(result.state_path)
     ensure_promotion_gates(trigger_payload)
     migrate_legacy_overall_status(trigger_payload)
     batch_id = child_batch_identity(trigger_payload)
-    if (should_trigger_early_gate(trigger_payload)
-            and not early_gate_concluded(trigger_payload)):
-        trigger_batch = trigger_payload.get(EARLY_GATE_TRIGGERED_BATCH_KEY) != batch_id
+    if should_trigger_early_gate(trigger_payload):
+        retry_count = int(trigger_payload.get(EARLY_GATE_RETRY_COUNT_KEY) or 0)
+        eg_failed = get_gate_status(trigger_payload, GATE_EARLY_GATE_BUILD) == "failure"
+        retry_candidate = eg_failed and retry_count < MAX_EARLY_GATE_RETRIES
+        if retry_candidate and leader_pr_url:
+            try:
+                leader_commit = (git_runner or (lambda args, cwd: _run_git(args, cwd=cwd)))(
+                    ["rev-parse", "HEAD"], cwd=repo_root
+                ).strip()
+                active, _failed_check = early_gate_check_state(
+                    leader_pr_url, leader_commit, gh_runner=gh_runner
+                )
+                retry_candidate = not active
+            except (GhCommandError, GapPrMonitorError, ValueError, RuntimeError, CheckQueryError):
+                # If current-run status cannot be verified, leave the batch held.
+                retry_candidate = False
+        if retry_candidate:
+            retry_count += 1
+            retry_batch_id = early_gate_retry_identity(batch_id, retry_count)
+            retry_early_gate = True
+            trigger_batch = True
+            trigger_payload[EARLY_GATE_RETRY_COUNT_KEY] = retry_count
+            trigger_payload[EARLY_GATE_RETRY_BATCH_KEY] = retry_batch_id
+        else:
+            trigger_batch = trigger_payload.get(EARLY_GATE_TRIGGERED_BATCH_KEY) != batch_id
         if trigger_batch and not dry_run:
             trigger_payload[EARLY_GATE_TRIGGERED_BATCH_KEY] = batch_id
             save_state(result.state_path, trigger_payload)
@@ -1891,9 +1960,9 @@ def run_monitor_publish_and_signal(
             ) from exc
 
     # /early-gate only while builds passed and EG has not finished yet.
-    early_gate = should_trigger_early_gate(
-        state_payload
-    ) and not early_gate_concluded(state_payload)
+    early_gate = should_trigger_early_gate(state_payload) and (
+        retry_early_gate or not early_gate_concluded(state_payload)
+    )
     # Keep MonitorResult.overall_status aligned with gates for callers/tests.
     result_overall = derive_legacy_overall_status(state_payload)
 
@@ -1911,7 +1980,7 @@ def run_monitor_publish_and_signal(
                 # idempotency; only a real child head change authorizes a new
                 # Early Gate trigger for the same Leader.
                 allow_repeat=trigger_batch,
-                batch_id=batch_id,
+                batch_id=retry_batch_id or batch_id,
                 gh_runner=gh_runner,
             )
             try:

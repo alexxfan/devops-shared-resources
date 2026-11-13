@@ -395,6 +395,12 @@ class LeaderPRManager:
                 state.early_gate_triggered_batch = previous_state.get(
                     "early-gate-triggered-batch", state.early_gate_triggered_batch
                 )
+                state.early_gate_retry_count = int(previous_state.get(
+                    "early-gate-retry-count", state.early_gate_retry_count
+                ))
+                state.early_gate_retry_batch = previous_state.get(
+                    "early-gate-retry-batch", state.early_gate_retry_batch
+                )
 
             pr_body = body or self._default_body(
                 state, trigger_id=trigger_id, state_path=state_rel

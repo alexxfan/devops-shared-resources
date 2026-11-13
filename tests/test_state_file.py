@@ -342,6 +342,26 @@ def test_build_state_preserves_early_gate_triggered_batch_identity() -> None:
     assert validate_state(state.to_dict())["early-gate-triggered-batch"] == batch
 
 
+
+def test_build_state_preserves_early_gate_retry_metadata() -> None:
+    retry_batch = "b" * 64
+    state = build_state(
+        pull_requests=[],
+        early_gate_retry_count=1,
+        early_gate_retry_batch=retry_batch,
+    )
+    payload = state.to_dict()
+    assert payload["early-gate-retry-count"] == 1
+    assert payload["early-gate-retry-batch"] == retry_batch
+    assert validate_state(payload)["early-gate-retry-batch"] == retry_batch
+
+
+def test_validate_state_rejects_invalid_early_gate_retry_metadata() -> None:
+    with pytest.raises(Exception, match="early-gate-retry-count"):
+        validate_state({"pull-requests": [], "early-gate-retry-count": -1})
+    with pytest.raises(Exception, match="early-gate-retry-batch"):
+        validate_state({"pull-requests": [], "early-gate-retry-batch": "bad"})
+
 def test_validate_state_rejects_invalid_early_gate_batch_identity() -> None:
     with pytest.raises(Exception, match="early-gate-triggered-batch"):
         validate_state(
