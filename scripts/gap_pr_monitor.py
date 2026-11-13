@@ -2031,6 +2031,7 @@ def run_monitor_publish_and_signal(
                     commit_message="Record Early Gate trigger delivery",
                     rebase_on_conflict=False,
                     git_runner=git_runner,
+                    archive=finalizing,
                 )
                 result = replace(
                     result,
