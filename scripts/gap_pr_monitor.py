@@ -1933,8 +1933,8 @@ def run_monitor_publish_and_signal(
         pending_retry = (
             trigger_payload.get(EARLY_GATE_TRIGGER_PENDING_BATCH_KEY) == batch_id
             and trigger_payload.get(EARLY_GATE_TRIGGERED_BATCH_KEY) != batch_id
-            and bool(re.fullmatch(r"[0-9a-f]{64}", pending_retry_batch))
             and retry_count > 0
+            and pending_retry_batch == early_gate_retry_identity(batch_id, retry_count)
         )
         eg_failed = get_gate_status(trigger_payload, GATE_EARLY_GATE_BUILD) == "failure"
         retry_candidate = (

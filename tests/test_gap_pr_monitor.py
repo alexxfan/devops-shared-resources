@@ -38,6 +38,7 @@ from scripts.gap_pr_monitor import (
     classify_pr,
     compute_overall_status,
     early_gate_comment_already_present,
+    early_gate_retry_identity,
     extract_pr_urls,
     extract_trigger_id_from_labels,
     fetch_pr_merge_info,
@@ -4055,9 +4056,11 @@ def test_pending_early_gate_retry_resumes_without_incrementing_budget(
         EARLY_GATE_TRIGGERED_BATCH_KEY: "d" * 64,
         EARLY_GATE_TRIGGER_PENDING_BATCH_KEY: "c" * 64,
         EARLY_GATE_RETRY_COUNT_KEY: 1,
-        "early-gate-retry-batch": "e" * 64,
         EARLY_GATE_TRIGGERED_COMMIT_KEY: "b" * 40,
     }
+    payload["early-gate-retry-batch"] = early_gate_retry_identity(
+        child_batch_identity(payload), 1
+    )
     payload[EARLY_GATE_TRIGGER_PENDING_BATCH_KEY] = child_batch_identity(payload)
     save_state(path, payload)
 
@@ -4096,7 +4099,7 @@ def test_pending_early_gate_retry_resumes_without_incrementing_budget(
         gh_runner=lambda args: json.dumps({"check_runs": []}),
     )
 
-    assert delivered == ["e" * 64]
+    assert delivered == [json.loads(path.read_text(encoding="utf-8"))["early-gate-retry-batch"]]
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved[EARLY_GATE_RETRY_COUNT_KEY] == 1
 
