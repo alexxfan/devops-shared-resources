@@ -1096,7 +1096,7 @@ def test_run_stage1_monitor_posts_leader_conclusion_status(
         assert "overall-status" not in saved_before
         gates = {g["id"]: g["status"] for g in saved_before["promotion-gates"]}
         assert gates["component-builds"] == "success"
-        return PublishResult(sha="published-sha-abc", committed=True)
+        return PublishResult(sha="a" * 40, committed=True)
 
     import scripts.gap_pr_monitor as mod
     # Restore the real publisher after this test; rollover tests exercise real Git.
@@ -1112,7 +1112,7 @@ def test_run_stage1_monitor_posts_leader_conclusion_status(
     assert result.overall_status == "early-gate-triggered"
     assert result.leader_status_posted is False
     assert result.early_gate_comment_posted is True
-    assert result.published_sha == "published-sha-abc"
+    assert result.published_sha == "a" * 40
     assert publish_calls == ["leader-branch", "leader-branch"]
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert "overall-status" not in saved
@@ -1223,7 +1223,7 @@ def test_run_stage1_monitor_three_children_all_success_posts_leader(
     )
 
     def fake_publish(repo_root, state_path, head_ref, **kwargs):
-        return PublishResult(sha="published-sha-abc", committed=True)
+        return PublishResult(sha="a" * 40, committed=True)
 
     import scripts.gap_pr_monitor as mod
     # Restore the real publisher after this test; rollover tests exercise real Git.
@@ -1246,7 +1246,7 @@ def test_run_stage1_monitor_three_children_all_success_posts_leader(
     assert gates["component-builds"] == "success"
     assert all(e["pr-status"] == "success" for e in saved["pull-requests"])
     assert saved[EARLY_GATE_TRIGGERED_BATCH_KEY] == child_batch_identity(saved)
-    assert saved[EARLY_GATE_TRIGGERED_COMMIT_KEY] == "published-sha-abc"
+    assert saved[EARLY_GATE_TRIGGERED_COMMIT_KEY] == "a" * 40
     assert EARLY_GATE_TRIGGER_PENDING_BATCH_KEY not in saved
 
 
