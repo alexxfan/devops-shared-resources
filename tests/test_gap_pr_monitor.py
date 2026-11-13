@@ -15,6 +15,8 @@ from lib.pr_status_updater import (
 )
 from scripts.gap_pr_monitor import (
     DEFERRED_CHILD_GREEN_DESCRIPTION,
+    EARLY_GATE_BUILD_IN_PROGRESS_LABEL,
+    EARLY_GATE_BUILD_LINK_MARKER,
     EARLY_GATE_COMMENT_BODY,
     LATEST_LEADER_PR_SENTINEL,
     GapPrMonitorError,
@@ -27,6 +29,7 @@ from scripts.gap_pr_monitor import (
     apply_overall_status,
     apply_pr_statuses,
     apply_success_statuses,
+    child_batch_identity,
     children_batch_concluded,
     classify_pr,
     compute_overall_status,
@@ -38,6 +41,8 @@ from scripts.gap_pr_monitor import (
     load_state,
     main,
     post_early_gate_trigger_comment,
+    set_early_gate_build_in_progress_label,
+    upsert_early_gate_build_link_comment,
     post_leader_conclusion,
     publish_state,
     record_child_head_shas,
@@ -2016,7 +2021,7 @@ def test_coordinator_posts_leader_only_after_publish(
         updater_factory=factory,
     )
     order.append("eg_done" if result.early_gate_comment_posted else "eg_missing")
-    assert order[:2] == ["save", "publish"]
+    assert order[:3] == ["save", "save", "publish"]
     assert result.leader_status_posted is False
     assert result.early_gate_comment_posted is True
     assert "eg_comment" in order
@@ -3219,6 +3224,8 @@ def test_post_early_gate_trigger_comment_allows_retrigger() -> None:
     def gh(args):
         if args[0] == "api":
             return json.dumps([{"body": "/early-gate"}])
+        if args[:2] == ["pr", "view"]:
+            return ""
         if args[:2] == ["pr", "comment"]:
             comments.append(args[args.index("--body") + 1])
             return ""
@@ -3352,7 +3359,7 @@ def test_coordinator_all_success_comments_early_gate_no_leader_green(
     assert result.overall_status == "early-gate-triggered"
     assert result.early_gate_comment_posted is True
     assert result.leader_status_posted is False
-    assert comments == [EARLY_GATE_COMMENT_BODY]
+    assert comments and comments[0].startswith(EARLY_GATE_COMMENT_BODY + "\n<!-- gap-early-gate-batch:v1 ")
     # No Leader green updater constructed on the early-gate path.
     assert "u" not in holder
 
@@ -3396,7 +3403,9 @@ def test_coordinator_early_gate_skips_duplicate_comment(
     def gh(args):
         nonlocal comment_posts
         if args[0] == "api":
-            return json.dumps([[{"body": "/early-gate"}]])
+            return json.dumps([[{"body": "/early-gate\n<!-- gap-early-gate-batch:v1 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 -->"}]])
+        if args[:2] == ["pr", "view"]:
+            return EARLY_GATE_BUILD_IN_PROGRESS_LABEL + "\n"
         if args[:2] == ["pr", "comment"]:
             comment_posts += 1
             return ""
@@ -3462,7 +3471,66 @@ def test_coordinator_does_not_retrigger_for_timestamp_only_publication(
     )
 
     assert result.early_gate_comment_posted is True
-    assert comments == [EARLY_GATE_COMMENT_BODY]
+    assert comments and comments[0].startswith(EARLY_GATE_COMMENT_BODY + "\n<!-- gap-early-gate-batch:v1 ")
+
+
+def test_coordinator_does_not_retrigger_from_stale_pending_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "state.json"
+    child = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": child,
+                    "pr-status": "success",
+                    "builds": [],
+                }
+            ],
+            "promotion-gates": [
+                {"id": "component-builds", "required": True, "status": "pending"},
+                {"id": "early-gate-build", "required": False, "status": "pending"},
+                {"id": "early-gate-test", "required": False, "status": "pending"},
+            ],
+        },
+    )
+    comment_posts = 0
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.publish_state",
+        lambda *a, **k: PublishResult(sha="published-sha-abc", committed=True),
+    )
+    _fake_child_monitor(
+        monkeypatch,
+        statuses={child: "success"},
+        overall="early-gate-triggered",
+        child_head_changed=False,
+    )
+
+    def gh(args):
+        nonlocal comment_posts
+        if args[0] == "api":
+            return json.dumps([{"body": "/early-gate\n<!-- gap-early-gate-batch:v1 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 -->"}])
+        if args[:2] == ["pr", "view"]:
+            return EARLY_GATE_BUILD_IN_PROGRESS_LABEL + "\n"
+        if args[:2] == ["pr", "comment"]:
+            comment_posts += 1
+            return ""
+        return ""
+
+    result = run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url="https://github.com/org/gap/pull/9",
+        publish=True,
+        gh_runner=gh,
+    )
+    assert result.early_gate_comment_posted is False
+    assert comment_posts == 0
 
 
 # Changed child heads must permit a fresh early-gate trigger.
@@ -3816,3 +3884,64 @@ def test_coordinator_syncs_leader_body_before_early_gate(
     )
     assert result.early_gate_comment_posted is True
     assert order == ["publish", "body_sync", "eg_comment"]
+
+
+def test_early_gate_in_progress_label_is_added_and_removed() -> None:
+    calls: list[list[str]] = []
+
+    def gh(args):
+        calls.append(list(args))
+        return ""
+
+    assert set_early_gate_build_in_progress_label(
+        "https://github.com/org/gap/pull/9", active=True, gh_runner=gh
+    ) is True
+    assert set_early_gate_build_in_progress_label(
+        "https://github.com/org/gap/pull/9", active=False, gh_runner=gh
+    ) is True
+    assert ["--add-label", EARLY_GATE_BUILD_IN_PROGRESS_LABEL] == calls[0][-2:]
+    assert ["--remove-label", EARLY_GATE_BUILD_IN_PROGRESS_LABEL] == calls[1][-2:]
+
+
+def test_upsert_early_gate_build_link_comment_records_konflux_url() -> None:
+    sha = "a" * 40
+    comments: list[list[str]] = []
+
+    def gh(args):
+        comments.append(list(args))
+        if args[0] == "api" and "/issues/9/comments" in args[1]:
+            return "[]"
+        if args[0] == "api" and "/pulls/9/commits" in args[1]:
+            return json.dumps([{"sha": sha}])
+        if args[0] == "api" and "/commits/" in args[1] and "check-runs" in args[1]:
+            return json.dumps({"check_runs": [{
+                "app": {"slug": "konflux-internal-p02"},
+                "name": "Konflux Production Internal / early-gate-ci-build",
+                "details_url": "https://konflux.example/pipelinerun/early-gate-ci-build-abc",
+                "head_sha": sha,
+            }]})
+        if args[:2] == ["pr", "comment"]:
+            return ""
+        raise AssertionError(args)
+
+    assert upsert_early_gate_build_link_comment(
+        "https://github.com/org/gap/pull/9", gh_runner=gh
+    ) is True
+    comment = next(args for args in comments if args[:2] == ["pr", "comment"])
+    body = comment[comment.index("--body") + 1]
+    assert EARLY_GATE_BUILD_LINK_MARKER in body
+    assert "early-gate-ci-build-abc" in body
+
+
+def test_child_batch_identity_tracks_nonignored_heads_only():
+    payload = {
+        "pull-requests": [
+            {"pr-url": "https://github.com/org/a/pull/1", "head-sha": "a" * 40},
+            {"pr-url": "https://github.com/org/b/pull/2", "head-sha": "b" * 40, "ignore": True},
+        ]
+    }
+    first = child_batch_identity(payload)
+    payload["pull-requests"][1]["head-sha"] = "c" * 40
+    assert child_batch_identity(payload) == first
+    payload["pull-requests"][0]["head-sha"] = "d" * 40
+    assert child_batch_identity(payload) != first

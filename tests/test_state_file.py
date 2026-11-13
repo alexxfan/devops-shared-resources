@@ -325,3 +325,28 @@ def test_find_existing_state_path(tmp_path: Path) -> None:
         == "GAP Leaders/2026-09-20_gap-abc123/state.json"
     )
     assert find_existing_state_path(tmp_path, "gap-other") is None
+
+
+def test_build_state_preserves_early_gate_triggered_batch_identity() -> None:
+    batch = "a" * 64
+    state = build_state(
+        pull_requests=[
+            {
+                "repo": "kserve",
+                "pr-url": "https://github.com/rhoai-rhtap/kserve/pull/2",
+            }
+        ],
+        early_gate_triggered_batch=batch,
+    )
+    assert state.to_dict()["early-gate-triggered-batch"] == batch
+    assert validate_state(state.to_dict())["early-gate-triggered-batch"] == batch
+
+
+def test_validate_state_rejects_invalid_early_gate_batch_identity() -> None:
+    with pytest.raises(Exception, match="early-gate-triggered-batch"):
+        validate_state(
+            {
+                "early-gate-triggered-batch": "not-a-sha256",
+                "pull-requests": [],
+            }
+        )

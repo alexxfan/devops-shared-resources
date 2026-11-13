@@ -392,6 +392,9 @@ class LeaderPRManager:
                 state.creator_outcomes = merge_outcomes(
                     previous_state.get("creator-outcomes", []), state.creator_outcomes
                 )
+                state.early_gate_triggered_batch = previous_state.get(
+                    "early-gate-triggered-batch", state.early_gate_triggered_batch
+                )
 
             pr_body = body or self._default_body(
                 state, trigger_id=trigger_id, state_path=state_rel

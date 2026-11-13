@@ -870,6 +870,13 @@ def run_early_gate_results(
 
     child_targets = child_pass_pr_urls(payload)
     child_check_state, child_desc = child_check_for_overall(new_overall)
+    if not dry_run:
+        try:
+            gpm.set_early_gate_build_in_progress_label(
+                leader_url, active=False, dry_run=False, gh_runner=gh_runner
+            )
+        except (GhCommandError, ValueError, RuntimeError) as exc:
+            print(f"WARNING: failed to remove Early Gate in-progress label: {exc}", file=sys.stderr)
 
     if dry_run:
         print(

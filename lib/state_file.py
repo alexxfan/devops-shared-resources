@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,8 @@ PR_STATUSES = frozenset(
 OVERALL_STATUS_SUCCESS = "success"
 OVERALL_STATUS_FAILURE = "failure"
 OVERALL_STATUS_EARLY_GATE_TRIGGERED = "early-gate-triggered"
+EARLY_GATE_BATCH_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+
 OVERALL_STATUSES = frozenset(
     {
         OVERALL_STATUS_SUCCESS,
@@ -182,6 +185,7 @@ class PromoterState:
     # Set when the GAP run has concluded; omitted from JSON while unset.
     overall_status: str | None = None
     creator_outcomes: list[dict[str, str]] = field(default_factory=list)
+    early_gate_triggered_batch: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -191,6 +195,8 @@ class PromoterState:
             payload["creator-outcomes"] = validate_outcomes(self.creator_outcomes)
         if self.overall_status is not None:
             payload["overall-status"] = self.overall_status
+        if self.early_gate_triggered_batch is not None:
+            payload["early-gate-triggered-batch"] = self.early_gate_triggered_batch
         return payload
 
     def to_json(self, *, indent: int = 2) -> str:
@@ -257,6 +263,7 @@ def build_state(
     prs: list[StatePullRequest] | list[dict[str, Any]] | None = None,
     overall_status: str | None = None,
     creator_outcomes: list[dict[str, str]] | None = None,
+    early_gate_triggered_batch: str | None = None,
 ) -> PromoterState:
     """Build a validated PromoterState from PR records.
 
@@ -287,10 +294,14 @@ def build_state(
         else:
             raise StateFileError(f"pull-requests[{index}] must be a mapping")
 
+    batch_id = early_gate_triggered_batch
+    if batch_id is not None and (not isinstance(batch_id, str) or not EARLY_GATE_BATCH_ID_RE.fullmatch(batch_id)):
+        raise StateFileError("early-gate-triggered-batch must be a 64-character lowercase SHA-256 hex value")
     state = PromoterState(
         pull_requests=normalized,
         overall_status=_normalize_overall_status(overall_status),
         creator_outcomes=validate_outcomes(creator_outcomes or []),
+        early_gate_triggered_batch=batch_id,
     )
     validate_state(state.to_dict())
     return state
@@ -329,6 +340,11 @@ def validate_state(data: Any) -> dict[str, Any]:
     )
     if overall is not None:
         normalized["overall-status"] = overall
+    batch_id = data.get("early-gate-triggered-batch")
+    if batch_id is not None:
+        if not isinstance(batch_id, str) or not EARLY_GATE_BATCH_ID_RE.fullmatch(batch_id):
+            raise StateFileError("early-gate-triggered-batch must be a 64-character lowercase SHA-256 hex value")
+        normalized["early-gate-triggered-batch"] = batch_id
     if LIFECYCLE_KEY in data:
         try:
             retired_outcome(data)
