@@ -18,6 +18,10 @@ from scripts.gap_pr_monitor import (
     EARLY_GATE_BUILD_IN_PROGRESS_LABEL,
     EARLY_GATE_BUILD_LINK_MARKER,
     EARLY_GATE_COMMENT_BODY,
+    EARLY_GATE_TRIGGERED_BATCH_KEY,
+    EARLY_GATE_TRIGGERED_COMMIT_KEY,
+    EARLY_GATE_TRIGGER_PENDING_BATCH_KEY,
+    EARLY_GATE_RETRY_COUNT_KEY,
     LATEST_LEADER_PR_SENTINEL,
     GapPrMonitorError,
     MonitorResult,
@@ -1109,7 +1113,7 @@ def test_run_stage1_monitor_posts_leader_conclusion_status(
     assert result.leader_status_posted is False
     assert result.early_gate_comment_posted is True
     assert result.published_sha == "published-sha-abc"
-    assert publish_calls == ["leader-branch"]
+    assert publish_calls == ["leader-branch", "leader-branch"]
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert "overall-status" not in saved
     gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
@@ -1241,6 +1245,9 @@ def test_run_stage1_monitor_three_children_all_success_posts_leader(
     gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
     assert gates["component-builds"] == "success"
     assert all(e["pr-status"] == "success" for e in saved["pull-requests"])
+    assert saved[EARLY_GATE_TRIGGERED_BATCH_KEY] == child_batch_identity(saved)
+    assert saved[EARLY_GATE_TRIGGERED_COMMIT_KEY] == "published-sha-abc"
+    assert EARLY_GATE_TRIGGER_PENDING_BATCH_KEY not in saved
 
 
 # A stage-one mixed failure must not bypass the coordinator's Leader-publication boundary.
@@ -3883,7 +3890,7 @@ def test_coordinator_syncs_leader_body_before_early_gate(
         updater_factory=lambda **kw: FakeUpdater(**kw),
     )
     assert result.early_gate_comment_posted is True
-    assert order == ["publish", "body_sync", "eg_comment"]
+    assert order == ["publish", "body_sync", "eg_comment", "publish"]
 
 
 def test_early_gate_in_progress_label_is_added_and_removed() -> None:
@@ -3945,3 +3952,83 @@ def test_child_batch_identity_tracks_nonignored_heads_only():
     assert child_batch_identity(payload) == first
     payload["pull-requests"][0]["head-sha"] = "d" * 40
     assert child_batch_identity(payload) != first
+
+
+def _retryable_early_gate_state(path: Path, *, commit: str = "b" * 40) -> str:
+    child = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    payload = {
+        "pull-requests": [{
+            "repo": "kserve-branch",
+            "pr-url": child,
+            "pr-status": "success",
+            "head-sha": "a" * 40,
+            "builds": [],
+        }],
+        "promotion-gates": [
+            {"id": "component-builds", "required": True, "status": "success"},
+            {"id": "early-gate-build", "required": False, "status": "failure"},
+            {"id": "early-gate-test", "required": False, "status": "pending"},
+        ],
+        EARLY_GATE_TRIGGERED_COMMIT_KEY: commit,
+    }
+    payload[EARLY_GATE_TRIGGERED_BATCH_KEY] = child_batch_identity(payload)
+    save_state(path, payload)
+    return child
+
+
+def test_monitor_only_run_does_not_consume_early_gate_retry_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.json"
+    child = _retryable_early_gate_state(path)
+    _fake_child_monitor(
+        monkeypatch,
+        statuses={child: "success"},
+        overall="early-gate-triggered",
+    )
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.early_gate_check_state",
+        lambda *args, **kwargs: (False, True),
+    )
+
+    run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url="https://github.com/org/gap/pull/9",
+        publish=False,
+        gh_runner=lambda args: json.dumps({"check_runs": []}),
+    )
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved.get(EARLY_GATE_RETRY_COUNT_KEY, 0) == 0
+    assert EARLY_GATE_TRIGGER_PENDING_BATCH_KEY not in saved
+
+
+def test_early_gate_retry_checks_the_commit_that_received_the_trigger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.json"
+    child = _retryable_early_gate_state(path, commit="d" * 40)
+    _fake_child_monitor(
+        monkeypatch,
+        statuses={child: "success"},
+        overall="early-gate-triggered",
+    )
+    checked: list[str] = []
+
+    def check(_leader: str, commit: str, **kwargs):
+        checked.append(commit)
+        return True, False
+
+    monkeypatch.setattr("scripts.gap_pr_monitor.early_gate_check_state", check)
+    run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url="https://github.com/org/gap/pull/9",
+        publish=False,
+        gh_runner=lambda args: json.dumps({"check_runs": []}),
+    )
+
+    assert checked == ["d" * 40]

@@ -153,6 +153,8 @@ EARLY_GATE_COMMENT_RE = re.compile(
 EARLY_GATE_BUILD_IN_PROGRESS_LABEL = "early-gate-build-in-progress"
 EARLY_GATE_BUILD_LINK_MARKER = "<!-- gap-early-gate-build-link -->"
 EARLY_GATE_TRIGGERED_BATCH_KEY = "early-gate-triggered-batch"
+EARLY_GATE_TRIGGERED_COMMIT_KEY = "early-gate-triggered-commit"
+EARLY_GATE_TRIGGER_PENDING_BATCH_KEY = "early-gate-trigger-pending-batch"
 EARLY_GATE_RETRY_COUNT_KEY = "early-gate-retry-count"
 EARLY_GATE_RETRY_BATCH_KEY = "early-gate-retry-batch"
 MAX_EARLY_GATE_RETRIES = 1
@@ -1890,27 +1892,44 @@ def run_monitor_publish_and_signal(
         retry_candidate = eg_failed and retry_count < MAX_EARLY_GATE_RETRIES
         if retry_candidate and leader_pr_url:
             try:
-                leader_commit = (git_runner or (lambda args, cwd: _run_git(args, cwd=cwd)))(
-                    ["rev-parse", "HEAD"], cwd=repo_root
+                # Early Gate may have started on a Leader commit that was later
+                # superseded by a bookkeeping commit. Check the commit recorded
+                # when the trigger was delivered, not the current checkout.
+                leader_commit = str(
+                    trigger_payload.get(EARLY_GATE_TRIGGERED_COMMIT_KEY) or ""
                 ).strip()
+                if not re.fullmatch(r"[0-9a-f]{40}", leader_commit):
+                    leader_commit = (git_runner or (lambda args, cwd: _run_git(args, cwd=cwd)))(
+                        ["rev-parse", "HEAD"], cwd=repo_root
+                    ).strip()
                 active, _failed_check = early_gate_check_state(
                     leader_pr_url, leader_commit, gh_runner=gh_runner
                 )
                 retry_candidate = not active
             except (GhCommandError, GapPrMonitorError, ValueError, RuntimeError, CheckQueryError):
-                # If current-run status cannot be verified, leave the batch held.
+                # If the triggering commit's status cannot be verified, leave
+                # the batch held rather than starting a duplicate Early Gate.
                 retry_candidate = False
         if retry_candidate:
-            retry_count += 1
-            retry_batch_id = early_gate_retry_identity(batch_id, retry_count)
+            proposed_retry_count = retry_count + 1
+            retry_batch_id = early_gate_retry_identity(batch_id, proposed_retry_count)
             retry_early_gate = True
             trigger_batch = True
-            trigger_payload[EARLY_GATE_RETRY_COUNT_KEY] = retry_count
-            trigger_payload[EARLY_GATE_RETRY_BATCH_KEY] = retry_batch_id
+            # Monitor-only runs must not consume the one-shot retry budget. A
+            # publishing run persists the proposed values before its commit.
+            if publish and not dry_run:
+                trigger_payload[EARLY_GATE_RETRY_COUNT_KEY] = proposed_retry_count
+                trigger_payload[EARLY_GATE_RETRY_BATCH_KEY] = retry_batch_id
         else:
-            trigger_batch = trigger_payload.get(EARLY_GATE_TRIGGERED_BATCH_KEY) != batch_id
-        if trigger_batch and not dry_run:
-            trigger_payload[EARLY_GATE_TRIGGERED_BATCH_KEY] = batch_id
+            trigger_batch = (
+                trigger_payload.get(EARLY_GATE_TRIGGER_PENDING_BATCH_KEY) == batch_id
+                or trigger_payload.get(EARLY_GATE_TRIGGERED_BATCH_KEY) != batch_id
+            )
+        if trigger_batch and publish and not dry_run:
+            # Keep delivery authorization durable until the /early-gate
+            # comment is confirmed. The triggered key is written only after
+            # the comment succeeds below.
+            trigger_payload[EARLY_GATE_TRIGGER_PENDING_BATCH_KEY] = batch_id
             save_state(result.state_path, trigger_payload)
 
     if not publish:
@@ -1992,6 +2011,32 @@ def run_monitor_publish_and_signal(
                 )
             except (GhCommandError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
                 print(f"WARNING: failed to update Early Gate label/link: {exc}", file=sys.stderr)
+
+            if trigger_batch and not dry_run:
+                # The trigger comment is the delivery acknowledgement. Record
+                # its batch and the exact Leader commit it was sent to only
+                # after the post/check succeeded, then publish that receipt so
+                # a later poll cannot lose or repeat the authorization.
+                delivered = load_state(result.state_path)
+                delivered[EARLY_GATE_TRIGGERED_BATCH_KEY] = batch_id
+                delivered[EARLY_GATE_TRIGGERED_COMMIT_KEY] = published.sha
+                delivered.pop(EARLY_GATE_TRIGGER_PENDING_BATCH_KEY, None)
+                save_state(result.state_path, delivered)
+                published = publish_state(
+                    repo_root,
+                    result.state_path,
+                    branch,
+                    remote=remote,
+                    dry_run=False,
+                    commit_message="Record Early Gate trigger delivery",
+                    rebase_on_conflict=False,
+                    git_runner=git_runner,
+                )
+                result = replace(
+                    result,
+                    state_path=published.state_path or result.state_path,
+                    published_sha=published.sha,
+                )
         except (GhCommandError, ValueError, RuntimeError) as exc:
             raise GapPrMonitorError(
                 f"Failed to post Early Gate trigger comment on {leader_url}: {exc}"

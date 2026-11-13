@@ -186,6 +186,8 @@ class PromoterState:
     overall_status: str | None = None
     creator_outcomes: list[dict[str, str]] = field(default_factory=list)
     early_gate_triggered_batch: str | None = None
+    early_gate_triggered_commit: str | None = None
+    early_gate_trigger_pending_batch: str | None = None
     early_gate_retry_count: int = 0
     early_gate_retry_batch: str | None = None
 
@@ -199,6 +201,10 @@ class PromoterState:
             payload["overall-status"] = self.overall_status
         if self.early_gate_triggered_batch is not None:
             payload["early-gate-triggered-batch"] = self.early_gate_triggered_batch
+        if self.early_gate_triggered_commit is not None:
+            payload["early-gate-triggered-commit"] = self.early_gate_triggered_commit
+        if self.early_gate_trigger_pending_batch is not None:
+            payload["early-gate-trigger-pending-batch"] = self.early_gate_trigger_pending_batch
         if self.early_gate_retry_count:
             payload["early-gate-retry-count"] = self.early_gate_retry_count
         if self.early_gate_retry_batch is not None:
@@ -270,6 +276,8 @@ def build_state(
     overall_status: str | None = None,
     creator_outcomes: list[dict[str, str]] | None = None,
     early_gate_triggered_batch: str | None = None,
+    early_gate_triggered_commit: str | None = None,
+    early_gate_trigger_pending_batch: str | None = None,
     early_gate_retry_count: int = 0,
     early_gate_retry_batch: str | None = None,
 ) -> PromoterState:
@@ -305,6 +313,12 @@ def build_state(
     batch_id = early_gate_triggered_batch
     if batch_id is not None and (not isinstance(batch_id, str) or not EARLY_GATE_BATCH_ID_RE.fullmatch(batch_id)):
         raise StateFileError("early-gate-triggered-batch must be a 64-character lowercase SHA-256 hex value")
+    triggered_commit = early_gate_triggered_commit
+    if triggered_commit is not None and (not isinstance(triggered_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", triggered_commit)):
+        raise StateFileError("early-gate-triggered-commit must be a 40-character lowercase commit SHA")
+    pending_batch = early_gate_trigger_pending_batch
+    if pending_batch is not None and (not isinstance(pending_batch, str) or not EARLY_GATE_BATCH_ID_RE.fullmatch(pending_batch)):
+        raise StateFileError("early-gate-trigger-pending-batch must be a 64-character lowercase SHA-256 hex value")
     if not isinstance(early_gate_retry_count, int) or isinstance(early_gate_retry_count, bool) or early_gate_retry_count < 0:
         raise StateFileError("early-gate-retry-count must be a non-negative integer")
     retry_batch = early_gate_retry_batch
@@ -315,6 +329,8 @@ def build_state(
         overall_status=_normalize_overall_status(overall_status),
         creator_outcomes=validate_outcomes(creator_outcomes or []),
         early_gate_triggered_batch=batch_id,
+        early_gate_triggered_commit=triggered_commit,
+        early_gate_trigger_pending_batch=pending_batch,
         early_gate_retry_count=early_gate_retry_count,
         early_gate_retry_batch=retry_batch,
     )
@@ -360,6 +376,16 @@ def validate_state(data: Any) -> dict[str, Any]:
         if not isinstance(batch_id, str) or not EARLY_GATE_BATCH_ID_RE.fullmatch(batch_id):
             raise StateFileError("early-gate-triggered-batch must be a 64-character lowercase SHA-256 hex value")
         normalized["early-gate-triggered-batch"] = batch_id
+    triggered_commit = data.get("early-gate-triggered-commit")
+    if triggered_commit is not None:
+        if not isinstance(triggered_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", triggered_commit):
+            raise StateFileError("early-gate-triggered-commit must be a 40-character lowercase commit SHA")
+        normalized["early-gate-triggered-commit"] = triggered_commit
+    pending_batch = data.get("early-gate-trigger-pending-batch")
+    if pending_batch is not None:
+        if not isinstance(pending_batch, str) or not EARLY_GATE_BATCH_ID_RE.fullmatch(pending_batch):
+            raise StateFileError("early-gate-trigger-pending-batch must be a 64-character lowercase SHA-256 hex value")
+        normalized["early-gate-trigger-pending-batch"] = pending_batch
     retry_count = data.get("early-gate-retry-count", 0)
     if not isinstance(retry_count, int) or isinstance(retry_count, bool) or retry_count < 0:
         raise StateFileError("early-gate-retry-count must be a non-negative integer")

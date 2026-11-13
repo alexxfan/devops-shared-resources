@@ -327,8 +327,10 @@ def test_find_existing_state_path(tmp_path: Path) -> None:
     assert find_existing_state_path(tmp_path, "gap-other") is None
 
 
-def test_build_state_preserves_early_gate_triggered_batch_identity() -> None:
+def test_build_state_preserves_early_gate_trigger_metadata() -> None:
     batch = "a" * 64
+    commit = "b" * 40
+    pending = "c" * 64
     state = build_state(
         pull_requests=[
             {
@@ -337,9 +339,16 @@ def test_build_state_preserves_early_gate_triggered_batch_identity() -> None:
             }
         ],
         early_gate_triggered_batch=batch,
+        early_gate_triggered_commit=commit,
+        early_gate_trigger_pending_batch=pending,
     )
-    assert state.to_dict()["early-gate-triggered-batch"] == batch
-    assert validate_state(state.to_dict())["early-gate-triggered-batch"] == batch
+    payload = state.to_dict()
+    assert payload["early-gate-triggered-batch"] == batch
+    assert payload["early-gate-triggered-commit"] == commit
+    assert payload["early-gate-trigger-pending-batch"] == pending
+    normalized = validate_state(payload)
+    assert normalized["early-gate-triggered-commit"] == commit
+    assert normalized["early-gate-trigger-pending-batch"] == pending
 
 
 
@@ -361,6 +370,14 @@ def test_validate_state_rejects_invalid_early_gate_retry_metadata() -> None:
         validate_state({"pull-requests": [], "early-gate-retry-count": -1})
     with pytest.raises(Exception, match="early-gate-retry-batch"):
         validate_state({"pull-requests": [], "early-gate-retry-batch": "bad"})
+
+
+def test_validate_state_rejects_invalid_early_gate_trigger_metadata() -> None:
+    with pytest.raises(Exception, match="early-gate-triggered-commit"):
+        validate_state({"pull-requests": [], "early-gate-triggered-commit": "bad"})
+    with pytest.raises(Exception, match="early-gate-trigger-pending-batch"):
+        validate_state({"pull-requests": [], "early-gate-trigger-pending-batch": "bad"})
+
 
 def test_validate_state_rejects_invalid_early_gate_batch_identity() -> None:
     with pytest.raises(Exception, match="early-gate-triggered-batch"):
