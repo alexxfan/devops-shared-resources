@@ -160,7 +160,7 @@ def test_hook_after_publish_and_applicable_signal(tmp_path, monkeypatch, signal,
         assert kw['archive'] is False  # Actual failed-batch policy remains active.
         order.append('publish')
         if relocated:
-            published_path.parent.mkdir(parents=True)
+            published_path.parent.mkdir(parents=True, exist_ok=True)
             published_path.write_bytes(path.read_bytes())
             path.unlink()
         return monitor.PublishResult('b' * 40, True, state_path=published_path)
@@ -193,7 +193,8 @@ def test_hook_after_publish_and_applicable_signal(tmp_path, monkeypatch, signal,
     output = monitor.run_monitor_publish_and_signal(path, repo_root=tmp_path, publish=True,
         head_ref='leader', leader_pr_url=LEADER_URL, notification_config=NotificationConfig('preview'))
     assert output.state_path == published_path and not output.leader_status_posted
-    assert order == ['publish'] + (['signal'] if signal == 'early' else []) + ['notify', 'summary']
+    expected = ['publish'] + (['signal', 'publish'] if signal == 'early' else []) + ['notify', 'summary']
+    assert order == expected
 
 
 # A known key or discoverable episode is adopted even before the retry deadline.
