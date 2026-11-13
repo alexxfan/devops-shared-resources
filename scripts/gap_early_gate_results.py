@@ -804,11 +804,17 @@ def run_early_gate_results(
     trigger_commit = str(
         payload.get(gpm.EARLY_GATE_TRIGGERED_COMMIT_KEY) or ""
     ).strip()
-    # The receipt commit may be newer than the commit that received /early-gate.
-    # Match terminal EG comments to the recorded trigger commit while still
-    # verifying the checkout against the current Leader head above.
+    trigger_batch = payload.get(gpm.EARLY_GATE_TRIGGERED_BATCH_KEY)
+    current_batch = gpm.child_batch_identity(payload)
+    # The receipt commit may be newer than the commit that received /early-gate,
+    # but it is evidence only for the exact child batch that was delivered.
+    # A stale pending receipt must fall back to the current Leader commit.
     evidence_commit = (
-        trigger_commit if re.fullmatch(r"[0-9a-f]{40}", trigger_commit)
+        trigger_commit
+        if (
+            trigger_batch == current_batch
+            and re.fullmatch(r"[0-9a-f]{40}", trigger_commit)
+        )
         else leader_commit
     )
     if publish and not dry_run and (root / ".git").exists():
@@ -884,13 +890,12 @@ def run_early_gate_results(
     # Leader state records both the same semantic child batch and the commit
     # that received the trigger. Monitor-only/stale checkouts must not clear a
     # label that a newer Early Gate run may have set.
-    trigger_batch = payload.get(gpm.EARLY_GATE_TRIGGERED_BATCH_KEY)
     trigger_commit = payload.get(gpm.EARLY_GATE_TRIGGERED_COMMIT_KEY)
     label_owned = (
         publish
         and not dry_run
         and isinstance(trigger_batch, str)
-        and trigger_batch == gpm.child_batch_identity(payload)
+        and trigger_batch == current_batch
         and isinstance(trigger_commit, str)
         and trigger_commit == evidence_commit
     )

@@ -927,6 +927,45 @@ def early_gate_retry_identity(batch_id: str, retry_count: int) -> str:
     return hashlib.sha256(f"{batch_id}:early-gate-retry:{retry_count}".encode()).hexdigest()
 
 
+def recover_early_gate_trigger_commit(
+    repo_root: Path,
+    state_path: Path,
+    batch_id: str,
+    *,
+    git_runner: Callable[..., str] | None = None,
+) -> str | None:
+    """Find the first published commit that recorded a pending trigger batch.
+
+    This recovers the original trigger commit after the comment was posted but
+    receipt publication failed, leaving only the pending marker on the Leader.
+    """
+    run = git_runner or (lambda args, cwd: _run_git(args, cwd=cwd))
+    relative = state_path_for_output(state_path, repo_root=repo_root)
+    try:
+        commits = run(
+            ["rev-list", "--reverse", "HEAD", "--", relative],
+            cwd=repo_root,
+        ).splitlines()
+    except (GapPrMonitorError, ValueError, RuntimeError):
+        return None
+    for raw_commit in commits:
+        commit = str(raw_commit).strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            continue
+        try:
+            raw_state = run(["show", f"{commit}:{relative}"], cwd=repo_root)
+            candidate = json.loads(raw_state)
+        except (GapPrMonitorError, ValueError, RuntimeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(candidate, dict)
+            and candidate.get(EARLY_GATE_TRIGGER_PENDING_BATCH_KEY) == batch_id
+            and candidate.get(EARLY_GATE_TRIGGERED_BATCH_KEY) != batch_id
+        ):
+            return commit
+    return None
+
+
 def set_early_gate_build_in_progress_label(
     leader_pr_url: str,
     *,
@@ -1888,9 +1927,23 @@ def run_monitor_publish_and_signal(
     batch_id = child_batch_identity(trigger_payload)
     if should_trigger_early_gate(trigger_payload):
         retry_count = int(trigger_payload.get(EARLY_GATE_RETRY_COUNT_KEY) or 0)
+        pending_retry_batch = str(
+            trigger_payload.get(EARLY_GATE_RETRY_BATCH_KEY) or ""
+        ).strip()
+        pending_retry = (
+            trigger_payload.get(EARLY_GATE_TRIGGER_PENDING_BATCH_KEY) == batch_id
+            and trigger_payload.get(EARLY_GATE_TRIGGERED_BATCH_KEY) != batch_id
+            and bool(re.fullmatch(r"[0-9a-f]{64}", pending_retry_batch))
+            and retry_count > 0
+        )
         eg_failed = get_gate_status(trigger_payload, GATE_EARLY_GATE_BUILD) == "failure"
-        retry_candidate = eg_failed and retry_count < MAX_EARLY_GATE_RETRIES
-        if retry_candidate and leader_pr_url:
+        retry_candidate = (
+            not pending_retry
+            and eg_failed
+            and retry_count < MAX_EARLY_GATE_RETRIES
+        )
+        retry_ready = retry_candidate or pending_retry
+        if retry_ready and leader_pr_url:
             try:
                 # Early Gate may have started on a Leader commit that was later
                 # superseded by a bookkeeping commit. Check the commit recorded
@@ -1905,12 +1958,24 @@ def run_monitor_publish_and_signal(
                 active, _failed_check = early_gate_check_state(
                     leader_pr_url, leader_commit, gh_runner=gh_runner
                 )
-                retry_candidate = not active
+                retry_ready = not active
             except (GhCommandError, GapPrMonitorError, ValueError, RuntimeError, CheckQueryError):
                 # If the triggering commit's status cannot be verified, leave
                 # the batch held rather than starting a duplicate Early Gate.
-                retry_candidate = False
-        if retry_candidate:
+                retry_ready = False
+        if pending_retry:
+            if retry_ready:
+                # Resume the already-accounted retry without incrementing the
+                # bounded retry budget a second time.
+                retry_batch_id = pending_retry_batch
+                retry_early_gate = True
+                trigger_batch = True
+            else:
+                trigger_batch = (
+                    trigger_payload.get(EARLY_GATE_TRIGGER_PENDING_BATCH_KEY) == batch_id
+                    or trigger_payload.get(EARLY_GATE_TRIGGERED_BATCH_KEY) != batch_id
+                )
+        elif retry_candidate and retry_ready:
             proposed_retry_count = retry_count + 1
             retry_batch_id = early_gate_retry_identity(batch_id, proposed_retry_count)
             retry_early_gate = True
@@ -2019,7 +2084,20 @@ def run_monitor_publish_and_signal(
                 # a later poll cannot lose or repeat the authorization.
                 delivered = load_state(result.state_path)
                 delivered[EARLY_GATE_TRIGGERED_BATCH_KEY] = batch_id
-                delivered[EARLY_GATE_TRIGGERED_COMMIT_KEY] = published.sha
+                if early_gate_comment_posted:
+                    delivery_commit = published.sha
+                else:
+                    delivery_commit = str(
+                        delivered.get(EARLY_GATE_TRIGGERED_COMMIT_KEY) or ""
+                    ).strip()
+                    if not re.fullmatch(r"[0-9a-f]{40}", delivery_commit):
+                        delivery_commit = recover_early_gate_trigger_commit(
+                            repo_root,
+                            result.state_path,
+                            batch_id,
+                            git_runner=git_runner,
+                        ) or published.sha
+                delivered[EARLY_GATE_TRIGGERED_COMMIT_KEY] = delivery_commit
                 delivered.pop(EARLY_GATE_TRIGGER_PENDING_BATCH_KEY, None)
                 save_state(result.state_path, delivered)
                 published = publish_state(

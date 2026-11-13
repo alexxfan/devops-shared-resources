@@ -4032,3 +4032,96 @@ def test_early_gate_retry_checks_the_commit_that_received_the_trigger(
     )
 
     assert checked == ["d" * 40]
+
+
+def test_pending_early_gate_retry_resumes_without_incrementing_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.json"
+    child = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    payload = {
+        "pull-requests": [{
+            "repo": "kserve-branch",
+            "pr-url": child,
+            "pr-status": "success",
+            "head-sha": "a" * 40,
+            "builds": [],
+        }],
+        "promotion-gates": [
+            {"id": "component-builds", "required": True, "status": "success"},
+            {"id": "early-gate-build", "required": False, "status": "failure"},
+            {"id": "early-gate-test", "required": False, "status": "failure"},
+        ],
+        EARLY_GATE_TRIGGERED_BATCH_KEY: "d" * 64,
+        EARLY_GATE_TRIGGER_PENDING_BATCH_KEY: "c" * 64,
+        EARLY_GATE_RETRY_COUNT_KEY: 1,
+        "early-gate-retry-batch": "e" * 64,
+        EARLY_GATE_TRIGGERED_COMMIT_KEY: "b" * 40,
+    }
+    payload[EARLY_GATE_TRIGGER_PENDING_BATCH_KEY] = child_batch_identity(payload)
+    save_state(path, payload)
+
+    def fake_run(state_path, **kwargs):
+        return MonitorResult(
+            state_path=Path(state_path),
+            updated_urls=[], skipped_urls=[], merge_failure_urls=[], success_urls=[child],
+            dry_run=False, overall_status="failure",
+        )
+
+    monkeypatch.setattr("scripts.gap_pr_monitor.run_monitor", fake_run)
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.early_gate_check_state",
+        lambda *args, **kwargs: (False, True),
+    )
+    monkeypatch.setattr("scripts.gap_pr_monitor.sync_leader_body_omit_ignored", lambda *a, **k: False)
+    monkeypatch.setattr("scripts.gap_pr_monitor.set_early_gate_build_in_progress_label", lambda *a, **k: True)
+    monkeypatch.setattr("scripts.gap_pr_monitor.upsert_early_gate_build_link_comment", lambda *a, **k: False)
+    monkeypatch.setattr("scripts.gap_pr_monitor._post_leader_failure_summary", lambda **kwargs: None)
+    delivered: list[str] = []
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.post_early_gate_trigger_comment",
+        lambda *args, **kwargs: delivered.append(kwargs["batch_id"]) or True,
+    )
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.publish_state",
+        lambda *args, **kwargs: PublishResult(sha="f" * 40, committed=True),
+    )
+
+    run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url="https://github.com/org/gap/pull/9",
+        publish=True,
+        gh_runner=lambda args: json.dumps({"check_runs": []}),
+    )
+
+    assert delivered == ["e" * 64]
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved[EARLY_GATE_RETRY_COUNT_KEY] == 1
+
+
+def test_recover_early_gate_trigger_commit_uses_first_pending_state_commit(
+    tmp_path: Path,
+) -> None:
+    from scripts.gap_pr_monitor import recover_early_gate_trigger_commit
+
+    state_path = tmp_path / "GAP Leaders" / "2026-11-13_gap-1" / "state.json"
+    relative = "GAP Leaders/2026-11-13_gap-1/state.json"
+    batch = "a" * 64
+    commits = ["1" * 40, "2" * 40]
+    states = {
+        commits[0]: json.dumps({EARLY_GATE_TRIGGER_PENDING_BATCH_KEY: batch}),
+        commits[1]: json.dumps({EARLY_GATE_TRIGGER_PENDING_BATCH_KEY: batch}),
+    }
+
+    def git(args, cwd):
+        if args[:3] == ["rev-list", "--reverse", "HEAD"]:
+            return "\n".join(commits)
+        if args[:1] == ["show"]:
+            return states[args[1].split(":", 1)[0]]
+        raise AssertionError(args)
+
+    assert recover_early_gate_trigger_commit(
+        tmp_path, state_path, batch, git_runner=git
+    ) == commits[0]
