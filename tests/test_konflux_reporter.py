@@ -54,6 +54,17 @@ def test_pending_and_started_konflux_runs_are_linked(entry, reason):
     assert row.build_links[0].url.endswith("/pipelinerun/foo-pull-request-r1")
 
 
+@pytest.mark.parametrize("status", ["queued", "in_progress", "running"])
+def test_legacy_active_status_names_are_linked(entry, status):
+    entry["pr-status"] = "build-pending"
+    active = observe([run(status="Unknown", reason="Running")]).to_dict()
+    active["status"] = status
+    entry["build-observations"]["runs"] = [active]
+    row = reporter.build_child_row(entry)
+    assert len(row.build_links) == 1
+    assert row.build_links[0].conclusion == status
+
+
 def test_failed_rows_do_not_add_active_sibling_links(entry):
     failed = observe([run(status="False", reason="Failed")]).to_dict()
     active = observe([run(name="active", status="Unknown", reason="Running")]).to_dict()
