@@ -562,15 +562,15 @@ def build_child_row(
                 build_links = _verified_konflux_run_links(
                     evidence, head_sha, statuses=_ACTIVE_KONFLUX_STATUSES
                 )
-                retry_details = [
-                    str(record.get("component", "?")) + ": " + str(record["retry"].get("status", "unknown"))
-                    + ": " + str(record["retry"].get("reason", ""))
-                    for record in evidence.get("runs", [])
-                    if isinstance(record, dict) and isinstance(record.get("retry"), dict)
-                    and record.get("status") != "success"
-                ]
-                if retry_details:
-                    evidence_reason = "; ".join(filter(None, [evidence_reason, *retry_details]))
+            retry_details = [
+                str(record.get("component", "?")) + ": " + str(record["retry"].get("status", "unknown"))
+                + ": " + str(record["retry"].get("reason", ""))
+                for record in evidence.get("runs", [])
+                if isinstance(record, dict) and isinstance(record.get("retry"), dict)
+                and record.get("status") != "success"
+            ]
+            if retry_details:
+                evidence_reason = "; ".join(filter(None, [evidence_reason, *retry_details]))
     elif status_key in {"merge-failure", "build-pending", "new"}:
         # Merge-feasibility and legacy pending rows have no trusted Konflux
         # receipt to link. Keep the Build links cell empty so a feasibility
