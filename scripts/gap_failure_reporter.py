@@ -324,6 +324,47 @@ def select_failed_build_checks(
     return candidates[: max(0, limit)]
 
 
+_LINKABLE_KONFLUX_STATUSES = frozenset({"pending", "failure", "timed_out", "cancelled"})
+
+
+def _verified_konflux_run_links(
+    evidence: dict[str, Any],
+    head_sha: str,
+    *,
+    statuses: frozenset[str] = _LINKABLE_KONFLUX_STATUSES,
+) -> tuple[BuildCheckLink, ...]:
+    """Return unique current-head Konflux run links from persisted evidence.
+
+    Pending observations cover both queued and running PipelineRuns. Links are
+    accepted only for the configured Konflux UI host and a concrete namespace/
+    PipelineRun path, so arbitrary state text cannot become a Markdown link.
+    """
+    from urllib.parse import urlsplit
+
+    expected_host = urlsplit(os.environ.get("KONFLUX_UI_URL", DEFAULT_UI)).netloc
+    verified: list[BuildCheckLink] = []
+    seen_urls: set[str] = set()
+    for record in evidence.get("runs", []):
+        if not isinstance(record, dict) or record.get("status") not in statuses:
+            continue
+        if record.get("head_sha") != head_sha:
+            continue
+        link = str(record.get("url", "")).strip()
+        parsed = urlsplit(link)
+        if not (parsed.scheme == "https" and parsed.netloc == expected_host
+                and re.fullmatch(r"/ns/[a-z0-9.-]+/pipelinerun/[a-z0-9.-]+", parsed.path)
+                and not parsed.query and not parsed.fragment):
+            continue
+        if link in seen_urls:
+            continue
+        seen_urls.add(link)
+        name = str(record.get("name") or record.get("pipeline_name")
+                   or record.get("component") or "build").strip() or "build"
+        verified.append(BuildCheckLink(name=name, conclusion=str(record["status"]), url=link))
+    verified.sort(key=lambda link: (link.name.lower(), link.url))
+    return tuple(verified)
+
+
 def format_build_failure_reason(
     repo: str,
     pr_number: int,
@@ -492,8 +533,8 @@ def build_child_row(
         comments = list_issue_comments(pr_url, gh_runner=gh_runner)
         close_reason = extract_close_reason_from_comments(comments)
 
-    # Build links only for build-failure. merge-failure / build-pending / new:
-    # reason text only — never attach push or unrelated PR build links.
+    # Build links come from current-head Konflux evidence for failures and
+    # pending/started builds. Merge-feasibility rows remain link-free.
     status_key = (state_status or "").strip()
     evidence_reason = None
     if konflux_evidence or build_status_source() == "konflux":
@@ -512,23 +553,8 @@ def build_child_row(
                             if r.get("retry") else str(r.get("status", "unknown")))
                            for r in evidence.get("runs", []) if isinstance(r, dict) and r.get("status") != "success"]
                 evidence_reason = "Konflux: " + "; ".join(pending) if pending else "Awaiting monitor refresh"
-            if status_key == "build-failure":
-                from urllib.parse import urlsplit
-                expected_host = urlsplit(os.environ.get("KONFLUX_UI_URL", DEFAULT_UI)).netloc
-                verified = []
-                for record in evidence.get("runs", []):
-                    if not isinstance(record, dict) or record.get("status") not in {"failure", "timed_out", "cancelled"}:
-                        continue
-                    if record.get("head_sha") != head_sha:
-                        continue
-                    link = str(record.get("url", ""))
-                    parsed = urlsplit(link)
-                    if (parsed.scheme == "https" and parsed.netloc == expected_host
-                            and re.fullmatch(r"/ns/[a-z0-9.-]+/pipelinerun/[a-z0-9.-]+", parsed.path)
-                            and not parsed.query and not parsed.fragment):
-                        verified.append(BuildCheckLink(name=str(record.get("name") or record.get("component")),
-                                                       conclusion=record["status"], url=link))
-                build_links = tuple(verified)
+            if status_key in {"build-failure", "build-pending", "new"}:
+                build_links = _verified_konflux_run_links(evidence, head_sha)
                 retry_details = [
                     str(record.get("component", "?")) + ": " + str(record["retry"].get("status", "unknown"))
                     + ": " + str(record["retry"].get("reason", ""))
@@ -539,6 +565,9 @@ def build_child_row(
                 if retry_details:
                     evidence_reason = "; ".join(filter(None, [evidence_reason, *retry_details]))
     elif status_key in {"merge-failure", "build-pending", "new"}:
+        # Merge-feasibility and legacy pending rows have no trusted Konflux
+        # receipt to link. Keep the Build links cell empty so a feasibility
+        # workflow is not presented as a component PipelineRun.
         build_links: tuple[BuildCheckLink, ...] = ()
     else:
         build_links = fetch_failed_build_check_links(
