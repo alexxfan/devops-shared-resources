@@ -54,6 +54,16 @@ def test_pending_and_started_konflux_runs_are_linked(entry, reason):
     assert row.build_links[0].url.endswith("/pipelinerun/foo-pull-request-r1")
 
 
+def test_failed_rows_do_not_add_active_sibling_links(entry):
+    failed = observe([run(status="False", reason="Failed")]).to_dict()
+    active = observe([run(name="active", status="Unknown", reason="Running")]).to_dict()
+    entry["build-observations"]["runs"] = [failed, active]
+    row = reporter.build_child_row(entry)
+    assert row.state_status == "build-failure"
+    assert len(row.build_links) == 1
+    assert row.build_links[0].conclusion == "failure"
+
+
 def test_pending_konflux_links_deduplicate_and_reject_old_or_invalid_runs(entry):
     entry["pr-status"] = "build-pending"
     current = observe([run(status="Unknown", reason="Running")]).to_dict()

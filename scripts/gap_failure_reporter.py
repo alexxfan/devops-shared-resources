@@ -324,14 +324,15 @@ def select_failed_build_checks(
     return candidates[: max(0, limit)]
 
 
-_LINKABLE_KONFLUX_STATUSES = frozenset({"pending", "failure", "timed_out", "cancelled"})
+_FAILED_KONFLUX_STATUSES = frozenset({"failure", "timed_out", "cancelled"})
+_ACTIVE_KONFLUX_STATUSES = frozenset({"pending", "queued", "in_progress", "running"})
 
 
 def _verified_konflux_run_links(
     evidence: dict[str, Any],
     head_sha: str,
     *,
-    statuses: frozenset[str] = _LINKABLE_KONFLUX_STATUSES,
+    statuses: frozenset[str] = _ACTIVE_KONFLUX_STATUSES | _FAILED_KONFLUX_STATUSES,
 ) -> tuple[BuildCheckLink, ...]:
     """Return unique current-head Konflux run links from persisted evidence.
 
@@ -553,8 +554,14 @@ def build_child_row(
                             if r.get("retry") else str(r.get("status", "unknown")))
                            for r in evidence.get("runs", []) if isinstance(r, dict) and r.get("status") != "success"]
                 evidence_reason = "Konflux: " + "; ".join(pending) if pending else "Awaiting monitor refresh"
-            if status_key in {"build-failure", "build-pending", "new"}:
-                build_links = _verified_konflux_run_links(evidence, head_sha)
+            if status_key == "build-failure":
+                build_links = _verified_konflux_run_links(
+                    evidence, head_sha, statuses=_FAILED_KONFLUX_STATUSES
+                )
+            elif status_key in {"build-pending", "new"}:
+                build_links = _verified_konflux_run_links(
+                    evidence, head_sha, statuses=_ACTIVE_KONFLUX_STATUSES
+                )
                 retry_details = [
                     str(record.get("component", "?")) + ": " + str(record["retry"].get("status", "unknown"))
                     + ": " + str(record["retry"].get("reason", ""))
