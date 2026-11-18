@@ -896,9 +896,22 @@ def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira
     creator = e.get("creator-outcome") or {}
     context = {key: literal(observation.get(key)) for key in (
         "repository", "category", "source_branch", "destination_branch", "component", "pipeline", "observation_id")}
+    # Keep the Jira H1 bounded even when a component or branch name is unusually long.
+    # These values are truncated before literal escaping so an escape sequence cannot be split.
+    subject = observation.get("component") if observation.get("category") == "build" else str(observation.get("repository") or "").rsplit("/", 1)[-1]
+    if not isinstance(subject, str) or not subject.strip():
+        subject = "component"
+    source_branch = str(observation.get("source_branch") or "main").strip() or "main"
+    destination_branch = str(observation.get("destination_branch") or "stable").strip() or "stable"
     context.update(jira_environment=target.name,
+                   title_subject=literal(subject[:80]),
+                   title_source_branch=literal(source_branch[:60]),
+                   title_destination_branch=literal(destination_branch[:60]),
                    title_category=observation['category'], title_repository=observation['repository'],
                    pipeline=literal(observation.get("pipeline") or run.get("pipeline")),
+                   has_build_link=bool(e.get("build_url")),
+                   has_pr_link=bool(e.get("pr_url")),
+                   has_workflow_link=bool(e.get("workflow_url") or creator.get("workflow-url")),
                    reason=literal(e.get("reason") or run.get("reason") or creator.get("reason")),
                    note=literal(e.get("note")),
                    revision=literal(e.get("head_sha") or e.get("head-sha")), links=[],

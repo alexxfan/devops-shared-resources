@@ -703,13 +703,38 @@ def test_categories_labels_and_missing(category, setup):
 
 
 def test_jira_summary_and_triage_guidance_are_actionable():
-    obs = observation(evidence={"reason": "PipelineRunTimeout", "pr_url": "https://github.com/acme/repo/pull/1"})
+    obs = observation(evidence={"reason": "PipelineRunTimeout", "pr_url": "https://github.com/acme/repo/pull/1", "build_url": "https://build.example/run/1"})
     markdown = render_markdown(obs)
     assert "promotion for cpu from main to stable has failed due to PipelineRunTimeout." in markdown
     assert "Open the linked PipelineRun" in markdown
     assert "comment /retest on the component PR" in markdown
     assert "Keep the ticket open while the current promotion is blocked" in markdown
     assert _summary(obs) == "promotion for cpu from main to stable has failed"
+
+
+@pytest.mark.parametrize('evidence, expected', [
+    ({'reason': 'missing', 'pr_url': 'https://github.com/acme/repo/pull/1'},
+     'Open the component PR checks and confirm why the expected build did not pass.'),
+    ({'reason': 'missing'},
+     'Open the component PR and inspect its checks for the build failure.'),
+])
+def test_build_guidance_falls_back_when_build_link_is_missing(evidence, expected):
+    markdown = render_markdown(observation(evidence=evidence))
+    assert expected in markdown
+    assert 'Open the linked PipelineRun' not in markdown
+
+
+def test_conflict_guidance_uses_actual_branch_stream():
+    markdown = render_markdown(observation(category='conflict', source_branch='release/3.7',
+                                           destination_branch='stable-3.7', evidence={}))
+    assert r'merge conflict between release\/3\.7 and stable\-3\.7' in markdown
+    assert 'main-to-stable' not in markdown
+
+
+def test_feasibility_guidance_does_not_require_workflow_link():
+    markdown = render_markdown(observation(category='feasibility', component=None, evidence={}))
+    assert 'Locate the configured feasibility run in workflow history' in markdown
+    assert 'main-to-stable' not in markdown
 
 
 # Jira omits provenance boilerplate regardless of the evidence flags, without losing its

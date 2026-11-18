@@ -17,13 +17,15 @@ def test_first_h1_supplies_jira_title_with_literal_escaping(environment):
     body = notify_tools.description(obs, jira_environment=environment)
     h1 = next(node for node in body['content'] if node['type'] == 'heading' and node['attrs']['level'] == 1)
     assert title == ''.join(node['text'] for node in h1['content'])
-    assert obs['repository'] in title and obs['component'] in title
+    assert title == 'promotion for cpu_[test] from main to stable has failed'
+    assert obs['repository'] not in title
     assert not any(node.get('marks') for node in h1['content'])
 
 
-def test_overlong_rendered_title_is_rejected():
-    with pytest.raises(ValueError, match='1–250 characters'):
-        _summary(observation(repository='acme/' + 'x' * 250))
+def test_overlong_rendered_title_is_bounded():
+    title = _summary(observation(component='x' * 251, source_branch='s' * 500, destination_branch='d' * 500))
+    assert len(title) <= 250
+    assert title.startswith('promotion for ') and title.endswith(' has failed')
 
 
 def replace_template(monkeypatch, name, transform):

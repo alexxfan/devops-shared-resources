@@ -1,6 +1,5 @@
 {# The first H1 supplies the Jira summary. Keep it stable for deduplication. -#}
-{% set subject = component if category == 'build' and component else repository.split('/')[-1] -%}
-# promotion for {{ subject }} from {{ source_branch }} to {{ destination_branch }} has failed
+# promotion for {{ title_subject }} from {{ title_source_branch }} to {{ title_destination_branch }} has failed
 
 {% if jira_environment == 'stage' %}
 STAGE JIRA ENVIRONMENT
@@ -8,20 +7,23 @@ STAGE JIRA ENVIRONMENT
 
 ## Summary
 
-promotion for {{ subject }} from {{ source_branch }} to {{ destination_branch }} has failed due to {{ reason }}.
+promotion for {{ title_subject }} from {{ title_source_branch }} to {{ title_destination_branch }} has failed due to {{ reason }}.
 
 ## Triage guidance
 
 {% if category == 'build' %}
-- Open the linked PipelineRun and confirm the failure reason.
-- For a transient infrastructure failure, comment /retest on the component PR and wait for a new current-head build.
+{% if has_build_link %}- Open the linked PipelineRun and confirm the failure reason.
+{% elif has_pr_link %}- Open the component PR checks and confirm why the expected build did not pass.
+{% else %}- Open the component PR and inspect its checks for the build failure.
+{% endif %}- For a transient infrastructure failure, comment /retest on the component PR and wait for a new current-head build.
 - For a code or configuration failure, fix the component PR and allow GAP to observe the replacement build.
 {% elif category == 'conflict' %}
-- Open the component promotion PR and resolve the main-to-stable merge conflict.
+- Open the component promotion PR and resolve the merge conflict between {{ source_branch }} and {{ destination_branch }}.
 - Push the resolution and wait for the mergeability check to refresh.
 {% else %}
-- Open the linked feasibility workflow and inspect the main-to-stable sync result.
-- Fix the reported sync or workflow problem, then wait for the next feasibility result.
+{% if has_workflow_link %}- Open the linked feasibility workflow and inspect its sync result.
+{% else %}- Locate the configured feasibility run in workflow history and inspect its sync result.
+{% endif %}- Fix the reported sync or workflow problem, then wait for the next feasibility result.
 {% endif %}
 - Keep the ticket open while the current promotion is blocked; GAP will update it after a new current-head result.
 
