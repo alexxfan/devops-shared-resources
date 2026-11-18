@@ -111,16 +111,16 @@ omit the ownership layout. Python still handles section-size limits, and fallbac
 continues to omit ownership. Supplying `owning_team` when rendering the template
 directly produces a complete text preview.
 
-The first rendered H1 in the Jira template is also the issue summary. Its literal
-text must be nonempty and at most 250 characters, without inline links or code.
-The template interpolates already-escaped repository and component fields and
-applies `literal` only to the staging banner. Its Jinja `context` variable is
-`merge feasibility` for conflict/feasibility incidents, or the component for builds
-(`Unavailable` when absent). Overlong titles fail validation rather than truncate.
-Titles are presentation only:
-changing template wording or manually editing an existing Jira summary does not
-change incident identity or prevent updates, recovery, or replay suppression.
-Existing summaries are preserved; the template supplies titles for new issues.
+The first rendered H1 in the Jira template is also the issue summary. It uses
+`promotion for <subject> from <source> to <destination> has failed`; subject and
+branch values are bounded before escaping so the decoded title always stays within
+Jira's 250-character limit. Build guidance uses the PipelineRun link when present,
+then the component PR checks, and otherwise directs the operator to inspect the PR.
+Conflict and feasibility guidance uses the actual configured branch stream and only
+claims a direct workflow link when one was supplied.
+Titles do not identify incidents: the registry property and labels do. A new failure
+observation refreshes the editable summary from the current template and verifies the
+summary in the Jira readback; a mismatch is held as ambiguous rather than accepted.
 Jira descriptions link to the same ownership sources as Slack,
 including repository ownership for conflict and feasibility incidents.
 
