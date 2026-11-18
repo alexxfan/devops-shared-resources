@@ -70,7 +70,9 @@ def test_title_changes_preserve_incident_updates_recovery_and_replay(tmp_path, m
     assert updated['outbox'][0]['state'] == 'confirmed'
     assert len(jira.issues) == 1 and len(slack.calls) == 2
     assert slack.calls[-1][1]['thread_ts'] == root['ts']
-    assert jira.issues['RHAI-1']['fields']['summary'] == stored_title
+    expected_title = _summary(observation(category=category, oid='new-failure'))
+    assert jira.issues['RHAI-1']['fields']['summary'] == expected_title
+    assert expected_title != stored_title or title_change == 'template'
 
     recovered = runner('recovery').run([observation('success', 'recovered', category=category)])
     assert recovered['outbox'][0]['state'] == 'confirmed'

@@ -443,7 +443,7 @@ class JiraNotifierTests(unittest.TestCase):
     # An open-issue update must verify that the requested changes were actually stored.
     def test_update_issue_changes_open_issue_and_verifies_readback(self):
         original = self._issue("RHAI-14", summary="before", labels=["gap-staging"])
-        updated = self._issue("RHAI-14", summary="before", labels=["new-label", "gap-staging"])
+        updated = self._issue("RHAI-14", summary="after", labels=["new-label", "gap-staging"])
         updated["fields"]["description"] = original["fields"]["description"]
         session = FakeSession(
             responses={
@@ -453,11 +453,24 @@ class JiraNotifierTests(unittest.TestCase):
         )
         notifier = self._notifier(session)
 
-        result = notifier.update_issue("RHAI-14", labels=["gap-staging", "new-label"])
+        result = notifier.update_issue("RHAI-14", summary="after", labels=["gap-staging", "new-label"])
 
         self.assertEqual(result, updated)
         self.assertEqual(session.calls[1][0], "put")
+        self.assertEqual(session.calls[1][2]["json"]["fields"]["summary"], "after")
         self.assertEqual(session.calls[1][2]["json"]["fields"]["labels"], ["gap-staging", "new-label"])
+
+    def test_update_issue_rejects_summary_readback_mismatch(self):
+        original = self._issue("RHAI-15", summary="before", labels=["gap-staging"])
+        updated = self._issue("RHAI-15", summary="server-wrote-different-title", labels=["gap-staging"])
+        session = FakeSession(
+            responses={
+                "get": [FakeResponse(original, 200), FakeResponse(updated, 200)],
+                "put": [FakeResponse({}, 204)],
+            }
+        )
+        with self.assertRaises(JiraAmbiguousError):
+            self._notifier(session).update_issue("RHAI-15", summary="after")
 
     # Registry properties may update a closed issue without reopening or transitioning it.
     def test_put_notification_state_updates_closed_issue_without_reopening(self):

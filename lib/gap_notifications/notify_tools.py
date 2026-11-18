@@ -525,9 +525,9 @@ class JiraNotifier:
         elif type_id != STAGING_JIRA_ISSUE_TYPE_ID:
             raise JiraAmbiguousError("Jira creation readback did not match", key=issue["key"])
 
-    def update_issue(self, key: str, *, description: dict | None = None, labels: list[str] | None = None,
-                     add_labels: list[str] | None = None) -> dict[str, Any]:
-        """Replace labels when requested, or atomically add without snapshot replacement."""
+    def update_issue(self, key: str, *, summary: str | None = None, description: dict | None = None,
+                     labels: list[str] | None = None, add_labels: list[str] | None = None) -> dict[str, Any]:
+        """Update the supplied presentation fields, verifying every requested change."""
         if labels is not None and add_labels is not None:
             raise ValueError("labels and add_labels are mutually exclusive")
         additions = [] if add_labels is None else self._validate_labels(add_labels)
@@ -537,6 +537,8 @@ class JiraNotifier:
         if current_category == "done":
             raise JiraTerminalIssueError("Jira issue is already done and must not be mutated", key=key)
         payload_fields: dict[str, Any] = {}
+        if summary is not None:
+            payload_fields["summary"] = self._summary(summary)
         if description is not None:
             self._validate_adf(description)
             payload_fields["description"] = copy.deepcopy(description)
@@ -613,6 +615,8 @@ class JiraNotifier:
         if self._project_key(updated) != self.project:
             raise JiraAmbiguousError("Jira update readback did not match", key=updated["key"])
         if self._status_category_or_error(updated, key=updated["key"]) == "done":
+            raise JiraAmbiguousError("Jira update readback did not match", key=updated["key"])
+        if "summary" in payload_fields and updated["fields"].get("summary") != payload_fields["summary"]:
             raise JiraAmbiguousError("Jira update readback did not match", key=updated["key"])
         if "description" in payload_fields and self._adf_signature(updated["fields"].get("description")) != self._adf_signature(payload_fields["description"]):
             raise JiraAmbiguousError("Jira update readback did not match", key=updated["key"])
