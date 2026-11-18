@@ -42,6 +42,51 @@ def test_stale_or_wrong_identity_is_not_reported_as_current_failure(entry, field
     assert "awaiting monitor refresh" in row.reason
 
 
+@pytest.mark.parametrize("reason", ["PipelineRunPending", "Running"])
+def test_pending_and_started_konflux_runs_are_linked(entry, reason):
+    entry["pr-status"] = "build-pending"
+    pending = observe([run(status="Unknown", reason=reason)]).to_dict()
+    entry["build-observations"]["runs"] = [pending]
+    row = reporter.build_child_row(entry)
+    assert row.state_status == "build-pending"
+    assert len(row.build_links) == 1
+    assert row.build_links[0].conclusion == "pending"
+    assert row.build_links[0].url.endswith("/pipelinerun/foo-pull-request-r1")
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress", "running"])
+def test_legacy_active_status_names_are_linked(entry, status):
+    entry["pr-status"] = "build-pending"
+    active = observe([run(status="Unknown", reason="Running")]).to_dict()
+    active["status"] = status
+    entry["build-observations"]["runs"] = [active]
+    row = reporter.build_child_row(entry)
+    assert len(row.build_links) == 1
+    assert row.build_links[0].conclusion == status
+
+
+def test_failed_rows_do_not_add_active_sibling_links(entry):
+    failed = observe([run(status="False", reason="Failed")]).to_dict()
+    active = observe([run(name="active", status="Unknown", reason="Running")]).to_dict()
+    entry["build-observations"]["runs"] = [failed, active]
+    row = reporter.build_child_row(entry)
+    assert row.state_status == "build-failure"
+    assert len(row.build_links) == 1
+    assert row.build_links[0].conclusion == "failure"
+
+
+def test_pending_konflux_links_deduplicate_and_reject_old_or_invalid_runs(entry):
+    entry["pr-status"] = "build-pending"
+    current = observe([run(status="Unknown", reason="Running")]).to_dict()
+    duplicate = dict(current)
+    old = dict(current, head_sha="b" * 40)
+    invalid = dict(current, url="https://evil.example/ns/rhoai-tenant/pipelinerun/evil")
+    entry["build-observations"]["runs"] = [current, duplicate, old, invalid]
+    row = reporter.build_child_row(entry)
+    assert len(row.build_links) == 1
+    assert row.build_links[0].url == current["url"]
+
+
 def test_konflux_mode_does_not_fall_back_to_github_for_unmigrated_state(entry, monkeypatch):
     monkeypatch.setenv("GAP_BUILD_STATUS_SOURCE", "konflux")
     del entry["build-observations"]

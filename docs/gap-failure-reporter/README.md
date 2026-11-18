@@ -5,7 +5,11 @@ are `build-failure`, `merge-failure`, `build-pending`, `new`, or **closed**,
 including close reasons from PR comments. For `build-failure` rows, Build links
 are completed Konflux GitHub Checks whose name includes `on-pull-request`
 (never `on-push`), preferring PipelineRun URLs over Konflux UI home pages.
-`merge-failure` / `build-pending` rows leave Build links blank.
+Current-head Konflux receipts also provide links for queued or running
+(`build-pending`) PipelineRuns. Links are deduplicated and rejected when the
+receipt is for an older head or an untrusted URL. `merge-failure` rows leave
+Build links blank because they describe merge-feasibility checks rather than
+component builds.
 
 ## How it runs
 
