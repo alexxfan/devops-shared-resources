@@ -29,7 +29,7 @@ def project_tracking(observations, jira, *, trial_id, known_keys=None, jira_envi
     from lib.gap_notifications.dispatch_incidents import discussion_url, validated_property
     from lib.gap_notifications.dispatch_incidents import incident_key
     from lib.gap_notifications.dispatch_incidents import bind_trial, incident_label, validate_observations
-    from lib.gap_notifications.notify_tools import routing_target
+    from lib.gap_notifications.notify_tools import routing_target, SLACK_ALLOWED_ORIGINS
     target = routing_target(jira_environment, channel)
     bind_trial({}, trial_id, **target.options)
     validate_observations(observations, **target.options)
@@ -138,7 +138,8 @@ def tracking_cell(tracking, pr_url):
                 if url:
                     if not re.fullmatch(r"[CG][A-Z0-9]+", tracking["channel"]):
                         raise ValueError("invalid configured channel")
-                    if not re.fullmatch(r"https://redhat-internal\.slack\.com/archives/" + re.escape(tracking["channel"]) + r"/p[0-9]+", url):
+                    if not any(re.fullmatch(re.escape(origin) + r"/archives/" + re.escape(tracking["channel"]) + r"/p[0-9]+", url)
+                               for origin in SLACK_ALLOWED_ORIGINS):
                         raise ValueError("invalid discussion")
                     value += f" · [Slack thread]({url})"
                 else:
