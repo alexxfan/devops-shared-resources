@@ -140,7 +140,11 @@ failure-specific guidance. Threaded updates omit this explanation to avoid repea
 root context.
 
 Jira descriptions use the packaged `lib/gap_notifications/templates/issue.md.j2`
-with Jinja2 StrictUndefined, independent of the current directory. Feasibility
+with Jinja2 StrictUndefined, independent of the current directory. New Jira titles
+use the stable form `promotion for <component> from <source> to <destination> has failed`;
+for non-build observations, the repository name is used as the subject. The description
+starts with a plain-language failure sentence and includes category-specific triage guidance.
+Feasibility
 issues include a main-to-release dry-run explanation, distinguish it from testing
 the proposed stable PR contents, and direct failures to the feasibility job rather
 than assuming a merge conflict. They refer to the configured source branch without
@@ -177,6 +181,12 @@ existing replacement `labels` API and verifies required additions on readback.
 Description rendering and adapter ADF/label validation finish before create/update
 intent is persisted, so deterministic presentation errors do not strand write intent. Identical events remain no-ops; closed tickets are not
 backfilled. Summary/registry identity and Slack lifecycle are unchanged.
+
+## FAQ
+
+### What should I do when a GAP Jira ticket is created?
+
+Open the evidence link in the ticket and follow the triage guidance. For a component build failure, check the PipelineRun first; retry a transient infrastructure failure with `/retest` on the component PR, and fix code or configuration failures through the normal PR process. For a merge conflict, resolve the main-to-stable PR conflict. For a feasibility failure, inspect the main-to-release workflow and fix the reported sync or configuration problem. Keep the ticket open while the promotion is blocked; GAP updates the same incident after it observes a new current-head result.
 
 ## Discussion projection and read-only inspection
 

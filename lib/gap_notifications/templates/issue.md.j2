@@ -1,11 +1,29 @@
-{# The first H1 supplies the Jira summary. Keep this format compatible with existing issues. -#}
-{% set banner = 'JIRA STAGE - ' if jira_environment == 'stage' else '' -%}
-{% set context = 'merge feasibility' if category in ['feasibility', 'conflict'] else component -%}
-# {{ banner }}Promotion Gate Failure in {{ repository }} ({{ context }})
+{# The first H1 supplies the Jira summary. Keep it stable for deduplication. -#}
+{% set subject = component if category == 'build' and component else repository.split('/')[-1] -%}
+# promotion for {{ subject }} from {{ source_branch }} to {{ destination_branch }} has failed
 
 {% if jira_environment == 'stage' %}
 STAGE JIRA ENVIRONMENT
 {% endif %}
+
+## Summary
+
+promotion for {{ subject }} from {{ source_branch }} to {{ destination_branch }} has failed due to {{ reason }}.
+
+## Triage guidance
+
+{% if category == 'build' %}
+- Open the linked PipelineRun and confirm the failure reason.
+- For a transient infrastructure failure, comment /retest on the component PR and wait for a new current-head build.
+- For a code or configuration failure, fix the component PR and allow GAP to observe the replacement build.
+{% elif category == 'conflict' %}
+- Open the component promotion PR and resolve the main-to-stable merge conflict.
+- Push the resolution and wait for the mergeability check to refresh.
+{% else %}
+- Open the linked feasibility workflow and inspect the main-to-stable sync result.
+- Fix the reported sync or workflow problem, then wait for the next feasibility result.
+{% endif %}
+- Keep the ticket open while the current promotion is blocked; GAP will update it after a new current-head result.
 
 {% if category == 'feasibility' %}
 ## Main-to-release feasibility

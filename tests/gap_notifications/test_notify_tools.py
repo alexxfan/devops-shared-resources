@@ -702,6 +702,16 @@ def test_categories_labels_and_missing(category, setup):
     assert 'Unavailable' in render_markdown(obs)
 
 
+def test_jira_summary_and_triage_guidance_are_actionable():
+    obs = observation(evidence={"reason": "PipelineRunTimeout", "pr_url": "https://github.com/acme/repo/pull/1"})
+    markdown = render_markdown(obs)
+    assert "promotion for cpu from main to stable has failed due to PipelineRunTimeout." in markdown
+    assert "Open the linked PipelineRun" in markdown
+    assert "comment /retest on the component PR" in markdown
+    assert "Keep the ticket open while the current promotion is blocked" in markdown
+    assert _summary(obs) == "promotion for cpu from main to stable has failed"
+
+
 # Jira omits provenance boilerplate regardless of the evidence flags, without losing its
 # destination banner or evidence links.
 @pytest.mark.parametrize('environment', ['stage', 'production'])
