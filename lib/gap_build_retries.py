@@ -102,11 +102,17 @@ class BuildRetryManager:
         for comment in comments:
             user = comment.get("user") or {}
             body = str(comment.get("body") or "")
+            first_line = body.splitlines()[0].strip() if body.splitlines() else ""
             if user.get("login") != self.actor:
                 # Ignore human quotes/spoofed markers. A bot-issued retry with
                 # a different identity may be a changed deployment actor; stop
                 # rather than silently resetting its cross-leader budget.
-                if user.get("type") != "Bot" or not body.startswith("/retest "):
+                if user.get("type") != "Bot" or not (
+                    first_line in {"/retest", "/test"}
+                    or first_line.startswith("/retest ")
+                    or first_line.startswith("/test ")
+                    or first_line.startswith("/build-konflux ")
+                ):
                     continue
             for match in MARKER.finditer(body):
                 record = json.loads(match[1])
@@ -134,22 +140,38 @@ class BuildRetryManager:
         info = {"retrigger_count": count, "status": "not-retried"}
         if observation["status"] not in {"failure", "timed_out", "cancelled"}:
             return info, False
-        if records:
-            last = max(records, key=lambda r: _moment(r["requested_at"]))
-            if (observation["uid"] == last["run_uid"]
-                    or _moment(observation["created_at"]) < _moment(last["requested_at"])):
-                waiting = now - _moment(last["requested_at"]) < START_GRACE
-                info.update(status="build-retrigger-pending" if waiting else "retry-not-started",
-                            reason="Waiting for a new Konflux attempt" if waiting else
-                                   "Retry did not produce a newer attempt within two hours; manual investigation required",
-                            requested_at=last["requested_at"], comment_url=last.get("comment_url"))
-                return info, waiting
-        if count >= MAX_RETRIGGERS:
-            info.update(status="retry-exhausted", reason="Two automatic retries already used for this component and SHA")
-            return info, False
         pipeline = observation.get("pipeline_name", "")
         if not pipeline or not NAME.fullmatch(pipeline) or not observation.get("uid") or not observation.get("completed_at"):
             info["reason"] = "Missing verified PaC template or completed attempt identity"
+            return info, False
+        last = max(records, key=lambda r: _moment(r["requested_at"])) if records else None
+        outstanding = bool(last and (
+            observation["uid"] == last["run_uid"]
+            or _moment(observation["created_at"]) < _moment(last["requested_at"])
+        ))
+        if outstanding and now - _moment(last["requested_at"]) < START_GRACE:
+            # Preserve the grace period even when optional TaskRun lookup is
+            # unavailable. A verified persistent error still wins.
+            try:
+                details, known_tasks = failure_details(client, observation)
+            except (KonfluxQueryError, ValueError, TypeError, KeyError) as exc:
+                info.update(
+                    status="build-retrigger-pending",
+                    reason=f"Waiting for a new Konflux attempt; retry evidence unavailable: {exc}",
+                    requested_at=last["requested_at"], comment_url=last.get("comment_url"),
+                )
+                return info, True
+            if PERSISTENT.search(details):
+                info["reason"] = "Known persistent code/configuration or FIPS failure"
+                return info, False
+            info.update(
+                status="build-retrigger-pending",
+                reason="Waiting for a new Konflux attempt",
+                requested_at=last["requested_at"], comment_url=last.get("comment_url"),
+            )
+            return info, True
+        if count >= MAX_RETRIGGERS:
+            info.update(status="retry-exhausted", reason="Two automatic retries already used for this component and SHA")
             return info, False
         # Known persistent task errors take precedence even when the parent
         # eventually times out or is cancelled during cleanup.
@@ -157,6 +179,13 @@ class BuildRetryManager:
         if PERSISTENT.search(details):
             info["reason"] = "Known persistent code/configuration or FIPS failure"
             return info, False
+        if records and outstanding:
+            waiting = now - _moment(last["requested_at"]) < START_GRACE
+            info.update(status="build-retrigger-pending" if waiting else "retry-not-started",
+                        reason="Waiting for a new Konflux attempt" if waiting else
+                               "Retry did not produce a newer attempt within two hours; manual investigation required",
+                        requested_at=last["requested_at"], comment_url=last.get("comment_url"))
+            return info, waiting
         if observation["status"] == "failure":
             branch = component_push_branch(client, repo=f"{pr.owner}/{pr.repo}", component=observation["component"])
             health = recent_push_health(client, repo=f"{pr.owner}/{pr.repo}",
@@ -184,7 +213,15 @@ class BuildRetryManager:
         if self.dry_run:
             info.update(status="would-retrigger", reason=reason)
             return info, True
-        body = (f"/retest {pipeline}\n\nGAP automatic retry {count + 1}/{MAX_RETRIGGERS} "
+        # PaC targets an already-started PipelineRun with /test and its
+        # concrete resource name. Keep this receipt component-specific.
+        run_name = str(observation.get("name") or "").strip()
+        if not run_name or not NAME.fullmatch(run_name):
+            info["reason"] = "Missing verified PipelineRun name for targeted retry"
+            return info, False
+        command = f"/test {run_name}"
+        record["command"] = command
+        body = (f"{command}\n\nGAP automatic retry {count + 1}/{MAX_RETRIGGERS} "
                 f"for `{observation['component']}` at `{pr.head_sha}`. {reason}.\n\n"
                 f"<!-- gap-build-retry:v1 {json.dumps(record, sort_keys=True)} -->")
         # One external write for both command and audit receipt. Do not retry
@@ -222,7 +259,7 @@ class BuildRetryManager:
                 return True
         return False
 
-    def _retry_missing(self, pr, observation, history, pipeline, *, cel_evaluated):
+    def _retry_missing(self, pr, observation, history, pipeline, *, cel_evaluated, bare_retry_state=None):
         """Retrigger an expected component whose PR check never appeared."""
         now = self.clock()
         records = [
@@ -280,10 +317,67 @@ class BuildRetryManager:
         if self.dry_run:
             info.update(status="would-retrigger", reason=reason)
             return info, True
+        # A bare /retest reruns every eligible missing pipeline on the PR.
+        # Persist one marker per affected component in the same comment so a
+        # restart can recover the shared attempt and every component budget.
+        command = "/retest"
+        record["command"] = command
+        if bare_retry_state and bare_retry_state.get("receipt"):
+            prior = bare_retry_state["receipt"]
+            record.update(comment_url=prior["comment_url"], comment_id=prior["comment_id"],
+                          requested_at=prior["requested_at"])
+            history.append(record)
+            self.saved[pr.url] = deepcopy(history)
+            info.update(status="build-retrigger-pending", retrigger_count=count + 1,
+                        requested_at=record["requested_at"], comment_url=record["comment_url"], reason=reason)
+            return info, True
+        batch_records = [record]
+        exhausted_components = []
+        grace_components = []
+        for item in (bare_retry_state or {}).get("components", []):
+            component, item_pipeline = item["component"], item["pipeline"]
+            if component == observation["component"]:
+                continue
+            previous = [r for r in history if r["component"] == component and r["sha"] == pr.head_sha]
+            if len(previous) >= MAX_RETRIGGERS:
+                exhausted_components.append(component)
+                continue
+            if previous:
+                last = max(previous, key=lambda r: _moment(r["requested_at"]))
+                if now - _moment(last["requested_at"]) < START_GRACE:
+                    grace_components.append(component)
+                    continue
+            batch_records.append({
+                "repository": f"{pr.owner}/{pr.repo}", "pr": pr.number,
+                "component": component, "sha": pr.head_sha,
+                "pipeline": item_pipeline,
+                "run_uid": item.get("run_uid") or f"missing:{item_pipeline}:{pr.head_sha}:{len(previous) + 1}",
+                "retrigger_count": len(previous) + 1,
+                "requested_at": now.isoformat(),
+                "reason": item.get("reason") or reason, "command": command,
+            })
+        if exhausted_components:
+            info.update(
+                status="retry-exhausted",
+                reason=("Missing-build retry budget exhausted for: "
+                        + ", ".join(sorted(exhausted_components))),
+            )
+            return info, False
+        if grace_components:
+            info.update(
+                status="build-retrigger-pending",
+                reason=("Waiting for retry grace period for: "
+                        + ", ".join(sorted(grace_components))),
+            )
+            return info, True
+        marker_text = "\n".join(
+            f"<!-- gap-build-retry:v1 {json.dumps(item, sort_keys=True)} -->"
+            for item in batch_records
+        )
         body = (
-            f"/retest {pipeline}\n\nGAP automatic retry {count + 1}/{MAX_RETRIGGERS} "
+            f"{command}\n\nGAP automatic retry {count + 1}/{MAX_RETRIGGERS} "
             f"for `{observation['component']}` at `{pr.head_sha}`. {reason}.\n\n"
-            f"<!-- gap-build-retry:v1 {json.dumps(record, sort_keys=True)} -->"
+            f"{marker_text}"
         )
         try:
             response = json.loads(self.runner([
@@ -292,11 +386,15 @@ class BuildRetryManager:
             ]))
             if (response.get("user") or {}).get("login") != self.actor:
                 raise RuntimeError("Retry comment author differs from GAP_BUILD_RETRY_ACTOR; stop automatic retries")
-            record.update(comment_url=response["html_url"], comment_id=response["id"],
-                          requested_at=response["created_at"])
+            receipt = {"comment_url": response["html_url"], "comment_id": response["id"],
+                       "requested_at": response["created_at"]}
+            if bare_retry_state is not None:
+                bare_retry_state["receipt"] = receipt
+            for item in batch_records:
+                item.update(receipt)
         except (RuntimeError, ValueError, TypeError, KeyError) as exc:
             raise RuntimeError("Could not confirm retry delivery; reconcile child comments on the next poll") from exc
-        history.append(record)
+        history.extend(batch_records)
         self.saved[pr.url] = deepcopy(history)
         info.update(status="build-retrigger-pending", retrigger_count=count + 1,
                     requested_at=record["requested_at"], comment_url=record["comment_url"], reason=reason)
@@ -354,6 +452,7 @@ class BuildRetryManager:
                 name=observation.get("name") or observation.get("component"),
             ))
         awaiting = False
+        bare_retry_state = {}
         components = [r["component"] for r in evidence["runs"]]
         expected_components = set(evidence.get("expected-components") or [])
         cel_evaluated = evidence.get("cel-evaluated") is True
@@ -362,13 +461,31 @@ class BuildRetryManager:
             for item in (evidence.get("required-pipelines") or {}).get("pipelines", [])
             if isinstance(item, dict)
         }
+        bare_retry_state["components"] = []
+        seen_retry_components = set()
+        retryable_statuses = {"missing"}
+        for item in evidence["runs"]:
+            component = item.get("component")
+            if (item.get("status") in retryable_statuses and component in expected_components
+                    and components.count(component) == 1 and component not in seen_retry_components):
+                pipeline = item.get("pipeline_name") or required_pipelines.get(component, "")
+                if pipeline and NAME.fullmatch(pipeline):
+                    bare_retry_state["components"].append({
+                        "component": component, "pipeline": pipeline,
+                        # Keep missing candidates unassigned until the batch
+                        # builder can use their current per-component count.
+                        "run_uid": item.get("uid") if item.get("status") != "missing" else None,
+                        "reason": item.get("reason") or "Expected PR build was not triggered; CEL expected this component",
+                    })
+                    seen_retry_components.add(component)
         for i, observation in enumerate(evidence["runs"]):
             if observation["status"] == "missing":
                 pipeline = observation.get("pipeline_name") or required_pipelines.get(observation["component"], "")
                 if observation["component"] in expected_components and components.count(observation["component"]) == 1:
                     try:
                         info, waiting = self._retry_missing(
-                            pr, observation, history, pipeline, cel_evaluated=cel_evaluated
+                            pr, observation, history, pipeline, cel_evaluated=cel_evaluated,
+                            bare_retry_state=bare_retry_state
                         )
                     except (RetryObservationChanged, KonfluxQueryError, CheckQueryError, ValueError, TypeError, KeyError) as exc:
                         info, waiting = {"status": "retry-evidence-unavailable", "reason": str(exc)}, True
