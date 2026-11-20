@@ -101,7 +101,8 @@ def test_targeted_retry_holds_batch_and_keeps_original_build_truth(reason):
     gh, client = FakeGitHub(), FakeKonflux(attempt(reason))
     gate, receipt = apply(manager(gh, client), client)
     assert gate.outcome == "pending"
-    assert len(gh.posts) == 1 and gh.posts[0].startswith("/retest " + PIPELINE + "\n")
+    assert len(gh.posts) == 1 and gh.posts[0].startswith("/retest r1\n")
+    assert PIPELINE in gh.posts[0]
     record = receipt["runs"][0]
     assert record["status"] in {"timed_out", "cancelled"}  # EG never sees fabricated success
     assert record["retry"]["status"] == "build-retrigger-pending"

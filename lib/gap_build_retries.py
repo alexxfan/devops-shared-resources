@@ -184,7 +184,12 @@ class BuildRetryManager:
         if self.dry_run:
             info.update(status="would-retrigger", reason=reason)
             return info, True
-        body = (f"/retest {pipeline}\n\nGAP automatic retry {count + 1}/{MAX_RETRIGGERS} "
+        # PaC's targeted form takes the actual PipelineRun resource name.
+        # The expected pipeline template name is not enough; use bare /retest
+        # if this observation does not carry a concrete run name.
+        run_name = str(observation.get("name") or "").strip()
+        command = f"/retest {run_name}" if run_name else "/retest"
+        body = (f"{command}\n\nGAP automatic retry {count + 1}/{MAX_RETRIGGERS} "
                 f"for `{observation['component']}` at `{pr.head_sha}`. {reason}.\n\n"
                 f"<!-- gap-build-retry:v1 {json.dumps(record, sort_keys=True)} -->")
         # One external write for both command and audit receipt. Do not retry
