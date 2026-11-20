@@ -112,15 +112,16 @@ class BuildRetryManager:
         for comment in comments:
             user = comment.get("user") or {}
             body = str(comment.get("body") or "")
+            first_line = body.splitlines()[0].strip() if body.splitlines() else ""
             if user.get("login") != self.actor:
                 # Ignore human quotes/spoofed markers. A bot-issued retry with
                 # a different identity may be a changed deployment actor; stop
                 # rather than silently resetting its cross-leader budget.
                 if user.get("type") != "Bot" or not (
-                    body in {"/retest", "/test"}
-                    or body.startswith("/retest ")
-                    or body.startswith("/test ")
-                    or body.startswith("/build-konflux ")
+                    first_line in {"/retest", "/test"}
+                    or first_line.startswith("/retest ")
+                    or first_line.startswith("/test ")
+                    or first_line.startswith("/build-konflux ")
                 ):
                     continue
             for match in MARKER.finditer(body):
@@ -242,7 +243,7 @@ class BuildRetryManager:
                 return True
         return False
 
-    def _retry_missing(self, pr, observation, history, pipeline, *, cel_evaluated):
+    def _retry_missing(self, pr, observation, history, pipeline, *, cel_evaluated, bare_retry_state=None):
         """Retrigger an expected component whose PR check never appeared."""
         now = self.clock()
         records = [
@@ -300,6 +301,20 @@ class BuildRetryManager:
         if self.dry_run:
             info.update(status="would-retrigger", reason=reason)
             return info, True
+        # A bare /retest reruns every eligible missing pipeline on the PR.
+        # Post it once, then attach the same receipt to each affected component
+        # so every component's retry budget reflects the shared attempt.
+        command = missing_build_command(pipeline)
+        shared = bare_retry_state if command == "/retest" else None
+        if shared and shared.get("receipt"):
+            prior = shared["receipt"]
+            record.update(command=command, comment_url=prior["comment_url"],
+                          comment_id=prior["comment_id"], requested_at=prior["requested_at"])
+            history.append(record)
+            self.saved[pr.url] = deepcopy(history)
+            info.update(status="build-retrigger-pending", retrigger_count=count + 1,
+                        requested_at=record["requested_at"], comment_url=record["comment_url"], reason=reason)
+            return info, True
         # Normal component templates expose /build-konflux <component> and
         # allow `all`; special or ambiguous pipelines fall back to bare /retest.
         command = missing_build_command(pipeline)
@@ -318,6 +333,10 @@ class BuildRetryManager:
                 raise RuntimeError("Retry comment author differs from GAP_BUILD_RETRY_ACTOR; stop automatic retries")
             record.update(comment_url=response["html_url"], comment_id=response["id"],
                           requested_at=response["created_at"])
+            if shared is not None:
+                shared["receipt"] = {key: record[key] for key in (
+                    "comment_url", "comment_id", "requested_at"
+                )}
         except (RuntimeError, ValueError, TypeError, KeyError) as exc:
             raise RuntimeError("Could not confirm retry delivery; reconcile child comments on the next poll") from exc
         history.append(record)
@@ -378,6 +397,7 @@ class BuildRetryManager:
                 name=observation.get("name") or observation.get("component"),
             ))
         awaiting = False
+        bare_retry_state = {}
         components = [r["component"] for r in evidence["runs"]]
         expected_components = set(evidence.get("expected-components") or [])
         cel_evaluated = evidence.get("cel-evaluated") is True
@@ -392,7 +412,8 @@ class BuildRetryManager:
                 if observation["component"] in expected_components and components.count(observation["component"]) == 1:
                     try:
                         info, waiting = self._retry_missing(
-                            pr, observation, history, pipeline, cel_evaluated=cel_evaluated
+                            pr, observation, history, pipeline, cel_evaluated=cel_evaluated,
+                            bare_retry_state=bare_retry_state
                         )
                     except (RetryObservationChanged, KonfluxQueryError, CheckQueryError, ValueError, TypeError, KeyError) as exc:
                         info, waiting = {"status": "retry-evidence-unavailable", "reason": str(exc)}, True

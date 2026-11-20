@@ -308,6 +308,24 @@ def test_expected_missing_build_is_retriggered_when_no_github_check_exists():
     assert evidence["retry-history"][0]["run_uid"].startswith("missing:")
 
 
+def test_multiple_ambiguous_missing_components_post_one_bare_retest_and_share_receipt():
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = missing_evidence(client)
+    second = dict(evidence["runs"][0])
+    second["component"] = "odh-other-v3-7-ea-1"
+    evidence["runs"].append(second)
+    evidence["expected-components"].append(second["component"])
+    evidence["required-pipelines"]["pipelines"].append({
+        "component": second["component"], "pipeline_name": "ambiguous-pipeline"
+    })
+    gate, evidence = manager(gh, client).apply(PR, gate, evidence)
+    assert gate.outcome == "pending"
+    assert len(gh.posts) == 1
+    assert gh.posts[0].startswith("/retest\n\n")
+    assert len(evidence["retry-history"]) == 2
+    assert {r["comment_id"] for r in evidence["retry-history"]} == {1}
+
+
 def test_missing_component_posts_build_konflux_command_when_pipeline_identity_is_specific():
     gh, client = FakeGitHub(), FakeKonflux()
     gate, evidence = missing_evidence(client)
