@@ -21,6 +21,16 @@ from lib.konflux_retry_evidence import component_push_branch, failure_details, r
 
 MAX_RETRIGGERS = 2
 START_GRACE = timedelta(hours=2)
+MISSING_BUILD_PIPELINE = re.compile(r"(?P<component>[a-z0-9][a-z0-9.-]*)-on-pull-request-[0-9]+$")
+SPECIAL_BUILD_COMPONENTS = frozenset({"container-build", "multi-arch-container-build"})
+
+
+def missing_build_command(pipeline):
+    """Return the configured component trigger, or bare /retest if ambiguous."""
+    match = MISSING_BUILD_PIPELINE.fullmatch(str(pipeline or ""))
+    if not match or match.group("component") in SPECIAL_BUILD_COMPONENTS:
+        return "/retest"
+    return f"/build-konflux {match.group('component')}"
 MARKER = re.compile(r"<!-- gap-build-retry:v1 (\{[^\n]+\}) -->")
 PERSISTENT = re.compile(
     r"fips[-_ ]?check|no such file|missing (?:file|path)|cannot find (?:file|package)|"
@@ -110,6 +120,7 @@ class BuildRetryManager:
                     body in {"/retest", "/test"}
                     or body.startswith("/retest ")
                     or body.startswith("/test ")
+                    or body.startswith("/build-konflux ")
                 ):
                     continue
             for match in MARKER.finditer(body):
@@ -289,11 +300,12 @@ class BuildRetryManager:
         if self.dry_run:
             info.update(status="would-retrigger", reason=reason)
             return info, True
-        # An expected build with no PipelineRun must use the bare PaC command.
-        # `/retest <pipeline>` is for an already-registered PipelineRun and is
-        # ignored by the all-pipelines trigger path when no build was created.
+        # Normal component templates expose /build-konflux <component> and
+        # allow `all`; special or ambiguous pipelines fall back to bare /retest.
+        command = missing_build_command(pipeline)
+        record["command"] = command
         body = (
-            f"/retest\n\nGAP automatic retry {count + 1}/{MAX_RETRIGGERS} "
+            f"{command}\n\nGAP automatic retry {count + 1}/{MAX_RETRIGGERS} "
             f"for `{observation['component']}` at `{pr.head_sha}`. {reason}.\n\n"
             f"<!-- gap-build-retry:v1 {json.dumps(record, sort_keys=True)} -->"
         )
