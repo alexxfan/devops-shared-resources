@@ -106,7 +106,11 @@ class BuildRetryManager:
                 # Ignore human quotes/spoofed markers. A bot-issued retry with
                 # a different identity may be a changed deployment actor; stop
                 # rather than silently resetting its cross-leader budget.
-                if user.get("type") != "Bot" or not (body == "/retest" or body.startswith("/retest ")):
+                if user.get("type") != "Bot" or not (
+                    body in {"/retest", "/test"}
+                    or body.startswith("/retest ")
+                    or body.startswith("/test ")
+                ):
                     continue
             for match in MARKER.finditer(body):
                 record = json.loads(match[1])
@@ -184,11 +188,11 @@ class BuildRetryManager:
         if self.dry_run:
             info.update(status="would-retrigger", reason=reason)
             return info, True
-        # PaC's targeted form takes the actual PipelineRun resource name.
-        # The expected pipeline template name is not enough; use bare /retest
-        # if this observation does not carry a concrete run name.
+        # PaC's targeted form is /test <PipelineRun name>. The expected
+        # pipeline template name is not enough; use bare /retest if this
+        # observation does not carry a concrete run name.
         run_name = str(observation.get("name") or "").strip()
-        command = f"/retest {run_name}" if run_name else "/retest"
+        command = f"/test {run_name}" if run_name else "/retest"
         body = (f"{command}\n\nGAP automatic retry {count + 1}/{MAX_RETRIGGERS} "
                 f"for `{observation['component']}` at `{pr.head_sha}`. {reason}.\n\n"
                 f"<!-- gap-build-retry:v1 {json.dumps(record, sort_keys=True)} -->")
