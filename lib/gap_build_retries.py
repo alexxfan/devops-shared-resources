@@ -458,7 +458,9 @@ class BuildRetryManager:
                 if pipeline and NAME.fullmatch(pipeline):
                     bare_retry_state["components"].append({
                         "component": component, "pipeline": pipeline,
-                        "run_uid": item.get("uid") or f"missing:{pipeline}:{pr.head_sha}:1",
+                        # Keep missing candidates unassigned until the batch
+                        # builder can use their current per-component count.
+                        "run_uid": item.get("uid") if item.get("status") != "missing" else None,
                         "reason": item.get("reason") or "Expected PR build was not triggered; CEL expected this component",
                     })
                     seen_retry_components.add(component)
