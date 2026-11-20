@@ -323,6 +323,29 @@ def test_multiple_ambiguous_missing_components_post_one_bare_retest_and_share_re
 
 
 
+def test_failed_before_missing_persists_both_components_in_one_comment():
+    gh, client = FakeGitHub(), FakeKonflux(attempt("PipelineRunTimeout"))
+    gate, evidence = evaluate(client)
+    second = {
+        "component": "odh-bar-v3-6", "status": "missing",
+        "reason": "No matching current-head Konflux PipelineRun found",
+        "head_sha": SHA, "name": "", "uid": "", "namespace": "",
+        "created_at": "", "url": "", "pipeline_name": "",
+        "completed_at": "", "message": "",
+    }
+    evidence["runs"].append(second)
+    evidence["expected-components"] = [COMPONENT, second["component"]]
+    evidence["required-pipelines"] = {"pipelines": [
+        {"component": COMPONENT, "pipeline_name": PIPELINE},
+        {"component": second["component"], "pipeline_name": "bar-on-pull-request-123"},
+    ]}
+    gate, evidence = manager(gh, client).apply(PR, gate, evidence)
+    assert gate.outcome == "pending"
+    assert len(gh.posts) == 1
+    assert len(evidence["retry-history"]) == 2
+    assert {r["component"] for r in evidence["retry-history"]} == {COMPONENT, second["component"]}
+
+
 def test_missing_component_always_posts_bare_retest_even_with_specific_pipeline():
     gh, client = FakeGitHub(), FakeKonflux()
     gate, evidence = missing_evidence(client)
