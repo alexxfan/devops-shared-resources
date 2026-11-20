@@ -333,6 +333,7 @@ class BuildRetryManager:
             return info, True
         batch_records = [record]
         exhausted_components = []
+        grace_components = []
         for item in (bare_retry_state or {}).get("components", []):
             component, item_pipeline = item["component"], item["pipeline"]
             if component == observation["component"]:
@@ -341,6 +342,11 @@ class BuildRetryManager:
             if len(previous) >= MAX_RETRIGGERS:
                 exhausted_components.append(component)
                 continue
+            if previous:
+                last = max(previous, key=lambda r: _moment(r["requested_at"]))
+                if now - _moment(last["requested_at"]) < START_GRACE:
+                    grace_components.append(component)
+                    continue
             batch_records.append({
                 "repository": f"{pr.owner}/{pr.repo}", "pr": pr.number,
                 "component": component, "sha": pr.head_sha,
@@ -357,6 +363,13 @@ class BuildRetryManager:
                         + ", ".join(sorted(exhausted_components))),
             )
             return info, False
+        if grace_components:
+            info.update(
+                status="build-retrigger-pending",
+                reason=("Waiting for retry grace period for: "
+                        + ", ".join(sorted(grace_components))),
+            )
+            return info, True
         marker_text = "\n".join(
             f"<!-- gap-build-retry:v1 {json.dumps(item, sort_keys=True)} -->"
             for item in batch_records

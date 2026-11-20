@@ -849,6 +849,30 @@ def test_multiple_missing_components_only_retrigger_the_component_without_a_chec
     assert second_pipeline in gh.posts[0]
 
 
+def test_fresh_missing_component_defers_shared_retest_for_member_in_grace():
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = missing_evidence(client)
+    second = dict(evidence["runs"][0])
+    second["component"] = "odh-other-v3-7-ea-1"
+    evidence["runs"] = [evidence["runs"][0], second]
+    evidence["expected-components"] = [COMPONENT, second["component"]]
+    evidence["required-pipelines"]["pipelines"].append({
+        "component": second["component"], "pipeline_name": "other-on-pull-request-123"
+    })
+    existing = {
+        "component": second["component"], "sha": PR.head_sha,
+        "pipeline": "other-on-pull-request-123",
+        "run_uid": "missing:other-on-pull-request-123:" + PR.head_sha + ":1",
+        "requested_at": (NOW - timedelta(minutes=5)).isoformat(),
+    }
+    saved = {"pull-requests": [{"pr-url": PR.url, "build-observations": {"retry-history": [existing]}}]}
+    mgr = BuildRetryManager(gh, saved, client_factory=lambda: client, clock=lambda: NOW)
+    gate, evidence = mgr.apply(PR, gate, evidence)
+    assert not gh.posts
+    assert gate.outcome == "pending"
+    assert "grace period" in evidence["runs"][0]["retry"]["reason"]
+
+
 def test_exhausted_missing_component_blocks_shared_retest_for_other_missing_component():
     gh, client = FakeGitHub(), FakeKonflux()
     gate, evidence = missing_evidence(client)
