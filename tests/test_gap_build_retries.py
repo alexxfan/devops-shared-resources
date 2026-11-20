@@ -315,6 +315,12 @@ def test_multiple_ambiguous_missing_components_post_one_bare_retest_and_share_re
     assert gh.posts[0].startswith("/retest\n\n")
     assert len(evidence["retry-history"]) == 2
     assert {r["comment_id"] for r in evidence["retry-history"]} == {1}
+    restarted = manager(gh, client, now=NOW + timedelta(minutes=20))
+    _, recovered = restarted.apply(PR, *missing_evidence(client))
+    assert len(gh.posts) == 1
+    assert len(recovered["retry-history"]) == 2
+
+
 
 
 def test_missing_component_always_posts_bare_retest_even_with_specific_pipeline():
