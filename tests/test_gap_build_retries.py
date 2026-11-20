@@ -292,9 +292,20 @@ def test_expected_missing_build_is_retriggered_when_no_github_check_exists():
     gate, evidence = manager(gh, client).apply(PR, gate, evidence)
     assert gate.outcome == "pending"
     assert len(gh.posts) == 1
-    assert gh.posts[0].startswith("/retest " + PIPELINE + "\n")
+    assert gh.posts[0].startswith("/retest\n\n")
+    assert PIPELINE in gh.posts[0]
     assert evidence["runs"][0]["retry"]["status"] == "build-retrigger-pending"
     assert evidence["retry-history"][0]["run_uid"].startswith("missing:")
+
+
+def test_bare_retest_receipt_is_reconciled_without_repeating_missing_retry():
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, saved = manager(gh, client).apply(PR, *missing_evidence(client))
+    assert gh.posts[0].startswith("/retest\n\n")
+    gate, evidence = manager(gh, client, saved=saved, now=NOW + timedelta(minutes=20)).apply(PR, *missing_evidence(client))
+    assert gate.outcome == "pending"
+    assert len(gh.posts) == 1
+    assert evidence["runs"][0]["retry"]["status"] == "build-retrigger-pending"
 
 
 def test_missing_build_waits_when_github_check_already_exists():
@@ -749,7 +760,8 @@ def test_multiple_missing_components_only_retrigger_the_component_without_a_chec
     gate, evidence = manager(gh, client).apply(PR, gate, evidence)
     assert gate.outcome == "pending"
     assert len(gh.posts) == 1
-    assert gh.posts[0].startswith("/retest " + second_pipeline + "\n")
+    assert gh.posts[0].startswith("/retest\n\n")
+    assert second_pipeline in gh.posts[0]
 
 
 def test_ignored_child_never_retriggers_missing_or_failed_builds():
