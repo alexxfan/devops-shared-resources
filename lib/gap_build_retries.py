@@ -140,12 +140,38 @@ class BuildRetryManager:
         info = {"retrigger_count": count, "status": "not-retried"}
         if observation["status"] not in {"failure", "timed_out", "cancelled"}:
             return info, False
-        if count >= MAX_RETRIGGERS:
-            info.update(status="retry-exhausted", reason="Two automatic retries already used for this component and SHA")
-            return info, False
         pipeline = observation.get("pipeline_name", "")
         if not pipeline or not NAME.fullmatch(pipeline) or not observation.get("uid") or not observation.get("completed_at"):
             info["reason"] = "Missing verified PaC template or completed attempt identity"
+            return info, False
+        last = max(records, key=lambda r: _moment(r["requested_at"])) if records else None
+        outstanding = bool(last and (
+            observation["uid"] == last["run_uid"]
+            or _moment(observation["created_at"]) < _moment(last["requested_at"])
+        ))
+        if outstanding and now - _moment(last["requested_at"]) < START_GRACE:
+            # Preserve the grace period even when optional TaskRun lookup is
+            # unavailable. A verified persistent error still wins.
+            try:
+                details, known_tasks = failure_details(client, observation)
+            except (KonfluxQueryError, ValueError, TypeError, KeyError) as exc:
+                info.update(
+                    status="build-retrigger-pending",
+                    reason=f"Waiting for a new Konflux attempt; retry evidence unavailable: {exc}",
+                    requested_at=last["requested_at"], comment_url=last.get("comment_url"),
+                )
+                return info, True
+            if PERSISTENT.search(details):
+                info["reason"] = "Known persistent code/configuration or FIPS failure"
+                return info, False
+            info.update(
+                status="build-retrigger-pending",
+                reason="Waiting for a new Konflux attempt",
+                requested_at=last["requested_at"], comment_url=last.get("comment_url"),
+            )
+            return info, True
+        if count >= MAX_RETRIGGERS:
+            info.update(status="retry-exhausted", reason="Two automatic retries already used for this component and SHA")
             return info, False
         # Known persistent task errors take precedence even when the parent
         # eventually times out or is cancelled during cleanup.
@@ -153,16 +179,13 @@ class BuildRetryManager:
         if PERSISTENT.search(details):
             info["reason"] = "Known persistent code/configuration or FIPS failure"
             return info, False
-        if records:
-            last = max(records, key=lambda r: _moment(r["requested_at"]))
-            if (observation["uid"] == last["run_uid"]
-                    or _moment(observation["created_at"]) < _moment(last["requested_at"])):
-                waiting = now - _moment(last["requested_at"]) < START_GRACE
-                info.update(status="build-retrigger-pending" if waiting else "retry-not-started",
-                            reason="Waiting for a new Konflux attempt" if waiting else
-                                   "Retry did not produce a newer attempt within two hours; manual investigation required",
-                            requested_at=last["requested_at"], comment_url=last.get("comment_url"))
-                return info, waiting
+        if records and outstanding:
+            waiting = now - _moment(last["requested_at"]) < START_GRACE
+            info.update(status="build-retrigger-pending" if waiting else "retry-not-started",
+                        reason="Waiting for a new Konflux attempt" if waiting else
+                               "Retry did not produce a newer attempt within two hours; manual investigation required",
+                        requested_at=last["requested_at"], comment_url=last.get("comment_url"))
+            return info, waiting
         if observation["status"] == "failure":
             branch = component_push_branch(client, repo=f"{pr.owner}/{pr.repo}", component=observation["component"])
             health = recent_push_health(client, repo=f"{pr.owner}/{pr.repo}",

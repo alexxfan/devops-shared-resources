@@ -147,6 +147,32 @@ def test_retry_budget_is_per_component_sha_and_counts_new_attempts_only():
     assert receipt["runs"][0]["retry"]["status"] == "retry-exhausted"
 
 
+def test_final_retry_receipt_grace_precedes_retry_budget():
+    gh, client = FakeGitHub(), FakeKonflux()
+    _, saved = apply(manager(gh, client), client)
+    client.items = [attempt(name="r2", created="2026-11-05T13:00:00Z")]
+    _, saved = apply(manager(gh, client, saved=saved, now=NOW + timedelta(hours=2)), client)
+    # The fake response uses a fixed timestamp; model GitHub's actual receipt time.
+    gh.comments[-1]["created_at"] = (NOW + timedelta(hours=2)).isoformat()
+    gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(hours=2, minutes=5)), client)
+    assert gate.outcome == "pending"
+    assert len(gh.posts) == 2
+    assert receipt["runs"][0]["retry"]["status"] == "build-retrigger-pending"
+
+
+def test_retry_receipt_grace_survives_task_lookup_failure():
+    gh, client = FakeGitHub(), FakeKonflux()
+    _, saved = apply(manager(gh, client), client)
+    def denied(*args, **kwargs):
+        raise KonfluxQueryError("HTTP 503 reading TaskRuns")
+    client._list_resources = denied
+    gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(minutes=5)), client)
+    assert gate.outcome == "pending"
+    assert not len(gh.posts) > 1
+    assert receipt["runs"][0]["retry"]["status"] == "build-retrigger-pending"
+    assert "evidence unavailable" in receipt["runs"][0]["retry"]["reason"]
+
+
 def test_missing_replacement_does_not_repeat_comment_forever():
     gh, client = FakeGitHub(), FakeKonflux()
     apply(manager(gh, client), client)
