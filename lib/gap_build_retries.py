@@ -132,7 +132,7 @@ class BuildRetryManager:
             unique[(record["component"], record["sha"], record["run_uid"])] = record
         return list(unique.values())
 
-    def _retry(self, pr, observation, history, client, *, bare_retry_state=None):
+    def _retry(self, pr, observation, history, client):
         """Plan or send one targeted retry after identity and budget checks."""
         now = self.clock()
         records = [r for r in history if r["component"] == observation["component"] and r["sha"] == pr.head_sha]
@@ -190,44 +190,17 @@ class BuildRetryManager:
         if self.dry_run:
             info.update(status="would-retrigger", reason=reason)
             return info, True
-        # One bare /retest reruns all eligible failed builds on this PR.
-        # Share its receipt across components so one monitor call cannot post
-        # duplicate commands or undercount per-component retry budgets.
-        command = "/retest"
+        # PaC targets an already-started PipelineRun with /test and its
+        # concrete resource name. Keep this receipt component-specific.
+        run_name = str(observation.get("name") or "").strip()
+        if not run_name or not NAME.fullmatch(run_name):
+            info["reason"] = "Missing verified PipelineRun name for targeted retry"
+            return info, False
+        command = f"/test {run_name}"
         record["command"] = command
-        if bare_retry_state and bare_retry_state.get("receipt"):
-            prior = bare_retry_state["receipt"]
-            record.update(comment_url=prior["comment_url"], comment_id=prior["comment_id"],
-                          requested_at=prior["requested_at"])
-            history.append(record)
-            self.saved[pr.url] = deepcopy(history)
-            info.update(status="build-retrigger-pending", retrigger_count=count + 1,
-                        requested_at=record["requested_at"], comment_url=record["comment_url"], reason=reason)
-            return info, True
-        batch_records = [record]
-        for item in (bare_retry_state or {}).get("components", []):
-            component, item_pipeline = item["component"], item["pipeline"]
-            if component == observation["component"]:
-                continue
-            previous = [r for r in history if r["component"] == component and r["sha"] == pr.head_sha]
-            if len(previous) >= MAX_RETRIGGERS:
-                continue
-            batch_records.append({
-                "repository": f"{pr.owner}/{pr.repo}", "pr": pr.number,
-                "component": component, "sha": pr.head_sha,
-                "pipeline": item_pipeline,
-                "run_uid": item.get("run_uid") or f"missing:{item_pipeline}:{pr.head_sha}:{len(previous) + 1}",
-                "retrigger_count": len(previous) + 1,
-                "requested_at": now.isoformat(),
-                "reason": item.get("reason") or reason, "command": command,
-            })
-        marker_text = "\n".join(
-            f"<!-- gap-build-retry:v1 {json.dumps(item, sort_keys=True)} -->"
-            for item in batch_records
-        )
         body = (f"{command}\n\nGAP automatic retry {count + 1}/{MAX_RETRIGGERS} "
                 f"for `{observation['component']}` at `{pr.head_sha}`. {reason}.\n\n"
-                f"{marker_text}")
+                f"<!-- gap-build-retry:v1 {json.dumps(record, sort_keys=True)} -->")
         # One external write for both command and audit receipt. Do not retry
         # this POST on errors: the next poll reads comments before acting again.
         try:
@@ -235,17 +208,13 @@ class BuildRetryManager:
                                                "--method", "POST", "-f", "body=" + body]))
             if (response.get("user") or {}).get("login") != self.actor:
                 raise RuntimeError("Retry comment author differs from GAP_BUILD_RETRY_ACTOR; stop automatic retries")
-            receipt = {"comment_url": response["html_url"], "comment_id": response["id"],
-                       "requested_at": response["created_at"]}
-            if bare_retry_state is not None:
-                bare_retry_state["receipt"] = receipt
-            for item in batch_records:
-                item.update(receipt)
+            record.update(comment_url=response["html_url"], comment_id=response["id"],
+                          requested_at=response["created_at"])
         except (RuntimeError, ValueError, TypeError, KeyError) as exc:
             # A POST may have reached GitHub even if its response was lost or
             # malformed. Stop publication; the next poll reconciles receipts.
             raise RuntimeError("Could not confirm retry delivery; reconcile child comments on the next poll") from exc
-        history.extend(batch_records)
+        history.append(record)
         self.saved[pr.url] = deepcopy(history)
         info.update(status="build-retrigger-pending", retrigger_count=count + 1,
                     requested_at=record["requested_at"], comment_url=record["comment_url"])
@@ -340,12 +309,14 @@ class BuildRetryManager:
                         requested_at=record["requested_at"], comment_url=record["comment_url"], reason=reason)
             return info, True
         batch_records = [record]
+        exhausted_components = []
         for item in (bare_retry_state or {}).get("components", []):
             component, item_pipeline = item["component"], item["pipeline"]
             if component == observation["component"]:
                 continue
             previous = [r for r in history if r["component"] == component and r["sha"] == pr.head_sha]
             if len(previous) >= MAX_RETRIGGERS:
+                exhausted_components.append(component)
                 continue
             batch_records.append({
                 "repository": f"{pr.owner}/{pr.repo}", "pr": pr.number,
@@ -356,6 +327,13 @@ class BuildRetryManager:
                 "requested_at": now.isoformat(),
                 "reason": item.get("reason") or reason, "command": command,
             })
+        if exhausted_components:
+            info.update(
+                status="retry-exhausted",
+                reason=("Missing-build retry budget exhausted for: "
+                        + ", ".join(sorted(exhausted_components))),
+            )
+            return info, False
         marker_text = "\n".join(
             f"<!-- gap-build-retry:v1 {json.dumps(item, sort_keys=True)} -->"
             for item in batch_records
@@ -449,7 +427,7 @@ class BuildRetryManager:
         }
         bare_retry_state["components"] = []
         seen_retry_components = set()
-        retryable_statuses = {"missing", "failure", "timed_out", "cancelled"}
+        retryable_statuses = {"missing"}
         for item in evidence["runs"]:
             component = item.get("component")
             if (item.get("status") in retryable_statuses and component in expected_components
@@ -506,8 +484,7 @@ class BuildRetryManager:
                 # Each component has its own lookup deadline. One slow archive
                 # query must not exhaust every subsequent component's budget.
                 client = self.client_factory()
-                info, waiting = self._retry(pr, observation, history, client,
-                                             bare_retry_state=bare_retry_state)
+                info, waiting = self._retry(pr, observation, history, client)
             except RetryObservationChanged as exc:
                 info, waiting = {"status": "retry-observation-changed", "reason": str(exc)}, True
             except (KonfluxQueryError, ValueError, TypeError, KeyError) as exc:

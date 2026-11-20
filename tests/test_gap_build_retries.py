@@ -101,7 +101,7 @@ def test_targeted_retry_holds_batch_and_keeps_original_build_truth(reason):
     gh, client = FakeGitHub(), FakeKonflux(attempt(reason))
     gate, receipt = apply(manager(gh, client), client)
     assert gate.outcome == "pending"
-    assert len(gh.posts) == 1 and gh.posts[0].startswith("/retest\n\n")
+    assert len(gh.posts) == 1 and gh.posts[0].startswith("/test r1\n")
     assert PIPELINE in gh.posts[0]
     record = receipt["runs"][0]
     assert record["status"] in {"timed_out", "cancelled"}  # EG never sees fabricated success
@@ -341,7 +341,9 @@ def test_failed_before_missing_persists_both_components_in_one_comment():
     ]}
     gate, evidence = manager(gh, client).apply(PR, gate, evidence)
     assert gate.outcome == "pending"
-    assert len(gh.posts) == 1
+    assert len(gh.posts) == 2
+    assert gh.posts[0].startswith("/test ")
+    assert gh.posts[1].startswith("/retest\n\n")
     assert len(evidence["retry-history"]) == 2
     assert {r["component"] for r in evidence["retry-history"]} == {COMPONENT, second["component"]}
 
@@ -819,6 +821,33 @@ def test_multiple_missing_components_only_retrigger_the_component_without_a_chec
     assert len(gh.posts) == 1
     assert gh.posts[0].startswith("/retest\n\n")
     assert second_pipeline in gh.posts[0]
+
+
+def test_exhausted_missing_component_blocks_shared_retest_for_other_missing_component():
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = missing_evidence(client)
+    second = dict(evidence["runs"][0])
+    second["component"] = "odh-other-v3-7-ea-1"
+    evidence["runs"] = [evidence["runs"][0], second]
+    evidence["expected-components"] = [COMPONENT, second["component"]]
+    evidence["required-pipelines"]["pipelines"].append({
+        "component": second["component"], "pipeline_name": "other-on-pull-request-123"
+    })
+    existing = {
+        "component": second["component"], "sha": PR.head_sha,
+        "pipeline": "other-on-pull-request-123",
+        "run_uid": "missing:other-on-pull-request-123:" + PR.head_sha + ":1",
+        "requested_at": NOW.isoformat(),
+    }
+    saved = {"pull-requests": [{"pr-url": PR.url, "build-observations": {"retry-history": [existing]}}]}
+    # A second previous receipt reaches the maximum for the other component.
+    saved["pull-requests"][0]["build-observations"]["retry-history"].append(
+        dict(existing, run_uid=existing["run_uid"].replace(":1", ":2"), requested_at=(NOW + timedelta(hours=1)).isoformat())
+    )
+    mgr = BuildRetryManager(gh, saved, client_factory=lambda: client, clock=lambda: NOW)
+    gate, evidence = mgr.apply(PR, gate, evidence)
+    assert not gh.posts
+    assert gate.outcome == "pending"
 
 
 def test_ignored_child_never_retriggers_missing_or_failed_builds():
