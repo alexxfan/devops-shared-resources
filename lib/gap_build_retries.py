@@ -21,16 +21,6 @@ from lib.konflux_retry_evidence import component_push_branch, failure_details, r
 
 MAX_RETRIGGERS = 2
 START_GRACE = timedelta(hours=2)
-MISSING_BUILD_PIPELINE = re.compile(r"(?P<component>[a-z0-9][a-z0-9.-]*)-on-pull-request-[0-9]+$")
-SPECIAL_BUILD_COMPONENTS = frozenset({"container-build", "multi-arch-container-build"})
-
-
-def missing_build_command(pipeline):
-    """Return the configured component trigger, or bare /retest if ambiguous."""
-    match = MISSING_BUILD_PIPELINE.fullmatch(str(pipeline or ""))
-    if not match or match.group("component") in SPECIAL_BUILD_COMPONENTS:
-        return "/retest"
-    return f"/build-konflux {match.group('component')}"
 MARKER = re.compile(r"<!-- gap-build-retry:v1 (\{[^\n]+\}) -->")
 PERSISTENT = re.compile(
     r"fips[-_ ]?check|no such file|missing (?:file|path)|cannot find (?:file|package)|"
@@ -142,7 +132,7 @@ class BuildRetryManager:
             unique[(record["component"], record["sha"], record["run_uid"])] = record
         return list(unique.values())
 
-    def _retry(self, pr, observation, history, client):
+    def _retry(self, pr, observation, history, client, *, bare_retry_state=None):
         """Plan or send one targeted retry after identity and budget checks."""
         now = self.clock()
         records = [r for r in history if r["component"] == observation["component"] and r["sha"] == pr.head_sha]
@@ -200,11 +190,20 @@ class BuildRetryManager:
         if self.dry_run:
             info.update(status="would-retrigger", reason=reason)
             return info, True
-        # PaC's targeted form is /test <PipelineRun name>. The expected
-        # pipeline template name is not enough; use bare /retest if this
-        # observation does not carry a concrete run name.
-        run_name = str(observation.get("name") or "").strip()
-        command = f"/test {run_name}" if run_name else "/retest"
+        # One bare /retest reruns all eligible failed builds on this PR.
+        # Share its receipt across components so one monitor call cannot post
+        # duplicate commands or undercount per-component retry budgets.
+        command = "/retest"
+        record["command"] = command
+        if bare_retry_state and bare_retry_state.get("receipt"):
+            prior = bare_retry_state["receipt"]
+            record.update(comment_url=prior["comment_url"], comment_id=prior["comment_id"],
+                          requested_at=prior["requested_at"])
+            history.append(record)
+            self.saved[pr.url] = deepcopy(history)
+            info.update(status="build-retrigger-pending", retrigger_count=count + 1,
+                        requested_at=record["requested_at"], comment_url=record["comment_url"], reason=reason)
+            return info, True
         body = (f"{command}\n\nGAP automatic retry {count + 1}/{MAX_RETRIGGERS} "
                 f"for `{observation['component']}` at `{pr.head_sha}`. {reason}.\n\n"
                 f"<!-- gap-build-retry:v1 {json.dumps(record, sort_keys=True)} -->")
@@ -217,6 +216,10 @@ class BuildRetryManager:
                 raise RuntimeError("Retry comment author differs from GAP_BUILD_RETRY_ACTOR; stop automatic retries")
             record.update(comment_url=response["html_url"], comment_id=response["id"],
                           requested_at=response["created_at"])
+            if bare_retry_state is not None:
+                bare_retry_state["receipt"] = {key: record[key] for key in (
+                    "comment_url", "comment_id", "requested_at"
+                )}
         except (RuntimeError, ValueError, TypeError, KeyError) as exc:
             # A POST may have reached GitHub even if its response was lost or
             # malformed. Stop publication; the next poll reconciles receipts.
@@ -304,21 +307,17 @@ class BuildRetryManager:
         # A bare /retest reruns every eligible missing pipeline on the PR.
         # Post it once, then attach the same receipt to each affected component
         # so every component's retry budget reflects the shared attempt.
-        command = missing_build_command(pipeline)
-        shared = bare_retry_state if command == "/retest" else None
-        if shared and shared.get("receipt"):
-            prior = shared["receipt"]
-            record.update(command=command, comment_url=prior["comment_url"],
-                          comment_id=prior["comment_id"], requested_at=prior["requested_at"])
+        command = "/retest"
+        record["command"] = command
+        if bare_retry_state and bare_retry_state.get("receipt"):
+            prior = bare_retry_state["receipt"]
+            record.update(comment_url=prior["comment_url"], comment_id=prior["comment_id"],
+                          requested_at=prior["requested_at"])
             history.append(record)
             self.saved[pr.url] = deepcopy(history)
             info.update(status="build-retrigger-pending", retrigger_count=count + 1,
                         requested_at=record["requested_at"], comment_url=record["comment_url"], reason=reason)
             return info, True
-        # Normal component templates expose /build-konflux <component> and
-        # allow `all`; special or ambiguous pipelines fall back to bare /retest.
-        command = missing_build_command(pipeline)
-        record["command"] = command
         body = (
             f"{command}\n\nGAP automatic retry {count + 1}/{MAX_RETRIGGERS} "
             f"for `{observation['component']}` at `{pr.head_sha}`. {reason}.\n\n"
@@ -333,8 +332,8 @@ class BuildRetryManager:
                 raise RuntimeError("Retry comment author differs from GAP_BUILD_RETRY_ACTOR; stop automatic retries")
             record.update(comment_url=response["html_url"], comment_id=response["id"],
                           requested_at=response["created_at"])
-            if shared is not None:
-                shared["receipt"] = {key: record[key] for key in (
+            if bare_retry_state is not None:
+                bare_retry_state["receipt"] = {key: record[key] for key in (
                     "comment_url", "comment_id", "requested_at"
                 )}
         except (RuntimeError, ValueError, TypeError, KeyError) as exc:
@@ -448,7 +447,8 @@ class BuildRetryManager:
                 # Each component has its own lookup deadline. One slow archive
                 # query must not exhaust every subsequent component's budget.
                 client = self.client_factory()
-                info, waiting = self._retry(pr, observation, history, client)
+                info, waiting = self._retry(pr, observation, history, client,
+                                             bare_retry_state=bare_retry_state)
             except RetryObservationChanged as exc:
                 info, waiting = {"status": "retry-observation-changed", "reason": str(exc)}, True
             except (KonfluxQueryError, ValueError, TypeError, KeyError) as exc:

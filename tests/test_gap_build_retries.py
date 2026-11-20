@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from lib.gap_build_retries import BuildRetryManager, classify_failure, missing_build_command
+from lib.gap_build_retries import BuildRetryManager, classify_failure
 from lib.gap_pr_gates import RepositoryPullRequest
 from lib.github_check_runs import CheckQueryError, ExpectedCheck
 from lib.github_cli import GhCommandError
@@ -101,7 +101,7 @@ def test_targeted_retry_holds_batch_and_keeps_original_build_truth(reason):
     gh, client = FakeGitHub(), FakeKonflux(attempt(reason))
     gate, receipt = apply(manager(gh, client), client)
     assert gate.outcome == "pending"
-    assert len(gh.posts) == 1 and gh.posts[0].startswith("/test r1\n")
+    assert len(gh.posts) == 1 and gh.posts[0].startswith("/retest\n\n")
     assert PIPELINE in gh.posts[0]
     record = receipt["runs"][0]
     assert record["status"] in {"timed_out", "cancelled"}  # EG never sees fabricated success
@@ -287,15 +287,6 @@ def missing_evidence(client, *, cel=True):
     return gate, evidence
 
 
-@pytest.mark.parametrize("pipeline,expected", [
-    ("odh-praxis-extproc-on-pull-request-95", "/build-konflux odh-praxis-extproc"),
-    ("container-build-on-pull-request-95", "/retest"),
-    ("unknown", "/retest"),
-])
-def test_missing_build_command_uses_component_annotation_or_safe_fallback(pipeline, expected):
-    assert missing_build_command(pipeline) == expected
-
-
 def test_expected_missing_build_is_retriggered_when_no_github_check_exists():
     gh, client = FakeGitHub(), FakeKonflux()
     gate, evidence = missing_evidence(client)
@@ -326,13 +317,13 @@ def test_multiple_ambiguous_missing_components_post_one_bare_retest_and_share_re
     assert {r["comment_id"] for r in evidence["retry-history"]} == {1}
 
 
-def test_missing_component_posts_build_konflux_command_when_pipeline_identity_is_specific():
+def test_missing_component_always_posts_bare_retest_even_with_specific_pipeline():
     gh, client = FakeGitHub(), FakeKonflux()
     gate, evidence = missing_evidence(client)
     evidence["required-pipelines"]["pipelines"][0]["pipeline_name"] = "foo-on-pull-request-123"
     gate, evidence = manager(gh, client).apply(PR, gate, evidence)
     assert gate.outcome == "pending"
-    assert gh.posts[0].startswith("/build-konflux foo\n\n")
+    assert gh.posts[0].startswith("/retest\n\n")
 
 
 def test_bare_retest_receipt_is_reconciled_without_repeating_missing_retry():
