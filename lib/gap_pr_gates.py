@@ -95,7 +95,7 @@ def decide_repository_pr(
     check_query_error: str | None,
     feasibility: FeasibilityRun,
     now: datetime,
-    build_app_slug: str,
+    build_app_slug: str | None,
     build_app_id: int | None = None,
     allowed_components: frozenset[str] | None = None,
     build_gate_override: GateResult | None = None,
@@ -161,7 +161,7 @@ def decide_repository_pr(
     )
 
 
-def expected_builds_for_pr(pull_request, tekton_documents, *, app_slug, app_id=None, allowed_components=None):
+def expected_builds_for_pr(pull_request, tekton_documents, *, app_slug=None, app_id=None, allowed_components=None):
     """Use the same revision-pinned trigger/component selection for either source."""
     return select_build_checks(
         tekton_documents or (),
@@ -193,7 +193,7 @@ def _evaluate_builds(
     check_query_error: str | None,
     now: datetime,
     deadline: datetime,
-    app_slug: str,
+    app_slug: str | None,
     app_id: int | None,
     allowed_components: frozenset[str] | None,
 ) -> GateResult:

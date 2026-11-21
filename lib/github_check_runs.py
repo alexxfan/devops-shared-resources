@@ -70,6 +70,8 @@ class ExpectedCheck:
     name_suffix: str | None = None
     app_slug: str | None = None
     app_id: int | None = None
+    check_name_prefix: str | None = None
+    name_suffixes: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -162,17 +164,24 @@ def parse_check_run(data: dict[str, Any]) -> CheckRun:
 
 
 def matches_expected(expected: ExpectedCheck, run: CheckRun) -> bool:
-    if expected.app_slug and run.app_slug != expected.app_slug:
+    if expected.check_name_prefix:
+        if not run.name.lower().startswith(expected.check_name_prefix.lower()):
+            return False
+    elif expected.app_slug and run.app_slug != expected.app_slug:
         return False
     if expected.app_id is not None and run.app_id != expected.app_id:
         return False
     if expected.name and run.name != expected.name:
         return False
-    if expected.name_suffix:
+    if expected.name_suffixes:
+        portion = run.name.split(" / ")[-1] if " / " in run.name else run.name
+        if not any(portion == s or run.name == s for s in expected.name_suffixes):
+            return False
+    elif expected.name_suffix:
         portion = run.name.split(" / ")[-1] if " / " in run.name else run.name
         if portion != expected.name_suffix and run.name != expected.name_suffix:
             return False
-    if not expected.name and not expected.name_suffix:
+    if not expected.name and not expected.name_suffix and not expected.name_suffixes:
         return False
     return True
 
