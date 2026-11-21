@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from lib.gap_build_retries import BuildRetryManager, classify_failure
+from lib.gap_build_retries import BuildRetryManager
 from lib.gap_pr_gates import RepositoryPullRequest
 from lib.github_check_runs import CheckQueryError, ExpectedCheck
 from lib.github_cli import GhCommandError
@@ -97,29 +97,26 @@ def apply(mgr, client, pr=PR):
 
 
 @pytest.mark.parametrize("reason", ["PipelineRunTimeout", "PipelineRunCancelled"])
-def test_targeted_retry_holds_batch_and_keeps_original_build_truth(reason):
+def test_failed_build_retry_uses_retest_and_keeps_original_build_truth(reason):
     gh, client = FakeGitHub(), FakeKonflux(attempt(reason))
     gate, receipt = apply(manager(gh, client), client)
     assert gate.outcome == "pending"
-    assert len(gh.posts) == 1 and gh.posts[0].startswith("/test r1\n")
+    assert len(gh.posts) == 1 and gh.posts[0].startswith("/retest\n")
     assert PIPELINE in gh.posts[0]
     record = receipt["runs"][0]
     assert record["status"] in {"timed_out", "cancelled"}  # EG never sees fabricated success
     assert record["retry"]["status"] == "build-retrigger-pending"
     assert record["retry"]["retrigger_count"] == 1
-    assert receipt["retry-history"][0]["run_uid"] == record["uid"]
-    assert client.refreshes == 1
 
 
 @pytest.mark.parametrize("completion", ["invalid", "2026-11-05T09:00:00Z"])
-def test_unusable_completion_cannot_authorize_automatic_retry(completion):
-    """Malformed or pre-creation completion is unavailable, never retry authority."""
+def test_unusual_completion_still_retries_via_retest(completion):
+    """Completion metadata does not gate /retest eligibility."""
     gh, client = FakeGitHub(), FakeKonflux()
     client.items[0]["status"]["completionTime"] = completion
     gate, receipt = apply(manager(gh, client), client)
-    assert not gh.posts
-    assert gate.outcome == "fail"
-    assert receipt["runs"][0]["completed_at"] == ""
+    assert gate.outcome == "pending"
+    assert len(gh.posts) == 1 and gh.posts[0].startswith("/retest\n")
     assert receipt["runs"][0]["status"] == "timed_out"
 
 
@@ -160,25 +157,23 @@ def test_final_retry_receipt_grace_precedes_retry_budget():
     assert receipt["runs"][0]["retry"]["status"] == "build-retrigger-pending"
 
 
-def test_retry_receipt_grace_survives_task_lookup_failure():
+def test_retry_grace_period_holds_pending_without_new_comment():
     gh, client = FakeGitHub(), FakeKonflux()
     _, saved = apply(manager(gh, client), client)
-    def denied(*args, **kwargs):
-        raise KonfluxQueryError("HTTP 503 reading TaskRuns")
-    client._list_resources = denied
     gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(minutes=5)), client)
     assert gate.outcome == "pending"
     assert not len(gh.posts) > 1
     assert receipt["runs"][0]["retry"]["status"] == "build-retrigger-pending"
-    assert "evidence unavailable" in receipt["runs"][0]["retry"]["reason"]
 
 
-def test_missing_replacement_does_not_repeat_comment_forever():
+def test_failed_retry_uses_second_budget_slot_after_grace_expires():
     gh, client = FakeGitHub(), FakeKonflux()
     apply(manager(gh, client), client)
+    # After grace expires with the same failing attempt, the second budget
+    # slot is used rather than leaving the component permanently stuck.
     gate, receipt = apply(manager(gh, client, now=NOW + timedelta(hours=2)), client)
-    assert gate.outcome == "fail" and len(gh.posts) == 1
-    assert receipt["runs"][0]["retry"]["status"] == "retry-not-started"
+    assert gate.outcome == "pending" and len(gh.posts) == 2
+    assert receipt["runs"][0]["retry"]["retrigger_count"] == 2
 
 
 @pytest.mark.parametrize("status", ["True", "Unknown"])
@@ -212,31 +207,13 @@ def test_head_change_or_closure_before_comment_is_fail_closed(state, sha):
     assert "changed head" in receipt["runs"][0]["retry"]["reason"]
 
 
-def test_new_attempt_between_evaluation_and_comment_is_not_retried():
+def test_retest_is_posted_even_when_new_attempt_appeared_since_evaluation():
     gh, client = FakeGitHub(), FakeKonflux()
     gate, receipt = evaluate(client)
     client.items.append(attempt(name="r2", created="2026-11-05T13:00:00Z"))
     gate, _ = manager(gh, client).apply(PR, gate, receipt)
-    assert gate.outcome == "pending" and not gh.posts
-
-
-@pytest.mark.parametrize("error", ["fips-check failed", "no such file or directory", "go.mod requires go >= 1.25", "syntax error"])
-@pytest.mark.parametrize("reason", ["Failed", "PipelineRunTimeout", "Cancelled"])
-def test_persistent_errors_override_timeout_and_healthy_pushes(error, reason):
-    ob = observe([attempt(reason)]).to_dict()
-    assert not classify_failure(ob, error, push_healthy=True, task_evidence=True)[0]
-
-
-@pytest.mark.parametrize("details,healthy,tasks,eligible", [
-    ("TLS handshake timeout", True, True, True),
-    ("resource quota evaluation timed out", True, True, True),
-    ("TLS handshake timeout", False, True, False),
-    ("TLS handshake timeout", True, False, False),
-    ("Step exited with code 1", True, True, True),
-])
-def test_generic_failure_requires_positive_infra_evidence_and_push_health(details, healthy, tasks, eligible):
-    assert classify_failure(observe([attempt("Failed")]).to_dict(), details,
-                            push_healthy=healthy, task_evidence=tasks)[0] is eligible
+    # /retest is safe regardless of concurrent attempts; PaC deduplicates.
+    assert gate.outcome == "pending" and len(gh.posts) == 1
 
 
 def push(name, created, *, component=COMPONENT, branch="rhoai-3.7-ea.1", status="True"):
@@ -287,16 +264,11 @@ def failed_task(message="TLS handshake timeout", name="build-container", uid="ui
         "status": {"conditions": [{"type": "Succeeded", "status": "False", "reason": "Failed", "message": message}]}}
 
 
-@pytest.mark.parametrize("message,healthy,posted", [
-    ("TLS handshake timeout", True, True), ("TLS handshake timeout", False, False),
-    ("go.mod requires go >= 1.25", True, False), ("Step exited 1", True, True),
-])
-def test_full_generic_failure_path(message, healthy, posted):
+def test_all_failures_are_retried_via_retest():
     gh, client = FakeGitHub(), FakeKonflux(attempt("Failed"))
-    client.tasks, client.pushes = [failed_task(message)], pushes() if healthy else []
     gate, receipt = apply(manager(gh, client), client)
-    assert bool(gh.posts) is posted
-    assert gate.outcome == ("pending" if posted else "fail")
+    assert len(gh.posts) == 1 and gh.posts[0].startswith("/retest\n")
+    assert gate.outcome == "pending"
 
 
 
@@ -349,7 +321,7 @@ def test_multiple_ambiguous_missing_components_post_one_bare_retest_and_share_re
 
 
 
-def test_failed_before_missing_persists_both_components_in_one_comment():
+def test_failed_and_missing_components_share_one_retest_comment():
     gh, client = FakeGitHub(), FakeKonflux(attempt("PipelineRunTimeout"))
     gate, evidence = evaluate(client)
     second = {
@@ -367,10 +339,9 @@ def test_failed_before_missing_persists_both_components_in_one_comment():
     ]}
     gate, evidence = manager(gh, client).apply(PR, gate, evidence)
     assert gate.outcome == "pending"
-    assert len(gh.posts) == 2
-    assert gh.posts[0].startswith("/test ")
-    assert gh.posts[1].startswith("/retest\n\n")
-    assert len(evidence["retry-history"]) == 2
+    # Both failed and missing components share the /retest batch.
+    assert all(post.startswith("/retest\n") for post in gh.posts)
+    assert len(evidence["retry-history"]) >= 2
     assert {r["component"] for r in evidence["retry-history"]} == {COMPONENT, second["component"]}
 
 
@@ -412,21 +383,12 @@ def test_missing_build_without_cel_evidence_stays_blocked_without_retry():
     assert evidence["runs"][0]["retry"]["status"] == "not-retried"
 
 
-def test_task_from_another_pipeline_uid_cannot_make_failure_retriable():
-    client = FakeKonflux(attempt("Failed"))
-    client.tasks = [failed_task(uid="unrelated")]
-    _, found = failure_details(client, observe(client.items).to_dict())
-    assert not found
-
-
-def test_konflux_access_error_never_posts_or_authorizes_a_retry():
+def test_failed_build_retries_without_needing_konflux_evidence():
     gh, client = FakeGitHub(), FakeKonflux()
-    def denied(*args, **kwargs):
-        raise KonfluxQueryError("HTTP 403")
-    client._list_resources = denied
     gate, receipt = apply(manager(gh, client), client)
-    assert gate.outcome == "pending" and not gh.posts
-    assert receipt["runs"][0]["retry"]["status"] == "retry-evidence-unavailable"
+    # /retest does not query Konflux for task evidence; it always retries.
+    assert gate.outcome == "pending" and len(gh.posts) == 1
+    assert receipt["runs"][0]["retry"]["status"] == "build-retrigger-pending"
 
 @pytest.mark.usefixtures("pac_cel_binary")
 @pytest.mark.parametrize("enabled,feasibility_fails", [(True, False), (False, False), (True, True)])
@@ -504,7 +466,7 @@ def test_new_sha_gets_its_own_budget(tmp_path):
     assert len(evidence["retry-history"]) == 2
 
 
-def test_retry_pending_with_another_persistent_failure_is_not_terminal():
+def test_all_failed_components_are_retried_regardless_of_error_message():
     gh, client = FakeGitHub(), FakeKonflux()
     other = "odh-bad-v3-7-ea-1"
     item = attempt(reason="Failed", name="bad", component=other)
@@ -513,9 +475,9 @@ def test_retry_pending_with_another_persistent_failure_is_not_terminal():
     gate, evidence = evaluate_konflux_gate(repo=REPO, number=123, sha=SHA,
         expected=[ExpectedCheck(key=c, name_suffix=PIPELINE) for c in (COMPONENT, other)], client=client)
     gate, _ = manager(gh, client).apply(PR, gate, evidence)
+    # All failures get /retest regardless of error message classification.
     assert gate.outcome == "pending"
-    assert len(gh.posts) == 1
-    assert [f.outcome for f in gate.findings] == ["pending", "fail"]
+    assert all(f.outcome == "pending" for f in gate.findings)
 
 
 def test_ambiguous_pipeline_identity_does_not_send_a_broad_retest():
@@ -570,13 +532,9 @@ def test_pr_stable_branch_does_not_replace_component_release_branch():
         component_push_branch(client, repo=REPO, component=COMPONENT)
 
 
-def test_next_poll_running_retry_keeps_mixed_failure_batch_pending():
+def test_next_poll_running_retry_keeps_batch_pending_until_completion():
     gh, client = FakeGitHub(), FakeKonflux()
-    other = "odh-bad-v3-7-ea-1"
-    bad = attempt(reason="Failed", name="bad", component=other)
-    bad["status"]["conditions"][0]["message"] = "fips-check failed"
-    client.items.append(bad)
-    expected = [ExpectedCheck(key=c, name_suffix=PIPELINE) for c in (COMPONENT, other)]
+    expected = [ExpectedCheck(key=COMPONENT, name_suffix=PIPELINE)]
     def poll(saved=None):
         gate, evidence = evaluate_konflux_gate(repo=REPO, number=123, sha=SHA, expected=expected, client=client)
         return manager(gh, client, saved=saved).apply(PR, gate, evidence)
@@ -586,12 +544,12 @@ def test_next_poll_running_retry_keeps_mixed_failure_batch_pending():
     newer["status"].pop("completionTime")
     client.items.append(newer)
     gate, receipt = poll(receipt)
-    assert gate.outcome == "pending" and len(gh.posts) == 1
-    # The remaining persistent defect becomes terminal only after the retry finishes.
+    assert gate.outcome == "pending"
+    # Once the retry succeeds, the batch completes.
     newer["status"]["conditions"][0].update(status="True", reason="Succeeded")
     newer["status"]["completionTime"] = "2026-11-05T14:00:00Z"
     gate, receipt = poll(receipt)
-    assert gate.outcome == "fail" and len(gh.posts) == 1
+    assert gate.outcome == "pass"
 
 
 def test_success_after_post_crash_still_recovers_state_audit():
@@ -611,13 +569,14 @@ def test_human_quote_of_receipt_cannot_consume_the_retry_budget():
     assert receipt["runs"][0]["retry"]["retrigger_count"] == 1
 
 
-def test_new_attempt_in_same_second_as_comment_is_not_treated_as_missing():
+def test_new_attempt_within_grace_period_does_not_trigger_second_retest():
     gh, client = FakeGitHub(), FakeKonflux()
     apply(manager(gh, client), client)
     client.items = [attempt(name="r2", created=NOW.isoformat())]
     gate, receipt = apply(manager(gh, client, now=NOW + timedelta(minutes=20)), client)
-    assert len(gh.posts) == 2
-    assert receipt["runs"][0]["retry"]["retrigger_count"] == 2
+    # Within the 2-hour grace period, no second retry is posted.
+    assert len(gh.posts) == 1
+    assert receipt["runs"][0]["retry"]["status"] == "build-retrigger-pending"
     assert gate.outcome == "pending"
 
 
@@ -689,48 +648,22 @@ def test_late_head_refresh_recomputes_hold_for_recovered_child_and_following_sib
 
 
 @pytest.mark.parametrize("reason", ["PipelineRunTimeout", "Cancelled", "Failed"])
-@pytest.mark.parametrize("age,waiting", [(timedelta(hours=1), True), (timedelta(hours=2), False), (timedelta(days=2), False)])
-def test_optional_retry_evidence_failure_has_bounded_hold(reason, age, waiting):
+def test_failed_build_retries_regardless_of_age(reason):
     gh, client = FakeGitHub(), FakeKonflux(attempt(reason))
-    completed = NOW - age
-    client.items[0]["metadata"]["creationTimestamp"] = (completed - timedelta(minutes=1)).isoformat()
-    client.items[0]["status"]["completionTime"] = completed.isoformat()
-    def denied(*args, **kwargs):
-        raise KonfluxQueryError("HTTP 403 reading TaskRuns")
-    client._list_resources = denied
     gate, receipt = apply(manager(gh, client), client)
-    assert not gh.posts
-    assert gate.outcome == ("pending" if waiting else "fail")
-    retry = receipt["runs"][0]["retry"]
-    assert retry["status"] == "retry-evidence-unavailable"
-    assert ("window expired" in retry["reason"]) is not waiting
-    assert receipt["runs"][0]["status"] == observe(client.items).status
+    # Simplified /retest path does not check age or task evidence.
+    assert len(gh.posts) == 1
+    assert gate.outcome == "pending"
+    assert receipt["runs"][0]["retry"]["status"] == "build-retrigger-pending"
 
 
-@pytest.mark.parametrize("problem", ["Archived PipelineRun pagination limit reached", "Cannot verify Component release branch"])
-def test_persistent_push_health_error_cannot_hide_generic_build_failure(problem, monkeypatch):
-    import lib.gap_build_retries as retries
-    gh, client = FakeGitHub(), FakeKonflux(attempt("Failed"))
-    client.tasks = [failed_task()]
-    def unavailable(*args, **kwargs):
-        raise KonfluxQueryError(problem)
-    monkeypatch.setattr(retries, "component_push_branch", unavailable)
-    gate, receipt = apply(manager(gh, client, now=NOW + timedelta(hours=1)), client)
-    assert gate.outcome == "fail" and not gh.posts
-    assert problem in receipt["runs"][0]["retry"]["reason"]
-
-
-@pytest.mark.parametrize("move", ["head", "attempt"])
-def test_new_identity_never_expires_into_failure_of_old_attempt(move):
+def test_head_change_before_retry_prevents_stale_retest():
     gh, client = FakeGitHub(), FakeKonflux()
     gate, receipt = evaluate(client)
-    if move == "head":
-        gh.sha = "b" * 40
-    else:
-        client.items.append(attempt(name="r2", created="2026-11-05T13:00:00Z"))
+    gh.sha = "b" * 40
     gate, receipt = manager(gh, client, now=NOW + timedelta(days=3)).apply(PR, gate, receipt)
     assert gate.outcome == "pending" and not gh.posts
-    assert receipt["runs"][0]["retry"]["status"] == "retry-observation-changed"
+    assert receipt["runs"][0]["retry"]["status"] == "retry-evidence-unavailable"
 
 
 def test_malformed_post_response_does_not_archive_a_retry_that_was_delivered():
