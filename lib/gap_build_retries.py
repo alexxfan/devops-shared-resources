@@ -53,7 +53,8 @@ class BuildRetryManager:
         """
         self.runner, self.dry_run = runner, dry_run
         self.clock = clock or (lambda: datetime.now(timezone.utc))
-        self.actor = os.environ.get("GAP_BUILD_RETRY_ACTOR", "rhods-devops-app[bot]")
+        _default_actor = "rhods-ci-bot" if os.environ.get("GAP_RETRY_COMMENT_TOKEN") else "rhods-devops-app[bot]"
+        self.actor = os.environ.get("GAP_BUILD_RETRY_ACTOR", _default_actor)
         self.saved = {}
         self.ignored_urls = set()
         for entry in payload.get("pull-requests", []):
@@ -89,7 +90,11 @@ class BuildRetryManager:
                 record = json.loads(match[1])
                 if record.get("repository") == f"{pr.owner}/{pr.repo}" and record.get("pr") == pr.number:
                     if (comment.get("user") or {}).get("login") != self.actor:
-                        raise ValueError("Retry receipt author differs from GAP_BUILD_RETRY_ACTOR; reconcile before retrying")
+                        if not os.environ.get("GAP_RETRY_COMMENT_TOKEN"):
+                            raise ValueError("Retry receipt author differs from GAP_BUILD_RETRY_ACTOR; reconcile before retrying")
+                        # Intentional actor migration: skip old-actor receipts
+                        # without counting them against the new actor's budget.
+                        continue
                     record.update(comment_url=comment.get("html_url"), comment_id=comment.get("id"))
                     # GitHub time, not a timestamp copied into the comment body.
                     record["requested_at"] = comment["created_at"]
@@ -251,6 +256,13 @@ class BuildRetryManager:
             for item in batch_records
         )
         body = f"{command}\n\n{marker_text}"
+        # Use a dedicated token for /retest comments when available so the
+        # comment is posted as a PaC-authorized collaborator (rhods-ci-bot)
+        # instead of the GitHub App bot which PaC does not authorize.
+        retry_token = os.environ.get("GAP_RETRY_COMMENT_TOKEN")
+        original_gh_token = os.environ.get("GH_TOKEN")
+        if retry_token:
+            os.environ["GH_TOKEN"] = retry_token
         try:
             response = json.loads(self.runner([
                 "api", f"repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments",
@@ -266,6 +278,12 @@ class BuildRetryManager:
                 item.update(receipt)
         except (RuntimeError, ValueError, TypeError, KeyError) as exc:
             raise RuntimeError("Could not confirm retry delivery; reconcile child comments on the next poll") from exc
+        finally:
+            if retry_token:
+                if original_gh_token is not None:
+                    os.environ["GH_TOKEN"] = original_gh_token
+                else:
+                    os.environ.pop("GH_TOKEN", None)
         history.extend(batch_records)
         self.saved[pr.url] = deepcopy(history)
         info.update(status="build-retrigger-pending", retrigger_count=count + 1,
