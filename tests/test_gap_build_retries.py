@@ -54,11 +54,12 @@ class FakeKonflux:
 
 
 class FakeGitHub:
-    def __init__(self):
+    def __init__(self, *, post_login="rhods-devops-app[bot]"):
         self.comments, self.posts = [], []
         self.sha, self.state = SHA, "open"
         self.fail_after_post = False
         self.fail_check_lookup = False
+        self.post_login = post_login
 
     def __call__(self, args):
         endpoint = args[1]
@@ -66,7 +67,7 @@ class FakeGitHub:
             body = args[-1].removeprefix("body=")
             self.posts.append(body)
             comment = {"id": len(self.comments) + 1, "html_url": "https://github.com/acme/foo/pull/123#issuecomment-1",
-                       "user": {"login": "rhods-devops-app[bot]"}, "body": body,
+                       "user": {"login": self.post_login}, "body": body,
                        "created_at": NOW.isoformat()}
             self.comments.append(comment)
             if self.fail_after_post:
@@ -880,3 +881,67 @@ def test_unmatched_running_observation_cannot_make_a_passing_gate():
     gate, evidence = manager(gh, client).apply(PR, gate, evidence)
     assert gate.outcome == "pending"
     assert not gh.posts
+
+
+def test_retry_comment_token_swaps_gh_token_for_post(monkeypatch):
+    """When GAP_RETRY_COMMENT_TOKEN is set the POST uses it and restores the original."""
+    monkeypatch.setenv("GAP_RETRY_COMMENT_TOKEN", "cibot-pat-token")
+    monkeypatch.setenv("GH_TOKEN", "app-token-original")
+    import os
+    captured_tokens = []
+    gh = FakeGitHub(post_login="rhods-ci-bot")
+    original_call = gh.__call__
+
+    def capturing_runner(args):
+        if "POST" in args:
+            captured_tokens.append(os.environ.get("GH_TOKEN"))
+        return original_call(args)
+
+    gh_wrapper = type(gh)()
+    gh_wrapper.__class__ = type(gh)
+    client = FakeKonflux()
+    mgr = manager(capturing_runner, client)
+    gate, receipt = apply(mgr, client)
+    assert gate.outcome == "pending"
+    assert captured_tokens == ["cibot-pat-token"]
+    # Original token is restored after the POST.
+    assert os.environ.get("GH_TOKEN") == "app-token-original"
+
+
+def test_retry_comment_token_restores_absent_gh_token(monkeypatch):
+    """When GH_TOKEN was not set originally, it is removed after the POST."""
+    monkeypatch.setenv("GAP_RETRY_COMMENT_TOKEN", "cibot-pat-token")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    import os
+    gh = FakeGitHub(post_login="rhods-ci-bot")
+    client = FakeKonflux()
+    mgr = manager(gh, client)
+    gate, receipt = apply(mgr, client)
+    assert gate.outcome == "pending"
+    assert os.environ.get("GH_TOKEN") is None
+
+
+def test_retry_comment_token_sets_actor_to_cibot(monkeypatch):
+    """GAP_RETRY_COMMENT_TOKEN presence defaults the actor to rhods-ci-bot."""
+    monkeypatch.setenv("GAP_RETRY_COMMENT_TOKEN", "cibot-pat-token")
+    gh = FakeGitHub(post_login="rhods-ci-bot")
+    client = FakeKonflux()
+    mgr = manager(gh, client)
+    assert mgr.actor == "rhods-ci-bot"
+
+
+def test_old_actor_receipts_skipped_during_migration(monkeypatch):
+    """Old-actor retry comments are ignored when GAP_RETRY_COMMENT_TOKEN is set."""
+    monkeypatch.setenv("GAP_RETRY_COMMENT_TOKEN", "cibot-pat-token")
+    gh = FakeGitHub(post_login="rhods-ci-bot")
+    client = FakeKonflux()
+    # First retry posted by old actor (simulate pre-migration comment).
+    apply(manager(gh, client), client)
+    # Rewrite the comment to look like it came from the old actor.
+    gh.comments[0]["user"]["login"] = "rhods-devops-app[bot]"
+    gh.comments[0]["user"]["type"] = "Bot"
+    # Second poll should post a new retry (old receipt is not counted).
+    gate, receipt = apply(manager(gh, client), client)
+    assert gate.outcome == "pending"
+    assert len(gh.posts) == 2
+    assert receipt["runs"][0]["retry"]["retrigger_count"] == 1
