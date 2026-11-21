@@ -81,6 +81,12 @@ def main(argv=None):
     if argv == ["run"]:
         args, reason = monitor_arguments(os.environ)
         print("GAP notifications configuration: " + reason, flush=True)
+        # Replicate schedule behavior when manual dispatch sends no trigger/leader.
+        event = os.environ.get("GITHUB_EVENT_NAME", "")
+        trigger = os.environ.get("GAP_TRIGGER_ID", "").strip()
+        leader = os.environ.get("GAP_LEADER_PR_URL", "").strip()
+        if event == "workflow_dispatch" and not trigger and not leader:
+            args.append("--schedule")
         return subprocess.call([sys.executable, str(ROOT / "scripts/gap_pr_monitor.py"),
                                 "--repo-root", ".", "--allow-gap-dir-fallback", *args])
     raise ValueError("expected receipt or run")
