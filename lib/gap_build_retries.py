@@ -221,9 +221,7 @@ class BuildRetryManager:
             return info, False
         command = f"/test {run_name}"
         record["command"] = command
-        body = (f"{command}\n\nGAP automatic retry {count + 1}/{MAX_RETRIGGERS} "
-                f"for `{observation['component']}` at `{pr.head_sha}`. {reason}.\n\n"
-                f"<!-- gap-build-retry:v1 {json.dumps(record, sort_keys=True)} -->")
+        body = f"{command}\n\n<!-- gap-build-retry:v1 {json.dumps(record, sort_keys=True)} -->"
         # One external write for both command and audit receipt. Do not retry
         # this POST on errors: the next poll reads comments before acting again.
         try:
@@ -374,11 +372,7 @@ class BuildRetryManager:
             f"<!-- gap-build-retry:v1 {json.dumps(item, sort_keys=True)} -->"
             for item in batch_records
         )
-        body = (
-            f"{command}\n\nGAP automatic retry {count + 1}/{MAX_RETRIGGERS} "
-            f"for `{observation['component']}` at `{pr.head_sha}`. {reason}.\n\n"
-            f"{marker_text}"
-        )
+        body = f"{command}\n\n{marker_text}"
         try:
             response = json.loads(self.runner([
                 "api", f"repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments",

@@ -44,7 +44,7 @@ def pac_cel_binary(tmp_path_factory):
     subprocess.run(
         ["go", "build", "-o", str(binary), "."],
         cwd=root / "tools" / "pac-cel", check=True,
-        env={**os.environ, "GOTOOLCHAIN": "local"},
+        env={**os.environ, "GOTOOLCHAIN": os.environ.get("GOTOOLCHAIN", "auto")},
     )
     previous = os.environ.get("PAC_CEL_EVALUATOR")
     os.environ["PAC_CEL_EVALUATOR"] = str(binary)
