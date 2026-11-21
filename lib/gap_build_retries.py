@@ -18,7 +18,7 @@ from lib.github_check_runs import (
 from lib.github_cli import GhCommandError
 from lib.konflux_builds import KonfluxQueryError, NAME
 
-MAX_RETRIGGERS = 2
+MAX_RETRIGGERS = 5
 START_GRACE = timedelta(hours=2)
 MARKER = re.compile(r"<!-- gap-build-retry:v1 (\{[^\n]+\}) -->")
 
@@ -70,7 +70,15 @@ class BuildRetryManager:
         """Reconcile trusted child comments with state across leaders/restarts."""
         endpoint = f"repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments"
         comments = collect_github_pages(self.runner, endpoint, None, 100)
-        history = list(self.saved.get(pr.url, []))
+        # When migrating actors (GAP_RETRY_COMMENT_TOKEN set + different actor),
+        # ignore saved retry records: they don't store the author, so old-actor
+        # saved records would otherwise block the new actor's budget.  Comment-
+        # based records are properly author-filtered below and will re-supply
+        # any new-actor receipts that were previously saved.
+        if os.environ.get("GAP_RETRY_COMMENT_TOKEN") and self.actor != "rhods-devops-app[bot]":
+            history = []
+        else:
+            history = list(self.saved.get(pr.url, []))
         for comment in comments:
             user = comment.get("user") or {}
             body = str(comment.get("body") or "")
@@ -161,7 +169,7 @@ class BuildRetryManager:
             if count >= MAX_RETRIGGERS:
                 info.update(
                     status="retry-exhausted",
-                    reason="Two automatic retries already used for this component and SHA",
+                    reason="Five automatic retries already used for this component and SHA",
                     requested_at=last["requested_at"], comment_url=last.get("comment_url"),
                 )
                 return info, False

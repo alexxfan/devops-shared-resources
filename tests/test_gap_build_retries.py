@@ -136,25 +136,27 @@ def test_crash_after_post_and_different_leader_cannot_reissue_same_attempt():
 def test_retry_budget_is_per_component_sha_and_counts_new_attempts_only():
     gh, client = FakeGitHub(), FakeKonflux()
     _, saved = apply(manager(gh, client), client)
-    client.items = [attempt(name="r2", created="2026-11-05T13:00:00Z")]
-    _, saved = apply(manager(gh, client, saved=saved, now=NOW + timedelta(hours=2)), client)
-    assert len(gh.posts) == 2
-    client.items = [attempt(name="r3", created="2026-11-05T15:00:00Z")]
-    gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(hours=4)), client)
-    assert len(gh.posts) == 2 and gate.outcome == "fail"
+    for i in range(2, 6):  # retries 2 through 5
+        client.items = [attempt(name=f"r{i}", created=f"2026-11-05T{9 + i}:00:00Z")]
+        _, saved = apply(manager(gh, client, saved=saved, now=NOW + timedelta(hours=i * 2)), client)
+    assert len(gh.posts) == 5
+    client.items = [attempt(name="r6", created="2026-11-05T22:00:00Z")]
+    gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(hours=14)), client)
+    assert len(gh.posts) == 5 and gate.outcome == "fail"
     assert receipt["runs"][0]["retry"]["status"] == "retry-exhausted"
 
 
 def test_final_retry_receipt_grace_precedes_retry_budget():
     gh, client = FakeGitHub(), FakeKonflux()
     _, saved = apply(manager(gh, client), client)
-    client.items = [attempt(name="r2", created="2026-11-05T13:00:00Z")]
-    _, saved = apply(manager(gh, client, saved=saved, now=NOW + timedelta(hours=2)), client)
+    for i in range(2, 6):  # retries 2 through 5
+        client.items = [attempt(name=f"r{i}", created=f"2026-11-05T{9 + i}:00:00Z")]
+        _, saved = apply(manager(gh, client, saved=saved, now=NOW + timedelta(hours=i * 2)), client)
     # The fake response uses a fixed timestamp; model GitHub's actual receipt time.
-    gh.comments[-1]["created_at"] = (NOW + timedelta(hours=2)).isoformat()
-    gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(hours=2, minutes=5)), client)
+    gh.comments[-1]["created_at"] = (NOW + timedelta(hours=10)).isoformat()
+    gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(hours=10, minutes=5)), client)
     assert gate.outcome == "pending"
-    assert len(gh.posts) == 2
+    assert len(gh.posts) == 5
     assert receipt["runs"][0]["retry"]["status"] == "build-retrigger-pending"
 
 
@@ -733,14 +735,15 @@ def test_missing_retry_receipts_use_unique_ids_and_exhaust_budget():
     _, saved = manager(gh, client).apply(PR, gate, evidence)
     assert saved["retry-history"][0]["run_uid"].endswith(":1")
 
-    gate, evidence = missing_evidence(client)
-    _, saved = manager(gh, client, saved=saved, now=NOW + timedelta(hours=2)).apply(PR, gate, evidence)
-    assert len(gh.posts) == 2
-    assert saved["retry-history"][1]["run_uid"].endswith(":2")
+    for i in range(2, 6):  # retries 2 through 5
+        gate, evidence = missing_evidence(client)
+        _, saved = manager(gh, client, saved=saved, now=NOW + timedelta(hours=i * 2)).apply(PR, gate, evidence)
+        assert len(gh.posts) == i
+        assert saved["retry-history"][i - 1]["run_uid"].endswith(f":{i}")
 
     gate, evidence = missing_evidence(client)
-    gate, evidence = manager(gh, client, saved=saved, now=NOW + timedelta(hours=4)).apply(PR, gate, evidence)
-    assert len(gh.posts) == 2
+    gate, evidence = manager(gh, client, saved=saved, now=NOW + timedelta(hours=14)).apply(PR, gate, evidence)
+    assert len(gh.posts) == 5
     assert evidence["runs"][0]["retry"]["status"] == "retry-exhausted"
 
 
@@ -824,10 +827,12 @@ def test_exhausted_missing_component_blocks_shared_retest_for_other_missing_comp
         "requested_at": NOW.isoformat(),
     }
     saved = {"pull-requests": [{"pr-url": PR.url, "build-observations": {"retry-history": [existing]}}]}
-    # A second previous receipt reaches the maximum for the other component.
-    saved["pull-requests"][0]["build-observations"]["retry-history"].append(
-        dict(existing, run_uid=existing["run_uid"].replace(":1", ":2"), requested_at=(NOW + timedelta(hours=1)).isoformat())
-    )
+    # Additional receipts reach the maximum for the other component.
+    for n in range(2, 6):
+        saved["pull-requests"][0]["build-observations"]["retry-history"].append(
+            dict(existing, run_uid=existing["run_uid"].replace(":1", f":{n}"),
+                 requested_at=(NOW + timedelta(hours=n - 1)).isoformat())
+        )
     mgr = BuildRetryManager(gh, saved, client_factory=lambda: client, clock=lambda: NOW)
     gate, evidence = mgr.apply(PR, gate, evidence)
     assert not gh.posts
@@ -945,3 +950,52 @@ def test_old_actor_receipts_skipped_during_migration(monkeypatch):
     assert gate.outcome == "pending"
     assert len(gh.posts) == 2
     assert receipt["runs"][0]["retry"]["retrigger_count"] == 1
+
+
+def test_saved_records_cleared_during_actor_migration(monkeypatch):
+    """Saved retry records from the old actor are ignored during migration.
+
+    Unlike comment-based records (which carry an author and are filtered in
+    _history), saved records from state.json don't store the author.  When
+    GAP_RETRY_COMMENT_TOKEN is set and the actor differs from the old default,
+    saved records are cleared so the new actor's budget starts fresh.
+    """
+    monkeypatch.setenv("GAP_RETRY_COMMENT_TOKEN", "cibot-pat-token")
+    gh = FakeGitHub(post_login="rhods-ci-bot")
+    client = FakeKonflux()
+    # Simulate saved records that would exhaust the budget under the old actor.
+    old_saved = {"retry-history": [
+        {
+            "component": COMPONENT, "sha": PR.head_sha,
+            "pipeline": PIPELINE, "run_uid": f"old:{i}",
+            "retrigger_count": i, "requested_at": (NOW + timedelta(hours=i)).isoformat(),
+            "repository": f"{PR.owner}/{PR.repo}", "pr": PR.number,
+        }
+        for i in range(1, 6)
+    ]}
+    # With 5 old-actor saved records the budget would be exhausted, but during
+    # migration saved records are ignored and the new actor can retry.
+    mgr = manager(gh, client, saved=old_saved, now=NOW + timedelta(hours=12))
+    gate, receipt = apply(mgr, client)
+    assert gate.outcome == "pending"
+    assert len(gh.posts) == 1
+    assert receipt["runs"][0]["retry"]["retrigger_count"] == 1
+
+
+def test_saved_records_counted_without_migration():
+    """Without GAP_RETRY_COMMENT_TOKEN saved records count toward the budget."""
+    gh, client = FakeGitHub(), FakeKonflux()
+    old_saved = {"retry-history": [
+        {
+            "component": COMPONENT, "sha": PR.head_sha,
+            "pipeline": PIPELINE, "run_uid": f"old:{i}",
+            "retrigger_count": i, "requested_at": (NOW - timedelta(hours=10 - i)).isoformat(),
+            "repository": f"{PR.owner}/{PR.repo}", "pr": PR.number,
+        }
+        for i in range(1, 6)
+    ]}
+    mgr = manager(gh, client, saved=old_saved, now=NOW + timedelta(hours=12))
+    gate, receipt = apply(mgr, client)
+    assert gate.outcome == "fail"
+    assert not gh.posts
+    assert receipt["runs"][0]["retry"]["status"] == "retry-exhausted"
