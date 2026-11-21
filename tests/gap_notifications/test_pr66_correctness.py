@@ -391,7 +391,7 @@ def test_producer_inventory_state_retry_roundtrip():
     from lib.konflux_gate import evaluate_konflux_gate
     from lib.state_file import StatePullRequest
     from lib.gap_build_retries import BuildRetryManager
-    expected = [SimpleNamespace(key='api', name_suffix=p) for p in ['build', 'test']]
+    expected = [SimpleNamespace(key='api', name_suffix=p, name_suffixes=(p,)) for p in ['build', 'test']]
     class Client:
         def observe(self, **kw):
             pipeline = next(iter(kw['pipeline_names']))

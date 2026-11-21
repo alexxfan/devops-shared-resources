@@ -259,14 +259,16 @@ class BuildRetryManager:
                 return True
         return False
 
-    def _retry_missing(self, pr, observation, history, pipeline, *, cel_evaluated, bare_retry_state=None):
+    def _retry_missing(self, pr, observation, history, pipeline, *, cel_evaluated,
+                        bare_retry_state=None, pipeline_alternatives=None):
         """Retrigger an expected component whose PR check never appeared."""
         now = self.clock()
+        _pipelines = set(pipeline_alternatives) if pipeline_alternatives else {pipeline}
         records = [
             r for r in history
             if r["component"] == observation["component"]
             and r["sha"] == pr.head_sha
-            and r["pipeline"] == pipeline
+            and r["pipeline"] in _pipelines
         ]
         count = len(records)
         info = {"retrigger_count": count, "status": "not-retried"}
@@ -298,8 +300,10 @@ class BuildRetryManager:
             info["reason"] = "Missing verified expected PipelineRun identity"
             return info, True
         # A check may exist while the Konflux archive is still catching up.
-        # Do not post a second /retest in that race.
-        if self._pipeline_check_exists(pr, pipeline):
+        # Do not post a second /retest in that race.  When a component has
+        # pipeline alternatives (multi-cluster), suppress retry if ANY
+        # alternative has a current-head check.
+        if any(self._pipeline_check_exists(pr, p) for p in _pipelines):
             info.update(status="build-trigger-pending",
                         reason="Current GitHub check exists; waiting for Konflux PipelineRun")
             return info, True
@@ -461,6 +465,14 @@ class BuildRetryManager:
             for item in (evidence.get("required-pipelines") or {}).get("pipelines", [])
             if isinstance(item, dict)
         }
+        # Multi-cluster alternatives: component → tuple of all pipeline names.
+        required_pipeline_alts: dict[str, tuple[str, ...]] = {}
+        for item in (evidence.get("required-pipelines") or {}).get("pipelines", []):
+            if isinstance(item, dict):
+                comp = item.get("component")
+                alts = item.get("pipeline_names")
+                if comp and isinstance(alts, list) and len(alts) > 1:
+                    required_pipeline_alts[comp] = tuple(alts)
         bare_retry_state["components"] = []
         seen_retry_components = set()
         retryable_statuses = {"missing"}
@@ -485,7 +497,8 @@ class BuildRetryManager:
                     try:
                         info, waiting = self._retry_missing(
                             pr, observation, history, pipeline, cel_evaluated=cel_evaluated,
-                            bare_retry_state=bare_retry_state
+                            bare_retry_state=bare_retry_state,
+                            pipeline_alternatives=required_pipeline_alts.get(observation["component"]),
                         )
                     except (RetryObservationChanged, KonfluxQueryError, CheckQueryError, ValueError, TypeError, KeyError) as exc:
                         info, waiting = {"status": "retry-evidence-unavailable", "reason": str(exc)}, True
@@ -519,8 +532,12 @@ class BuildRetryManager:
             try:
                 # Each component has its own lookup deadline. One slow archive
                 # query must not exhaust every subsequent component's budget.
-                # Reuse the cluster recorded on the gate receipt (P01 vs P02).
-                cluster = evidence.get("konflux-cluster")
+                # Prefer the per-component cluster from component-clusters,
+                # falling back to the overall konflux-cluster value.
+                component_clusters = evidence.get("component-clusters") or {}
+                cluster = component_clusters.get(
+                    observation["component"], evidence.get("konflux-cluster"),
+                )
                 client = (
                     self.client_factory(cluster=cluster)
                     if cluster

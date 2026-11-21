@@ -75,6 +75,7 @@ from lib.gap_check_selection import (
     fetch_file_collections,
     fetch_feasibility_run,
     fetch_tekton_documents,
+    multi_cluster_enabled,
 )
 from lib.leader_lifecycle import retire_leader, retired_outcome, validate_replacement
 from lib.konflux_builds import build_status_source
@@ -824,7 +825,7 @@ def early_gate_comment_already_present(
                 "api",
                 endpoint,
                 "--jq",
-                '[.check_runs[]? | select(.app.slug == "konflux-internal-p02" '
+                '[.check_runs[]? | select((.app.slug | startswith("konflux-internal")) '
                 'and (.name | split(" / ")[-1] == "early-gate-ci-build")) | .id]',
             ]
         )
@@ -2549,9 +2550,15 @@ def run_monitor(
         raise GapPrMonitorError(f"No pull requests listed in {path}.")
 
     if build_app_slug is None:
-        build_app_slug, env_app_id = default_build_producer()
-        if build_app_id is None:
-            build_app_id = env_app_id
+        if multi_cluster_enabled():
+            # Multi-cluster mode: accept builds from any Konflux Internal app.
+            # build_app_slug stays None, which triggers multi-cluster CEL
+            # evaluation and check-name-prefix matching throughout.
+            build_app_id = None
+        else:
+            build_app_slug, env_app_id = default_build_producer()
+            if build_app_id is None:
+                build_app_id = env_app_id
     moment = now or datetime.now().astimezone()
     runner = gh_runner or _run_gh
     try:
@@ -2604,7 +2611,7 @@ def _decide_url(
     *,
     runner: Callable[[Sequence[str]], str],
     now: datetime,
-    build_app_slug: str,
+    build_app_slug: str | None,
     build_app_id: int | None,
     retry_unknown: bool,
     component_repo_map: dict[str, frozenset[str]],
@@ -2755,7 +2762,7 @@ def _publish_gate_decision(
     description: str | None,
     runner: Callable[[Sequence[str]], str],
     now: datetime,
-    build_app_slug: str,
+    build_app_slug: str | None,
     build_app_id: int | None,
     retry_unknown: bool,
     component_repo_map: dict[str, frozenset[str]],
@@ -2836,7 +2843,7 @@ def _publish_decisions(
     description: str | None,
     runner: Callable[[Sequence[str]], str],
     now: datetime,
-    build_app_slug: str,
+    build_app_slug: str | None,
     build_app_id: int | None,
     retry_unknown: bool,
     component_repo_map: dict[str, frozenset[str]],

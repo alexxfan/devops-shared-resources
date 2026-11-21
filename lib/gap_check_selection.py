@@ -11,7 +11,7 @@ import base64
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Sequence
 from urllib.parse import urlparse
 
@@ -38,6 +38,9 @@ TARGET_BRANCH_TEMPLATE = "{{target_branch}}"
 DEFAULT_BUILD_APP_SLUG = "konflux-internal-p02"
 ENV_BUILD_APP_SLUG = "GAP_BUILD_CHECK_APP_SLUG"
 ENV_BUILD_APP_ID = "GAP_BUILD_CHECK_APP_ID"
+
+KONFLUX_CHECK_NAME_PREFIX = "konflux internal"
+KONFLUX_P02_CHECK_PREFIX = "konflux internal p02"
 
 FEASIBILITY_WORKFLOW_NAME = "Main-to-release feasibility"
 FEASIBILITY_WORKFLOW_FILE = "main-release-feasibility.yml"
@@ -103,6 +106,35 @@ def configured_konflux_cluster() -> str | None:
     host = urlparse(raw_url).hostname or ""
     match = re.match(r"^api\.([^.]+)(?:\.|$)", host)
     return match.group(1) if match else None
+
+
+def cluster_from_check_name(name: str) -> str | None:
+    """Determine the Konflux cluster ID from a GitHub check run name prefix.
+
+    Check run names from Konflux Internal apps start with the app name:
+    ``Konflux Internal p02 / …`` → ``"p02"`` and
+    ``Konflux Internal / …`` (without ``p02``) → ``"p01"``.
+    """
+    lower = name.lower()
+    if lower.startswith(KONFLUX_P02_CHECK_PREFIX):
+        return "p02"
+    if lower.startswith(KONFLUX_CHECK_NAME_PREFIX):
+        return "p01"
+    return None
+
+
+def is_konflux_internal_check(name: str) -> bool:
+    """Return True if the check run name indicates a Konflux Internal app."""
+    return name.lower().startswith(KONFLUX_CHECK_NAME_PREFIX)
+
+
+def multi_cluster_enabled() -> bool:
+    """Return True when multi-cluster build detection is active.
+
+    Multi-cluster mode is the default.  Setting ``GAP_BUILD_CHECK_APP_SLUG``
+    forces single-app mode for backward compatibility.
+    """
+    return not os.environ.get(ENV_BUILD_APP_SLUG, "").strip()
 
 
 @dataclass(frozen=True)
@@ -177,7 +209,7 @@ def select_build_checks(
     documents: Sequence[str],
     context: PullRequestContext,
     *,
-    app_slug: str,
+    app_slug: str | None,
     app_id: int | None = None,
     allowed_components: frozenset[str] | None = None,
 ) -> list[ExpectedCheck]:
@@ -189,7 +221,16 @@ def select_build_checks(
     None preserves unfiltered selection for callers without an allowlist;
     the GAP monitor always supplies a repository-scoped set. Every selected
     PipelineRun must declare a nonempty component label; names are not inferred.
+
+    When ``app_slug`` is ``None``, multi-cluster mode is used: CEL expressions
+    are evaluated with both P01 and P02 cluster values and the results are
+    unioned.  The returned checks use ``check_name_prefix`` instead of
+    ``app_slug`` to match any Konflux Internal app.
     """
+    if app_slug is None:
+        return _select_build_checks_multi_cluster(
+            documents, context, allowed_components=allowed_components,
+        )
     checks: list[ExpectedCheck] = []
     pipelines = load_pipelineruns(documents)
     expressions: list[str] = []
@@ -236,6 +277,68 @@ def select_build_checks(
             )
         )
     return checks
+
+
+def _select_build_checks_multi_cluster(
+    documents: Sequence[str],
+    context: PullRequestContext,
+    *,
+    allowed_components: frozenset[str] | None = None,
+) -> list[ExpectedCheck]:
+    """Evaluate CEL with both cluster values and union the results.
+
+    Each cluster produces its own CEL evaluation.  A PipelineRun that
+    matches *either* cluster is included.  Returned checks use
+    ``check_name_prefix`` so they match any Konflux Internal app on
+    GitHub, regardless of which cluster runs the build.
+
+    When P01 and P02 select different PipelineRun names for the same
+    component, both names are retained as alternatives.  A check run
+    matching *any* retained name satisfies the component.  When both
+    clusters select the same template, only one entry is kept.
+    """
+    cluster_cel_names = [
+        ("stone-prod-p01",),
+        ("stone-prod-p02",),
+    ]
+
+    # Collect all distinct pipeline names per component.
+    component_suffixes: dict[str, list[str]] = {}
+    for (cluster_name,) in cluster_cel_names:
+        cluster_context = replace(context, konflux_cluster=cluster_name)
+        checks = select_build_checks(
+            documents,
+            cluster_context,
+            app_slug=DEFAULT_BUILD_APP_SLUG,  # placeholder, replaced below
+            allowed_components=allowed_components,
+        )
+        for check in checks:
+            if check.key not in component_suffixes:
+                component_suffixes[check.key] = []
+            if check.name_suffix and check.name_suffix not in component_suffixes[check.key]:
+                component_suffixes[check.key].append(check.name_suffix)
+
+    result: list[ExpectedCheck] = []
+    for component, suffixes in component_suffixes.items():
+        if len(suffixes) == 1:
+            result.append(ExpectedCheck(
+                key=component,
+                name_suffix=suffixes[0],
+                app_slug=None,
+                app_id=None,
+                check_name_prefix=KONFLUX_CHECK_NAME_PREFIX,
+            ))
+        else:
+            # Different pipeline names across clusters: retain all as
+            # alternatives.  One matching check satisfies the component.
+            result.append(ExpectedCheck(
+                key=component,
+                name_suffixes=tuple(suffixes),
+                app_slug=None,
+                app_id=None,
+                check_name_prefix=KONFLUX_CHECK_NAME_PREFIX,
+            ))
+    return result
 
 
 def pipeline_is_expected(
