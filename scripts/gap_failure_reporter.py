@@ -431,10 +431,11 @@ def format_build_failure_reason(
     """Reason text listing each failing component (repo/PR in separate columns).
 
     Each component is bolded with its conclusion on its own line, separated
-    by ``<br>`` for GitHub table rendering.
+    by ``<br>`` for GitHub table rendering.  Returns an empty string when no
+    links are available — the Status column already shows ``build-failure``.
     """
     if not links:
-        return "build-failure"
+        return ""
     items = [
         f"**{_short_check_label(link.name)}**: {link.conclusion or 'failure'}"
         for link in links
@@ -684,14 +685,13 @@ def build_child_row(
         and status_key not in {"merge-failure", "build-pending", "new"}
     ):
         # Reason names/count must match Build links (not the Stage-1 status blurb).
-        if build_links or status_key == "build-failure":
-            reason_parts.append(
-                format_build_failure_reason(repo, number, build_links)
-            )
+        # The Status column already shows "build-failure", so the Reason column
+        # only adds component-level detail when available.
+        reason_text = format_build_failure_reason(repo, number, build_links)
+        if reason_text:
+            reason_parts.append(reason_text)
         elif gap_desc:
             reason_parts.append(gap_desc)
-        else:
-            reason_parts.append("build-failure")
     elif gap_desc:
         reason_parts.append(gap_desc)
     elif state_status:

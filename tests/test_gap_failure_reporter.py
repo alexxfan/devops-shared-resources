@@ -197,7 +197,8 @@ def test_format_build_failure_reason_matches_links() -> None:
     assert reason == (
         "**odh-foo-on-pull-request-9**: failure<br>**odh-bar-on-pull-request-9**: failure"
     )
-    assert fr.format_build_failure_reason("acme/r", 9, ()) == "build-failure"
+    # Empty links → empty string; Status column already shows "build-failure".
+    assert fr.format_build_failure_reason("acme/r", 9, ()) == ""
 
 
 # Replace unexpanded feasibility expressions with readable explanations, preserving other
