@@ -423,6 +423,55 @@ def _verified_konflux_run_links(
     return tuple(verified)
 
 
+def _build_failure_fallback_links(
+    evidence: dict[str, Any],
+    head_sha: str,
+) -> tuple[BuildCheckLink, ...]:
+    """Descriptive text-only entries for build-failure rows without verified links.
+
+    When ``_verified_konflux_run_links`` returns nothing (e.g. the Repository CR
+    is missing so builds were never triggered, or the PipelineRun URL did not pass
+    strict host/path validation), produce text-only entries so the Build links
+    column shows something useful instead of a bare dash.
+
+    These entries intentionally carry no URL.  Only ``_verified_konflux_run_links``
+    is allowed to produce clickable links — its host/path validation prevents
+    untrusted URLs from being rendered as Markdown links.
+    """
+    runs = evidence.get("runs", [])
+    if not runs:
+        return ()
+
+    links: list[BuildCheckLink] = []
+    for record in runs:
+        if not isinstance(record, dict):
+            continue
+        if record.get("head_sha") != head_sha:
+            continue
+        status = str(record.get("status") or "")
+        name = str(
+            record.get("name") or record.get("pipeline_name")
+            or record.get("component") or "build"
+        ).strip() or "build"
+
+        if status == "missing":
+            # Missing builds have no pipeline name; use component label.
+            comp = str(record.get("component") or name).strip() or name
+            links.append(BuildCheckLink(
+                name=f"{comp}: no builds triggered",
+                conclusion="missing",
+                url="",
+            ))
+        elif status in _FAILED_KONFLUX_STATUSES:
+            links.append(BuildCheckLink(
+                name=f"{name}: {status}",
+                conclusion=status,
+                url="",
+            ))
+    links.sort(key=lambda link: (link.name.lower(), link.url))
+    return tuple(links)
+
+
 def format_build_failure_reason(
     repo: str,
     pr_number: int,
@@ -529,9 +578,14 @@ def fetch_failed_build_check_links(
 def format_build_links_cell(links: Sequence[BuildCheckLink]) -> str:
     if not links:
         return "—"
-    return "<br>".join(
-        f"[{_short_check_label(link.name)}]({link.url})" for link in links
-    )
+    parts: list[str] = []
+    for link in links:
+        label = _short_check_label(link.name)
+        if link.url:
+            parts.append(f"[{label}]({link.url})")
+        else:
+            parts.append(label)
+    return "<br>".join(parts)
 
 
 def should_report_child(*, state_status: str, pr_state: str) -> bool:
@@ -625,6 +679,8 @@ def build_child_row(
                 build_links = _verified_konflux_run_links(
                     evidence, head_sha, statuses=_FAILED_KONFLUX_STATUSES
                 )
+                if not build_links:
+                    build_links = _build_failure_fallback_links(evidence, head_sha)
             elif status_key == "merge-failure":
                 # Include failed Konflux build links even on merge-failure
                 # PRs so operators can see which builds also need attention.

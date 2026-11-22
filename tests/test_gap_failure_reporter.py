@@ -731,3 +731,261 @@ def test_verified_konflux_run_links_env_var_adds_to_trusted_set(monkeypatch) -> 
     links_p01 = fr._verified_konflux_run_links(evidence_p01, head)
     assert len(links_p01) == 1
     assert _P01_HOST in links_p01[0].url
+
+
+# --- Build links fallback for missing / non-verified builds ---
+
+
+def test_build_failure_fallback_missing_builds_show_descriptive_text(monkeypatch) -> None:
+    """build-failure rows with only 'missing' status show 'no builds triggered' text."""
+    monkeypatch.setattr(fr, "build_status_source", lambda: "konflux")
+    monkeypatch.setenv("KONFLUX_UI_URL", "https://konflux-ui.example")
+    head = "e" * 40
+    entry = {
+        "repo": "acme/ai-gateway",
+        "pr-url": "https://github.com/acme/ai-gateway/pull/10",
+        "pr-status": "build-failure",
+        "build-observations": {
+            "source": "konflux",
+            "repository": "acme/ai-gateway",
+            "pr": 10,
+            "head-sha": head,
+            "pr-state": "OPEN",
+            "runs": [
+                {
+                    "component": "odh-ai-gateway",
+                    "status": "missing",
+                    "head_sha": head,
+                    "url": "",
+                    "name": "",
+                    "uid": "",
+                    "namespace": "",
+                    "pipeline_name": "",
+                    "reason": "No matching current-head Konflux PipelineRun found",
+                    "completed_at": "",
+                    "message": "",
+                    "created_at": "",
+                    "retry": {
+                        "status": "retry-exhausted",
+                        "retrigger_count": 5,
+                        "reason": "Five automatic retries already used for this component and SHA",
+                    },
+                },
+            ],
+        },
+    }
+    monkeypatch.setattr(fr, "fetch_pull_request", lambda *a, **kw: {
+        "state": "OPEN", "number": 10, "headRefOid": head, "mergedAt": None,
+    })
+    row = fr.build_child_row(entry, gh_runner=lambda _: "", reuse_monitor_evidence=True)
+    assert row is not None
+    assert len(row.build_links) == 1
+    assert "no builds triggered" in row.build_links[0].name
+    assert row.build_links[0].url == ""
+    # The cell renders as plain text, not "—".
+    cell = fr.format_build_links_cell(row.build_links)
+    assert cell != "—"
+    assert "no builds triggered" in cell
+
+
+def test_build_failure_fallback_failed_with_unverified_url(monkeypatch) -> None:
+    """Failed builds whose URL doesn't pass strict validation show text-only entries."""
+    monkeypatch.setattr(fr, "build_status_source", lambda: "konflux")
+    monkeypatch.setenv("KONFLUX_UI_URL", "https://konflux-ui.example")
+    head = "f" * 40
+    entry = {
+        "repo": "acme/modelexpress",
+        "pr-url": "https://github.com/acme/modelexpress/pull/3",
+        "pr-status": "build-failure",
+        "build-observations": {
+            "source": "konflux",
+            "repository": "acme/modelexpress",
+            "pr": 3,
+            "head-sha": head,
+            "pr-state": "OPEN",
+            "runs": [
+                {
+                    "component": "odh-modelexpress",
+                    "status": "failure",
+                    "head_sha": head,
+                    # Different host — strict validation rejects this.
+                    "url": "https://other-konflux.example/ns/rhoai-tenant/pipelinerun/odh-modelexpress-pr3-abc",
+                    "name": "odh-modelexpress-on-pull-request",
+                    "uid": "uid-m1",
+                    "namespace": "rhoai-tenant",
+                    "pipeline_name": "odh-modelexpress-on-pull-request",
+                    "reason": "PipelineRunTimeout",
+                    "completed_at": "",
+                    "message": "",
+                    "created_at": "",
+                },
+            ],
+        },
+    }
+    monkeypatch.setattr(fr, "fetch_pull_request", lambda *a, **kw: {
+        "state": "OPEN", "number": 3, "headRefOid": head, "mergedAt": None,
+    })
+    row = fr.build_child_row(entry, gh_runner=lambda _: "", reuse_monitor_evidence=True)
+    assert row is not None
+    # Fallback shows text-only entry (no URL) — untrusted hosts must not become links.
+    assert len(row.build_links) == 1
+    assert row.build_links[0].url == ""
+    assert "failure" in row.build_links[0].name
+    cell = fr.format_build_links_cell(row.build_links)
+    assert cell != "—"
+    assert "odh-modelexpress" in cell
+
+
+def test_format_build_links_cell_handles_empty_url() -> None:
+    """BuildCheckLink with empty URL renders as plain text, not a markdown link."""
+    links = [
+        fr.BuildCheckLink(
+            name="odh-widget: no builds triggered",
+            conclusion="missing",
+            url="",
+        ),
+    ]
+    cell = fr.format_build_links_cell(links)
+    assert cell == "odh-widget: no builds triggered"
+    assert "[" not in cell  # No markdown link syntax.
+
+
+def test_format_build_links_cell_mixed_url_and_text() -> None:
+    """Mix of URL-bearing and URL-less entries renders correctly."""
+    links = [
+        fr.BuildCheckLink(
+            name="Konflux / odh-foo-on-pull-request",
+            conclusion="failure",
+            url="https://konflux-ui.example/ns/rhoai-tenant/pipelinerun/odh-foo-abc",
+        ),
+        fr.BuildCheckLink(
+            name="odh-bar: no builds triggered",
+            conclusion="missing",
+            url="",
+        ),
+    ]
+    cell = fr.format_build_links_cell(links)
+    assert "[odh-foo-on-pull-request]" in cell
+    assert "odh-bar: no builds triggered" in cell
+    assert "<br>" in cell
+
+
+def test_build_failure_fallback_links_missing_component() -> None:
+    """_build_failure_fallback_links returns text entries for missing builds."""
+    head = "a" * 40
+    evidence = {
+        "runs": [
+            {
+                "component": "odh-widget",
+                "status": "missing",
+                "head_sha": head,
+                "url": "",
+                "name": "",
+            },
+        ],
+    }
+    links = fr._build_failure_fallback_links(evidence, head)
+    assert len(links) == 1
+    assert "no builds triggered" in links[0].name
+    assert links[0].url == ""
+    assert links[0].conclusion == "missing"
+
+
+def test_build_failure_fallback_links_failed_no_url() -> None:
+    """Failed builds with no URL get a text-only entry with status."""
+    head = "a" * 40
+    evidence = {
+        "runs": [
+            {
+                "component": "odh-widget",
+                "status": "failure",
+                "head_sha": head,
+                "url": "",
+            },
+        ],
+    }
+    links = fr._build_failure_fallback_links(evidence, head)
+    assert len(links) == 1
+    assert "failure" in links[0].name
+    assert links[0].url == ""
+
+
+def test_build_failure_fallback_links_failed_text_only() -> None:
+    """Failed builds in fallback produce text-only entries (no URL for safety)."""
+    head = "a" * 40
+    evidence = {
+        "runs": [
+            {
+                "component": "odh-widget",
+                "status": "failure",
+                "head_sha": head,
+                "url": "https://other.example/ns/tenant/pipelinerun/widget-abc",
+                "name": "odh-widget-on-pull-request",
+            },
+        ],
+    }
+    links = fr._build_failure_fallback_links(evidence, head)
+    assert len(links) == 1
+    # No URL in fallback — only _verified_konflux_run_links may produce links.
+    assert links[0].url == ""
+    assert "odh-widget-on-pull-request" in links[0].name
+    assert "failure" in links[0].name
+
+
+def test_build_failure_fallback_skips_wrong_head_sha() -> None:
+    """Fallback ignores runs whose head_sha doesn't match."""
+    evidence = {
+        "runs": [
+            {
+                "component": "odh-widget",
+                "status": "missing",
+                "head_sha": "b" * 40,
+                "url": "",
+            },
+        ],
+    }
+    links = fr._build_failure_fallback_links(evidence, "a" * 40)
+    assert len(links) == 0
+
+
+def test_build_failure_verified_links_still_preferred(monkeypatch) -> None:
+    """When verified links exist, the fallback is not used."""
+    monkeypatch.setattr(fr, "build_status_source", lambda: "konflux")
+    monkeypatch.setenv("KONFLUX_UI_URL", "https://konflux-ui.example")
+    head = "d" * 40
+    entry = {
+        "repo": "acme/repo",
+        "pr-url": "https://github.com/acme/repo/pull/5",
+        "pr-status": "build-failure",
+        "build-observations": {
+            "source": "konflux",
+            "repository": "acme/repo",
+            "pr": 5,
+            "head-sha": head,
+            "pr-state": "OPEN",
+            "runs": [
+                {
+                    "component": "odh-foo",
+                    "status": "failure",
+                    "head_sha": head,
+                    "url": "https://konflux-ui.example/ns/rhoai-tenant/pipelinerun/odh-foo-pr5-abc",
+                    "name": "odh-foo-on-pull-request",
+                    "uid": "uid1",
+                    "namespace": "rhoai-tenant",
+                    "pipeline_name": "odh-foo-on-pull-request",
+                    "reason": "PipelineRunTimeout",
+                    "completed_at": "",
+                    "message": "",
+                    "created_at": "",
+                },
+            ],
+        },
+    }
+    monkeypatch.setattr(fr, "fetch_pull_request", lambda *a, **kw: {
+        "state": "OPEN", "number": 5, "headRefOid": head, "mergedAt": None,
+    })
+    row = fr.build_child_row(entry, gh_runner=lambda _: "", reuse_monitor_evidence=True)
+    assert row is not None
+    # Verified link is used (has proper Konflux URL), not fallback.
+    assert len(row.build_links) == 1
+    assert row.build_links[0].url == "https://konflux-ui.example/ns/rhoai-tenant/pipelinerun/odh-foo-pr5-abc"
