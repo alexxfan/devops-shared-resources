@@ -41,7 +41,7 @@ from lib.leader_lifecycle import retired_outcome
 from lib.leader_history import history_state_outcome
 
 from lib.gap_check_selection import DEFAULT_BUILD_APP_SLUG, default_build_producer
-from lib.konflux_builds import build_status_source, DEFAULT_UI
+from lib.konflux_builds import build_status_source, DEFAULT_UI, DEFAULT_P01_UI
 from lib.github_check_runs import CheckQueryError, list_check_runs
 from lib.pr_status_updater import GhCommandError, parse_pr_url
 from scripts import gap_pr_monitor as gpm
@@ -391,7 +391,15 @@ def _verified_konflux_run_links(
     """
     from urllib.parse import urlsplit
 
-    expected_host = urlsplit(os.environ.get("KONFLUX_UI_URL", DEFAULT_UI)).netloc
+    trusted_hosts: set[str] = {
+        urlsplit(DEFAULT_UI).netloc,
+        urlsplit(DEFAULT_P01_UI).netloc,
+    }
+    env_ui = os.environ.get("KONFLUX_UI_URL", "").strip()
+    if env_ui:
+        env_netloc = urlsplit(env_ui).netloc
+        if env_netloc:
+            trusted_hosts.add(env_netloc)
     verified: list[BuildCheckLink] = []
     seen_urls: set[str] = set()
     for record in evidence.get("runs", []):
@@ -401,7 +409,7 @@ def _verified_konflux_run_links(
             continue
         link = str(record.get("url", "")).strip()
         parsed = urlsplit(link)
-        if not (parsed.scheme == "https" and parsed.netloc == expected_host
+        if not (parsed.scheme == "https" and parsed.netloc in trusted_hosts
                 and re.fullmatch(r"/ns/[a-z0-9.-]+/pipelinerun/[a-z0-9.-]+", parsed.path)
                 and not parsed.query and not parsed.fragment):
             continue
