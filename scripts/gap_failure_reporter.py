@@ -174,6 +174,15 @@ def _cell(text: str) -> str:
     return _PIPE.sub("\\|", _clip(text, 200))
 
 
+def _reason_cell(text: str) -> str:
+    """Escape a reason string for a markdown table cell, preserving ``<br>`` breaks."""
+    if "<br>" not in text:
+        return _cell(text)
+    parts = text.split("<br>")
+    escaped = [_PIPE.sub("\\|", p.strip()) for p in parts]
+    return "<br>".join(escaped)
+
+
 def extract_close_reason_from_comments(comments: Sequence[dict[str, Any]]) -> str | None:
     scored: list[tuple[int, str]] = []
     for comment in comments:
@@ -411,17 +420,18 @@ def format_build_failure_reason(
     pr_number: int,
     links: Sequence[BuildCheckLink],
 ) -> str:
-    """Reason text that matches the Build links column (same names and count)."""
-    prefix = f"{repo}#{pr_number} build-failure"
+    """Reason text listing each failing component (repo/PR in separate columns).
+
+    Each component is bolded with its conclusion on its own line, separated
+    by ``<br>`` for GitHub table rendering.
+    """
     if not links:
-        return prefix
-    first = _short_check_label(links[0].name)
-    conc = links[0].conclusion or "failure"
-    text = f"{prefix}: {first} concluded {conc}"
-    extra = len(links) - 1
-    if extra > 0:
-        text += f" (+{extra} more)"
-    return text
+        return "build-failure"
+    items = [
+        f"**{_short_check_label(link.name)}**: {link.conclusion or 'failure'}"
+        for link in links
+    ]
+    return "<br>".join(items)
 
 
 # Unexpanded Actions matrix placeholder — appears when main-release-feasibility
@@ -600,8 +610,8 @@ def build_child_row(
                     else:
                         duration = _format_pending_duration(r.get("created_at") or r.get("created-at", ""))
                         detail = duration if duration != "pending" else str(r.get("status", "unknown"))
-                    pending.append(f"{comp}: {detail}")
-                evidence_reason = "Konflux: " + "; ".join(pending) if pending else "Awaiting monitor refresh"
+                    pending.append(f"**{comp}**: {detail}")
+                evidence_reason = "<br>".join(pending) if pending else "Awaiting monitor refresh"
             if status_key == "build-failure":
                 build_links = _verified_konflux_run_links(
                     evidence, head_sha, statuses=_FAILED_KONFLUX_STATUSES
@@ -621,14 +631,15 @@ def build_child_row(
                     evidence, head_sha, statuses=_ACTIVE_KONFLUX_STATUSES
                 )
             retry_details = [
-                str(record.get("component", "?")) + ": " + str(record["retry"].get("status", "unknown"))
+                f"**{record.get('component', '?')}**: "
+                + str(record["retry"].get("status", "unknown"))
                 + ": " + str(record["retry"].get("reason", ""))
                 for record in evidence.get("runs", [])
                 if isinstance(record, dict) and isinstance(record.get("retry"), dict)
                 and record.get("status") != "success"
             ]
             if retry_details:
-                evidence_reason = "; ".join(filter(None, [evidence_reason, *retry_details]))
+                evidence_reason = "<br>".join(filter(None, [evidence_reason, *retry_details]))
     elif status_key == "merge-failure":
         # Include the feasibility workflow URL when available.
         feas_link = _feasibility_check_link(entry)
@@ -658,7 +669,7 @@ def build_child_row(
         reason_parts.append(evidence_reason or "builds pending")
     elif status_key == "merge-failure":
         reason_parts.append(
-            humanize_merge_failure_reason(gap_desc or f"{repo}#{number} merge-failure")
+            humanize_merge_failure_reason(gap_desc or "merge-failure")
         )
     elif status_key == "build-failure" or (
         pr_state == "closed"
@@ -672,7 +683,7 @@ def build_child_row(
         elif gap_desc:
             reason_parts.append(gap_desc)
         else:
-            reason_parts.append(f"{repo}#{number} build-failure")
+            reason_parts.append("build-failure")
     elif gap_desc:
         reason_parts.append(gap_desc)
     elif state_status:
@@ -824,7 +835,7 @@ def render_summary_markdown(
                     pr_link,
                     _cell(row.state_status),
                     _cell(row.pr_state + ("/merged" if row.merged else "")),
-                    _cell(row.reason),
+                    _reason_cell(row.reason),
                     format_build_links_cell(row.build_links),
                     tracking_cell(tracking, row.pr_url),
                 ]

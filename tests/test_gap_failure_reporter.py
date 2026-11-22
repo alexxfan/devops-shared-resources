@@ -179,7 +179,7 @@ def test_select_failed_build_checks_on_pull_request_only() -> None:
     assert "on-pull-request" in links[0].name
 
 
-# Describe the first failed build and count additional failures without inventing details.
+# List each failing component with bold name; no repo#PR prefix (shown in separate columns).
 def test_format_build_failure_reason_matches_links() -> None:
     links = (
         fr.BuildCheckLink(
@@ -195,9 +195,9 @@ def test_format_build_failure_reason_matches_links() -> None:
     )
     reason = fr.format_build_failure_reason("acme/r", 9, links)
     assert reason == (
-        "acme/r#9 build-failure: odh-foo-on-pull-request-9 concluded failure (+1 more)"
+        "**odh-foo-on-pull-request-9**: failure<br>**odh-bar-on-pull-request-9**: failure"
     )
-    assert fr.format_build_failure_reason("acme/r", 9, ()) == "acme/r#9 build-failure"
+    assert fr.format_build_failure_reason("acme/r", 9, ()) == "build-failure"
 
 
 # Replace unexpanded feasibility expressions with readable explanations, preserving other
