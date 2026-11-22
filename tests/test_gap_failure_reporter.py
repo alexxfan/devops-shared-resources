@@ -197,7 +197,8 @@ def test_format_build_failure_reason_matches_links() -> None:
     assert reason == (
         "**odh-foo-on-pull-request-9**: failure<br>**odh-bar-on-pull-request-9**: failure"
     )
-    assert fr.format_build_failure_reason("acme/r", 9, ()) == "build-failure"
+    # Empty links → empty string; Status column already shows "build-failure".
+    assert fr.format_build_failure_reason("acme/r", 9, ()) == ""
 
 
 # Replace unexpanded feasibility expressions with readable explanations, preserving other
@@ -659,3 +660,74 @@ def test_feasibility_check_link_present() -> None:
     assert link is not None
     assert link.name == "Main-to-release feasibility"
     assert link.url == "https://github.com/acme/r/actions/runs/555"
+
+
+# --- Multi-cluster URL acceptance tests ---
+
+_P02_HOST = "konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com"
+_P01_HOST = "konflux-ui.apps.stone-prod-p01.wcfb.p1.openshiftapps.com"
+
+
+def _make_evidence(host: str, head: str) -> dict:
+    """Build minimal Konflux evidence with one failing run on the given host."""
+    return {
+        "runs": [
+            {
+                "component": "odh-comp",
+                "status": "failure",
+                "head_sha": head,
+                "url": f"https://{host}/ns/rhoai-tenant/pipelinerun/odh-comp-abc",
+                "name": "odh-comp-on-pull-request",
+            },
+        ],
+    }
+
+
+def test_verified_konflux_run_links_accepts_p02_url(monkeypatch) -> None:
+    """P02 URLs are accepted without any KONFLUX_UI_URL env var."""
+    monkeypatch.delenv("KONFLUX_UI_URL", raising=False)
+    head = "a" * 40
+    evidence = _make_evidence(_P02_HOST, head)
+    links = fr._verified_konflux_run_links(evidence, head)
+    assert len(links) == 1
+    assert _P02_HOST in links[0].url
+
+
+def test_verified_konflux_run_links_accepts_p01_url(monkeypatch) -> None:
+    """P01 URLs are accepted without any KONFLUX_UI_URL env var."""
+    monkeypatch.delenv("KONFLUX_UI_URL", raising=False)
+    head = "b" * 40
+    evidence = _make_evidence(_P01_HOST, head)
+    links = fr._verified_konflux_run_links(evidence, head)
+    assert len(links) == 1
+    assert _P01_HOST in links[0].url
+
+
+def test_verified_konflux_run_links_rejects_untrusted_host(monkeypatch) -> None:
+    """URLs from an untrusted host are rejected even with valid paths."""
+    monkeypatch.delenv("KONFLUX_UI_URL", raising=False)
+    head = "c" * 40
+    evidence = _make_evidence("evil.example.com", head)
+    links = fr._verified_konflux_run_links(evidence, head)
+    assert len(links) == 0
+
+
+def test_verified_konflux_run_links_env_var_adds_to_trusted_set(monkeypatch) -> None:
+    """KONFLUX_UI_URL adds to the trusted set; P01 and P02 remain accepted."""
+    monkeypatch.setenv("KONFLUX_UI_URL", "https://konflux-ui.custom.example")
+    head = "d" * 40
+    # Custom host accepted
+    evidence_custom = _make_evidence("konflux-ui.custom.example", head)
+    links_custom = fr._verified_konflux_run_links(evidence_custom, head)
+    assert len(links_custom) == 1
+    assert "konflux-ui.custom.example" in links_custom[0].url
+    # P02 still accepted alongside custom
+    evidence_p02 = _make_evidence(_P02_HOST, head)
+    links_p02 = fr._verified_konflux_run_links(evidence_p02, head)
+    assert len(links_p02) == 1
+    assert _P02_HOST in links_p02[0].url
+    # P01 still accepted alongside custom
+    evidence_p01 = _make_evidence(_P01_HOST, head)
+    links_p01 = fr._verified_konflux_run_links(evidence_p01, head)
+    assert len(links_p01) == 1
+    assert _P01_HOST in links_p01[0].url

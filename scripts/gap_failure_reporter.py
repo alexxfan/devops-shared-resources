@@ -41,7 +41,7 @@ from lib.leader_lifecycle import retired_outcome
 from lib.leader_history import history_state_outcome
 
 from lib.gap_check_selection import DEFAULT_BUILD_APP_SLUG, default_build_producer
-from lib.konflux_builds import build_status_source, DEFAULT_UI
+from lib.konflux_builds import build_status_source, DEFAULT_UI, DEFAULT_P01_UI
 from lib.github_check_runs import CheckQueryError, list_check_runs
 from lib.pr_status_updater import GhCommandError, parse_pr_url
 from scripts import gap_pr_monitor as gpm
@@ -391,7 +391,15 @@ def _verified_konflux_run_links(
     """
     from urllib.parse import urlsplit
 
-    expected_host = urlsplit(os.environ.get("KONFLUX_UI_URL", DEFAULT_UI)).netloc
+    trusted_hosts: set[str] = {
+        urlsplit(DEFAULT_UI).netloc,
+        urlsplit(DEFAULT_P01_UI).netloc,
+    }
+    env_ui = os.environ.get("KONFLUX_UI_URL", "").strip()
+    if env_ui:
+        env_netloc = urlsplit(env_ui).netloc
+        if env_netloc:
+            trusted_hosts.add(env_netloc)
     verified: list[BuildCheckLink] = []
     seen_urls: set[str] = set()
     for record in evidence.get("runs", []):
@@ -401,7 +409,7 @@ def _verified_konflux_run_links(
             continue
         link = str(record.get("url", "")).strip()
         parsed = urlsplit(link)
-        if not (parsed.scheme == "https" and parsed.netloc == expected_host
+        if not (parsed.scheme == "https" and parsed.netloc in trusted_hosts
                 and re.fullmatch(r"/ns/[a-z0-9.-]+/pipelinerun/[a-z0-9.-]+", parsed.path)
                 and not parsed.query and not parsed.fragment):
             continue
@@ -423,10 +431,11 @@ def format_build_failure_reason(
     """Reason text listing each failing component (repo/PR in separate columns).
 
     Each component is bolded with its conclusion on its own line, separated
-    by ``<br>`` for GitHub table rendering.
+    by ``<br>`` for GitHub table rendering.  Returns an empty string when no
+    links are available — the Status column already shows ``build-failure``.
     """
     if not links:
-        return "build-failure"
+        return ""
     items = [
         f"**{_short_check_label(link.name)}**: {link.conclusion or 'failure'}"
         for link in links
@@ -676,14 +685,13 @@ def build_child_row(
         and status_key not in {"merge-failure", "build-pending", "new"}
     ):
         # Reason names/count must match Build links (not the Stage-1 status blurb).
-        if build_links or status_key == "build-failure":
-            reason_parts.append(
-                format_build_failure_reason(repo, number, build_links)
-            )
+        # The Status column already shows "build-failure", so the Reason column
+        # only adds component-level detail when available.
+        reason_text = format_build_failure_reason(repo, number, build_links)
+        if reason_text:
+            reason_parts.append(reason_text)
         elif gap_desc:
             reason_parts.append(gap_desc)
-        else:
-            reason_parts.append("build-failure")
     elif gap_desc:
         reason_parts.append(gap_desc)
     elif state_status:
