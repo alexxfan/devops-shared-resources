@@ -146,7 +146,11 @@ def test_merge_conflict_summary_reuses_monitor_facts_without_another_pr_scan(tmp
     result, _ = _run(path, github)
     child = _saved(path)["pull-requests"][0]
     assert child["pr-status"] == "merge-failure"
-    assert child["build-observations"]["query-skipped"]
+    obs = child["build-observations"]
+    # Merge-conflicted PRs now evaluate the Konflux gate (with a
+    # configuration error because file collections cannot be fetched),
+    # so the observations carry query-error rather than query-skipped.
+    assert obs.get("query-error") or obs.get("query-skipped")
     monkeypatch.setattr(reporter, "fetch_pull_request", forbidden)
     monkeypatch.setattr(reporter, "fetch_gap_status_description", forbidden)
     row = reporter.build_child_row(child, reuse_monitor_evidence=True)

@@ -446,9 +446,16 @@ def test_real_monitor_integration_preserves_child_hold_and_gate_rules(tmp_path, 
         assert updater.posts[0][1] == "pending"
         assert should_trigger_early_gate(_saved(path))
         assert _saved(path)["pull-requests"][0]["build-observations"]["retry-history"]
+    elif enabled and feasibility_fails:
+        # Build retries fire even on merge-failure PRs: failed builds are
+        # retried regardless of feasibility state so that build status is
+        # current when the feasibility issue is resolved.
+        assert len(ledger.posts) == 1
+        assert saved["pull-requests"][0]["pr-status"] == "merge-failure"
+        assert saved["pull-requests"][0]["build-observations"]["retry-history"]
     else:
         assert not ledger.posts
-        assert saved["pull-requests"][0]["pr-status"] == ("merge-failure" if feasibility_fails else "build-failure")
+        assert saved["pull-requests"][0]["pr-status"] == "build-failure"
 
 
 def test_new_sha_gets_its_own_budget(tmp_path):
@@ -999,3 +1006,52 @@ def test_saved_records_counted_without_migration():
     assert gate.outcome == "fail"
     assert not gh.posts
     assert receipt["runs"][0]["retry"]["status"] == "retry-exhausted"
+
+
+# --- Change 1: build retries are decoupled from merge feasibility ---
+
+
+def test_retry_applies_on_merge_failure_pr():
+    """Retries fire for failed builds on merge-failure PRs (decoupled from feasibility)."""
+    gh, client = FakeGitHub(), FakeKonflux()
+    # Simulate a merge-failure PR (the retry manager should still apply).
+    merge_failure_pr = replace(PR, mergeable="CONFLICTING", merge_state_status="DIRTY")
+    gate, evidence = evaluate(client)
+    mgr = manager(gh, client)
+    # With the decoupling, retries should be applied even though the final
+    # decision will be merge-failure.
+    gate_out, evidence_out = mgr.apply(merge_failure_pr, gate, evidence)
+    # The retry was posted (the build had a failure that was retried).
+    assert len(gh.posts) == 1
+    assert "/retest" in gh.posts[0]
+    assert evidence_out["retry-history"]
+
+
+def test_retry_skipped_for_merged_pr():
+    """Retries should NOT fire for already-merged PRs."""
+    gh, client = FakeGitHub(), FakeKonflux()
+    merged_pr = replace(PR, state="MERGED")
+    gate, evidence = evaluate(client)
+    mgr = manager(gh, client)
+    gate_out, evidence_out = mgr.apply(merged_pr, gate, evidence)
+    # Merged PRs are skipped by the retry manager's own guard.
+    assert not gh.posts
+
+
+def test_merge_conflict_pr_gets_konflux_observations(tmp_path, monkeypatch):
+    """Merge-conflicted PRs still get Konflux build observations for retries."""
+    from tests.test_gap_repository_gates import _GitHub, _state, _run, _saved
+    github = _GitHub()
+    github.mergeable = "CONFLICTING"
+    monkeypatch.setenv("GAP_BUILD_STATUS_SOURCE", "konflux")
+    monkeypatch.setattr(KonfluxClient, "from_environment", lambda **_: FakeKonflux())
+    path = _state(tmp_path)
+    result, _ = _run(path, github)
+    saved = _saved(path)
+    child = saved["pull-requests"][0]
+    assert child["pr-status"] == "merge-failure"
+    obs = child["build-observations"]
+    assert obs["source"] == "konflux"
+    # Check runs are fetched and Konflux gate is evaluated even for
+    # merge-conflicted PRs.
+    assert "head-sha" in obs

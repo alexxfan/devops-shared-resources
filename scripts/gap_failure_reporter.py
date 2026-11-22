@@ -89,6 +89,46 @@ _CLOSE_REASON_PATTERNS: tuple[re.Pattern[str], ...] = (
 _PIPE = re.compile(r"\|")
 
 
+def _format_pending_duration(created_at: str) -> str:
+    """Human-readable duration since PipelineRun creation, e.g. '3h 45m pending'."""
+    if not created_at or not isinstance(created_at, str):
+        return "pending"
+    try:
+        created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            return "pending"
+        delta = datetime.now(timezone.utc) - created
+        total_seconds = max(0, int(delta.total_seconds()))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes = remainder // 60
+        if hours > 0:
+            return f"{hours}h {minutes:02d}m pending"
+        if minutes > 0:
+            return f"{minutes}m pending"
+        return "pending"
+    except (ValueError, TypeError, OverflowError):
+        return "pending"
+
+
+def _feasibility_check_link(entry: dict[str, Any]) -> BuildCheckLink | None:
+    """Extract the feasibility workflow URL from merge-observations for merge-failure rows."""
+    merge_obs = entry.get("merge-observations")
+    if not isinstance(merge_obs, dict):
+        return None
+    feasibility = merge_obs.get("feasibility")
+    if not isinstance(feasibility, dict):
+        return None
+    url = str(feasibility.get("url") or "").strip()
+    if not url:
+        return None
+    conclusion = str(feasibility.get("conclusion") or "failure")
+    return BuildCheckLink(
+        name="Main-to-release feasibility",
+        conclusion=conclusion,
+        url=url,
+    )
+
+
 @dataclass(frozen=True)
 class BuildCheckLink:
     name: str
@@ -550,14 +590,32 @@ def build_child_row(
             if evidence.get("query-error"):
                 evidence_reason = "Konflux lookup unavailable: " + _clip(str(evidence["query-error"]))
             elif status_key in {"build-pending", "new"}:
-                pending = [str(r.get("component", "?")) + ": " + (str(r["retry"].get("status", "unknown")) + ": " + str(r["retry"].get("reason", ""))
-                            if r.get("retry") else str(r.get("status", "unknown")))
-                           for r in evidence.get("runs", []) if isinstance(r, dict) and r.get("status") != "success"]
+                pending = []
+                for r in evidence.get("runs", []):
+                    if not isinstance(r, dict) or r.get("status") == "success":
+                        continue
+                    comp = str(r.get("component", "?"))
+                    if r.get("retry"):
+                        detail = str(r["retry"].get("status", "unknown")) + ": " + str(r["retry"].get("reason", ""))
+                    else:
+                        duration = _format_pending_duration(r.get("created_at") or r.get("created-at", ""))
+                        detail = duration if duration != "pending" else str(r.get("status", "unknown"))
+                    pending.append(f"{comp}: {detail}")
                 evidence_reason = "Konflux: " + "; ".join(pending) if pending else "Awaiting monitor refresh"
             if status_key == "build-failure":
                 build_links = _verified_konflux_run_links(
                     evidence, head_sha, statuses=_FAILED_KONFLUX_STATUSES
                 )
+            elif status_key == "merge-failure":
+                # Include failed Konflux build links even on merge-failure
+                # PRs so operators can see which builds also need attention.
+                build_links = _verified_konflux_run_links(
+                    evidence, head_sha, statuses=_FAILED_KONFLUX_STATUSES
+                )
+                # Also include the feasibility check URL if available.
+                feas_link = _feasibility_check_link(entry)
+                if feas_link:
+                    build_links = (feas_link,) + build_links
             elif status_key in {"build-pending", "new"}:
                 build_links = _verified_konflux_run_links(
                     evidence, head_sha, statuses=_ACTIVE_KONFLUX_STATUSES
@@ -571,11 +629,13 @@ def build_child_row(
             ]
             if retry_details:
                 evidence_reason = "; ".join(filter(None, [evidence_reason, *retry_details]))
-    elif status_key in {"merge-failure", "build-pending", "new"}:
-        # Merge-feasibility and legacy pending rows have no trusted Konflux
-        # receipt to link. Keep the Build links cell empty so a feasibility
-        # workflow is not presented as a component PipelineRun.
-        build_links: tuple[BuildCheckLink, ...] = ()
+    elif status_key == "merge-failure":
+        # Include the feasibility workflow URL when available.
+        feas_link = _feasibility_check_link(entry)
+        build_links: tuple[BuildCheckLink, ...] = (feas_link,) if feas_link else ()
+    elif status_key in {"build-pending", "new"}:
+        # Legacy pending rows have no trusted Konflux receipt to link.
+        build_links = ()
     else:
         build_links = fetch_failed_build_check_links(
             ref.owner,
