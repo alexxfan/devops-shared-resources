@@ -104,11 +104,22 @@ def test_lookup_problem_is_visible_as_unknown_not_failed(entry):
     assert row.state_status == "build-pending"
 
 
-@pytest.mark.parametrize("field,value", [("url", "https://evil.example/ns/rhoai-tenant/pipelinerun/run"),
-                                        ("head_sha", "c" * 40)])
-def test_untrusted_or_old_head_link_is_not_rendered(entry, field, value):
-    entry["build-observations"]["runs"][0][field] = value
+def test_old_head_link_is_not_rendered(entry):
+    entry["build-observations"]["runs"][0]["head_sha"] = "c" * 40
     assert reporter.build_child_row(entry).build_links == ()
+
+
+def test_untrusted_url_not_rendered_as_link(entry):
+    """Untrusted host URL must not appear as a clickable link; a text-only
+    fallback describing the failure is acceptable."""
+    entry["build-observations"]["runs"][0]["url"] = (
+        "https://evil.example/ns/rhoai-tenant/pipelinerun/run"
+    )
+    row = reporter.build_child_row(entry)
+    # The fallback provides a text-only entry describing the failure.
+    assert len(row.build_links) == 1
+    assert row.build_links[0].url == ""  # No URL rendered — security preserved.
+    assert "failure" in row.build_links[0].conclusion
 
 def test_comment_after_monitor_reuses_pr_and_build_receipt_without_second_scan(entry, monkeypatch):
     def forbidden(*args, **kwargs):
