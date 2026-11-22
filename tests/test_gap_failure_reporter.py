@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from scripts import gap_failure_reporter as fr
@@ -178,7 +179,7 @@ def test_select_failed_build_checks_on_pull_request_only() -> None:
     assert "on-pull-request" in links[0].name
 
 
-# Describe the first failed build and count additional failures without inventing details.
+# List each failing component with bold name; no repo#PR prefix (shown in separate columns).
 def test_format_build_failure_reason_matches_links() -> None:
     links = (
         fr.BuildCheckLink(
@@ -194,9 +195,9 @@ def test_format_build_failure_reason_matches_links() -> None:
     )
     reason = fr.format_build_failure_reason("acme/r", 9, links)
     assert reason == (
-        "acme/r#9 build-failure: odh-foo-on-pull-request-9 concluded failure (+1 more)"
+        "**odh-foo-on-pull-request-9**: failure<br>**odh-bar-on-pull-request-9**: failure"
     )
-    assert fr.format_build_failure_reason("acme/r", 9, ()) == "acme/r#9 build-failure"
+    assert fr.format_build_failure_reason("acme/r", 9, ()) == "build-failure"
 
 
 # Replace unexpanded feasibility expressions with readable explanations, preserving other
@@ -414,3 +415,247 @@ def test_upsert_dry_run_no_mutate() -> None:
     assert comment_id is None
     assert created is True
     assert updated is False
+
+
+# --- Change 1: build retries are decoupled from merge feasibility ---
+
+
+# Change 2: pending build duration is reported in the summary reason.
+def test_pending_build_duration_in_reason(monkeypatch) -> None:
+    """Pending builds show how long they have been queued."""
+    from datetime import timedelta
+    monkeypatch.setattr(fr, "build_status_source", lambda: "konflux")
+    created_at = (datetime.now(timezone.utc) - timedelta(hours=3, minutes=45)).isoformat()
+    entry = {
+        "repo": "acme/my-repo",
+        "pr-url": "https://github.com/acme/my-repo/pull/42",
+        "pr-status": "build-pending",
+        "build-observations": {
+            "source": "konflux",
+            "repository": "acme/my-repo",
+            "pr": 42,
+            "head-sha": "a" * 40,
+            "pr-state": "OPEN",
+            "runs": [
+                {
+                    "component": "odh-widget",
+                    "status": "pending",
+                    "head_sha": "a" * 40,
+                    "created_at": created_at,
+                    "url": "",
+                    "name": "odh-widget-on-pull-request",
+                    "uid": "uid1",
+                    "namespace": "rhoai-tenant",
+                    "pipeline_name": "odh-widget-on-pull-request",
+                    "reason": "",
+                    "completed_at": "",
+                    "message": "",
+                },
+            ],
+        },
+    }
+    monkeypatch.setattr(fr, "fetch_pull_request", lambda *a, **kw: {
+        "state": "OPEN", "number": 42, "headRefOid": "a" * 40, "mergedAt": None,
+    })
+    row = fr.build_child_row(entry, gh_runner=lambda _: "", reuse_monitor_evidence=True)
+    assert row is not None
+    # The reason should include the duration string.
+    assert "3h" in row.reason
+    assert "pending" in row.reason
+
+
+# Change 2: short pending duration shows minutes only.
+def test_pending_build_duration_minutes_only(monkeypatch) -> None:
+    from datetime import timedelta
+    monkeypatch.setattr(fr, "build_status_source", lambda: "konflux")
+    created_at = (datetime.now(timezone.utc) - timedelta(minutes=12)).isoformat()
+    entry = {
+        "repo": "acme/my-repo",
+        "pr-url": "https://github.com/acme/my-repo/pull/42",
+        "pr-status": "build-pending",
+        "build-observations": {
+            "source": "konflux",
+            "repository": "acme/my-repo",
+            "pr": 42,
+            "head-sha": "a" * 40,
+            "pr-state": "OPEN",
+            "runs": [
+                {
+                    "component": "odh-widget",
+                    "status": "queued",
+                    "head_sha": "a" * 40,
+                    "created_at": created_at,
+                    "url": "",
+                    "name": "odh-widget-on-pull-request",
+                    "uid": "uid1",
+                    "namespace": "rhoai-tenant",
+                    "pipeline_name": "odh-widget-on-pull-request",
+                    "reason": "",
+                    "completed_at": "",
+                    "message": "",
+                },
+            ],
+        },
+    }
+    monkeypatch.setattr(fr, "fetch_pull_request", lambda *a, **kw: {
+        "state": "OPEN", "number": 42, "headRefOid": "a" * 40, "mergedAt": None,
+    })
+    row = fr.build_child_row(entry, gh_runner=lambda _: "", reuse_monitor_evidence=True)
+    assert row is not None
+    assert "12m pending" in row.reason
+
+
+# Change 2: _format_pending_duration unit tests.
+def test_format_pending_duration_hours() -> None:
+    from datetime import timedelta
+    created = (datetime.now(timezone.utc) - timedelta(hours=5, minutes=30)).isoformat()
+    result = fr._format_pending_duration(created)
+    assert result == "5h 30m pending"
+
+
+def test_format_pending_duration_minutes() -> None:
+    from datetime import timedelta
+    created = (datetime.now(timezone.utc) - timedelta(minutes=7)).isoformat()
+    result = fr._format_pending_duration(created)
+    assert result == "7m pending"
+
+
+def test_format_pending_duration_missing() -> None:
+    assert fr._format_pending_duration("") == "pending"
+    assert fr._format_pending_duration(None) == "pending"
+
+
+# Change 3a: build_links populated with failing Konflux run URLs for build-failure.
+def test_build_links_populated_for_build_failure_with_konflux_evidence(monkeypatch) -> None:
+    """build-failure rows with Konflux evidence include failing PipelineRun links."""
+    import os
+    monkeypatch.setattr(fr, "build_status_source", lambda: "konflux")
+    monkeypatch.setenv("KONFLUX_UI_URL", "https://konflux-ui.example")
+    head = "b" * 40
+    entry = {
+        "repo": "acme/repo",
+        "pr-url": "https://github.com/acme/repo/pull/5",
+        "pr-status": "build-failure",
+        "build-observations": {
+            "source": "konflux",
+            "repository": "acme/repo",
+            "pr": 5,
+            "head-sha": head,
+            "pr-state": "OPEN",
+            "runs": [
+                {
+                    "component": "odh-foo",
+                    "status": "failure",
+                    "head_sha": head,
+                    "url": "https://konflux-ui.example/ns/rhoai-tenant/pipelinerun/odh-foo-pr5-abc",
+                    "name": "odh-foo-on-pull-request",
+                    "uid": "uid1",
+                    "namespace": "rhoai-tenant",
+                    "pipeline_name": "odh-foo-on-pull-request",
+                    "reason": "PipelineRunTimeout",
+                    "completed_at": "",
+                    "message": "",
+                    "created_at": "",
+                },
+            ],
+        },
+    }
+    monkeypatch.setattr(fr, "fetch_pull_request", lambda *a, **kw: {
+        "state": "OPEN", "number": 5, "headRefOid": head, "mergedAt": None,
+    })
+    row = fr.build_child_row(entry, gh_runner=lambda _: "", reuse_monitor_evidence=True)
+    assert row is not None
+    assert len(row.build_links) == 1
+    assert "pipelinerun" in row.build_links[0].url
+    assert row.build_links[0].conclusion == "failure"
+
+
+# Change 3b: merge-failure rows include the feasibility workflow URL.
+def test_build_links_populated_for_merge_failure_with_feasibility_url(monkeypatch) -> None:
+    """merge-failure rows include the failing feasibility check URL in build_links."""
+    monkeypatch.setattr(fr, "build_status_source", lambda: "konflux")
+    head = "c" * 40
+    entry = {
+        "repo": "acme/repo",
+        "pr-url": "https://github.com/acme/repo/pull/7",
+        "pr-status": "merge-failure",
+        "build-observations": {
+            "source": "konflux",
+            "repository": "acme/repo",
+            "pr": 7,
+            "head-sha": head,
+            "pr-state": "OPEN",
+            "gate-reason": "merge-failure: main-release-feasibility (rhoai-3.0) concluded failure",
+            "runs": [],
+        },
+        "merge-observations": {
+            "schema": 1,
+            "feasibility": {
+                "status": "failure",
+                "url": "https://github.com/acme/repo/actions/runs/12345",
+                "conclusion": "failure",
+            },
+        },
+    }
+    monkeypatch.setattr(fr, "fetch_pull_request", lambda *a, **kw: {
+        "state": "OPEN", "number": 7, "headRefOid": head, "mergedAt": None,
+    })
+    row = fr.build_child_row(entry, gh_runner=lambda _: "", reuse_monitor_evidence=True)
+    assert row is not None
+    assert len(row.build_links) >= 1
+    feas = row.build_links[0]
+    assert feas.name == "Main-to-release feasibility"
+    assert "actions/runs" in feas.url
+
+
+# Change 3b: merge-failure without Konflux also gets feasibility link.
+def test_build_links_merge_failure_non_konflux_feasibility(monkeypatch) -> None:
+    """Non-Konflux merge-failure rows also get the feasibility URL."""
+    monkeypatch.setattr(fr, "build_status_source", lambda: "github")
+    head = "d" * 40
+    entry = {
+        "repo": "acme/repo",
+        "pr-url": "https://github.com/acme/repo/pull/8",
+        "pr-status": "merge-failure",
+        "merge-observations": {
+            "schema": 1,
+            "feasibility": {
+                "status": "failure",
+                "url": "https://github.com/acme/repo/actions/runs/99999",
+                "conclusion": "failure",
+            },
+        },
+    }
+    monkeypatch.setattr(fr, "fetch_pull_request", lambda *a, **kw: {
+        "state": "OPEN", "number": 8, "headRefOid": head, "mergedAt": None,
+    })
+    monkeypatch.setattr(fr, "fetch_gap_status_description", lambda *a, **kw: "merge-failure: feasibility failed")
+    row = fr.build_child_row(entry, gh_runner=lambda _: "")
+    assert row is not None
+    assert len(row.build_links) == 1
+    assert row.build_links[0].name == "Main-to-release feasibility"
+    assert "actions/runs/99999" in row.build_links[0].url
+
+
+# _feasibility_check_link returns None when no merge-observations are present.
+def test_feasibility_check_link_missing_observations() -> None:
+    assert fr._feasibility_check_link({}) is None
+    assert fr._feasibility_check_link({"merge-observations": {}}) is None
+    assert fr._feasibility_check_link({
+        "merge-observations": {"feasibility": {"status": "unknown"}},
+    }) is None
+
+
+def test_feasibility_check_link_present() -> None:
+    link = fr._feasibility_check_link({
+        "merge-observations": {
+            "feasibility": {
+                "status": "failure",
+                "url": "https://github.com/acme/r/actions/runs/555",
+                "conclusion": "failure",
+            },
+        },
+    })
+    assert link is not None
+    assert link.name == "Main-to-release feasibility"
+    assert link.url == "https://github.com/acme/r/actions/runs/555"

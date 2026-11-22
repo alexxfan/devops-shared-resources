@@ -2636,6 +2636,19 @@ def _decide_url(
             head_sha=pull_request.head_sha,
             jobs=(),
         )
+        # Fetch check runs even for merge-conflicted PRs so that the Konflux
+        # gate can evaluate build status and the retry manager can post
+        # /retest for failed builds independently of merge feasibility.
+        try:
+            check_runs = list_check_runs(
+                pull_request.owner,
+                pull_request.repo,
+                pull_request.head_sha,
+                runner,
+            )
+        except CheckQueryError as exc:
+            check_query_error = str(exc)
+        tekton_error = "Merge conflict prevents file-collection and Tekton document fetch"
     else:
         try:
             if not pull_request.base_sha:
@@ -2679,7 +2692,7 @@ def _decide_url(
         )
 
     build_gate_override, observations = None, None
-    if not blocking_merge and build_status_source() == "konflux":
+    if build_status_source() == "konflux":
         configuration_error = None
         cel_evaluated = False
         try:
@@ -2713,8 +2726,10 @@ def _decide_url(
         allowed_components=repository_components(component_repo_map, pull_request.repo),
         build_gate_override=build_gate_override,
     )
-    if (retry_manager is not None and observations is not None
-            and decision.pr_status != PR_STATUS_MERGE_FAILURE):
+    if retry_manager is not None and observations is not None:
+        # Evaluate retries regardless of merge-failure: failed/missing Konflux
+        # builds should be retried even on merge-conflicted PRs so that build
+        # status is current when the conflict is resolved.
         build_gate_override, observations = retry_manager.apply(pull_request, build_gate_override, observations)
         decision = decide_repository_pr(
             pull_request, tekton_documents=tekton_documents, tekton_error=tekton_error,
