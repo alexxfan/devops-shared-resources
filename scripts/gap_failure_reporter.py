@@ -585,7 +585,7 @@ def format_build_links_cell(links: Sequence[BuildCheckLink]) -> str:
             parts.append(f"[{label}]({link.url})")
         else:
             parts.append(label)
-    return "<br>".join(parts)
+    return "<br><br>".join(parts)
 
 
 def should_report_child(*, state_status: str, pr_state: str) -> bool:

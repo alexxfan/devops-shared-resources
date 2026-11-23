@@ -867,7 +867,7 @@ def test_format_build_links_cell_mixed_url_and_text() -> None:
     cell = fr.format_build_links_cell(links)
     assert "[odh-foo-on-pull-request]" in cell
     assert "odh-bar: no builds triggered" in cell
-    assert "<br>" in cell
+    assert "<br><br>" in cell
 
 
 def test_build_failure_fallback_links_missing_component() -> None:
