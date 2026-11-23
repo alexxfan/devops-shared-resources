@@ -610,6 +610,164 @@ def test_prefetch_has_a_hard_concurrency_limit(workers):
     with pytest.raises(KonfluxQueryError):
         client(lambda url: {}).prefetch_prs([], max_workers=workers)
 
+
+def test_prefetch_prs_chunked_splits_queries_and_delays():
+    """prefetch_prs_chunked delegates to prefetch_prs in chunk_size groups."""
+    import time as _time
+    fetched_queries = []
+    sleeps = []
+    original_sleep = _time.sleep
+
+    def tracking_fetch(url):
+        if "cluster.example" in url:
+            return {"metadata": {"resourceVersion": "1"}, "items": []}
+        return {"metadata": {}, "items": []}
+
+    api = client(tracking_fetch)
+    # Monkey-patch time.sleep to track delays
+    real_sleep = _time.sleep
+    def mock_sleep(seconds):
+        sleeps.append(seconds)
+    _time.sleep = mock_sleep
+    try:
+        # 5 unique queries, chunk_size=2 → 3 chunks, 2 delays
+        queries = [(REPO, i, SHA) for i in range(100, 105)]
+        api.prefetch_prs_chunked(queries, max_workers=2, chunk_size=2, chunk_delay=0.1)
+    finally:
+        _time.sleep = real_sleep
+    # 3 chunks → 2 inter-chunk delays
+    assert len(sleeps) == 2
+    assert all(s == 0.1 for s in sleeps)
+
+
+def test_prefetch_prs_chunked_no_delay_for_single_chunk():
+    """A single chunk should not sleep at all."""
+    import time as _time
+    sleeps = []
+    def tracking_fetch(url):
+        if "cluster.example" in url:
+            return {"metadata": {"resourceVersion": "1"}, "items": []}
+        return {"metadata": {}, "items": []}
+    api = client(tracking_fetch)
+    real_sleep = _time.sleep
+    _time.sleep = lambda s: sleeps.append(s)
+    try:
+        api.prefetch_prs_chunked([(REPO, 100, SHA)], chunk_size=15)
+    finally:
+        _time.sleep = real_sleep
+    assert sleeps == []
+
+
+def test_prefetch_prs_chunked_error_in_chunk_does_not_abort_later_chunks():
+    """Errors in one chunk should not prevent later chunks from running."""
+    import time as _time
+    call_count = [0]
+    def fetch(url):
+        call_count[0] += 1
+        # Fail for the first unique PR, succeed for others
+        query = parse_qs(urlsplit(url).query)
+        selector = query.get("labelSelector", [""])[0]
+        if "pull-request=100" in selector:
+            raise KonfluxQueryError("temporary failure")
+        if "cluster.example" in url:
+            return {"metadata": {"resourceVersion": "1"}, "items": []}
+        return {"metadata": {}, "items": []}
+    api = client(fetch)
+    _time.sleep = lambda s: None
+    try:
+        queries = [(REPO, 100, SHA), (REPO, 101, SHA), (REPO, 102, SHA)]
+        api.prefetch_prs_chunked(queries, chunk_size=1, chunk_delay=0)
+    finally:
+        import importlib
+        importlib.reload(_time)
+    # PR 100 errored but PR 101 and 102 should have been queried
+    assert call_count[0] > 1
+
+
+def test_prefetch_konflux_builds_groups_by_cluster(monkeypatch):
+    """_prefetch_konflux_builds extracts PRs from state and groups by cluster."""
+    from scripts.gap_pr_monitor import _prefetch_konflux_builds
+    created_clients = {}
+    class _TrackingClient:
+        def __init__(self, cluster):
+            self.cluster = cluster
+            self.queries = []
+            created_clients[cluster] = self
+        def prefetch_prs_chunked(self, queries, **kwargs):
+            self.queries.extend(queries)
+    monkeypatch.setattr(KonfluxClient, "for_cluster",
+                        classmethod(lambda cls, cid, **kw: _TrackingClient(cid)))
+    monkeypatch.delenv("KONFLUX_DEFAULT_CLUSTER", raising=False)
+    payload = {"pull-requests": [
+        {"repo": "foo", "pr-url": "https://github.com/acme/foo/pull/1",
+         "head-sha": "a" * 40, "pr-status": "new",
+         "build-observations": {"source": "konflux", "runs": [],
+                                "konflux-cluster": "p01"}},
+        {"repo": "bar", "pr-url": "https://github.com/acme/bar/pull/2",
+         "head-sha": "b" * 40, "pr-status": "new",
+         "build-observations": {"source": "konflux", "runs": [],
+                                "konflux-cluster": "p02"}},
+        {"repo": "baz", "pr-url": "https://github.com/acme/baz/pull/3",
+         "head-sha": "c" * 40, "pr-status": "new"},
+    ]}
+    result = _prefetch_konflux_builds(payload)
+    assert "p01" in result
+    assert "p02" in result
+    assert len(created_clients["p01"].queries) == 1
+    assert created_clients["p01"].queries[0] == ("acme/foo", 1, "a" * 40)
+    # bar goes to p02, baz goes to default (p02)
+    p02_repos = {q[0] for q in created_clients["p02"].queries}
+    assert "acme/bar" in p02_repos
+    assert "acme/baz" in p02_repos
+
+
+def test_prefetch_konflux_builds_skips_entries_without_head_sha():
+    """Entries missing head-sha should be skipped during prefetch."""
+    from scripts.gap_pr_monitor import _prefetch_konflux_builds
+    payload = {"pull-requests": [
+        {"repo": "foo", "pr-url": "https://github.com/acme/foo/pull/1",
+         "pr-status": "new"},
+        {"repo": "bar", "pr-url": "https://github.com/acme/bar/pull/2",
+         "head-sha": "", "pr-status": "new"},
+    ]}
+    assert _prefetch_konflux_builds(payload) == {}
+
+
+def test_prefetch_konflux_builds_ignores_client_errors(monkeypatch):
+    """Client construction failures are non-fatal."""
+    from scripts.gap_pr_monitor import _prefetch_konflux_builds
+    monkeypatch.setattr(KonfluxClient, "for_cluster",
+                        classmethod(lambda cls, cid, **kw: (_ for _ in ()).throw(
+                            KonfluxQueryError("no credentials"))))
+    payload = {"pull-requests": [
+        {"repo": "foo", "pr-url": "https://github.com/acme/foo/pull/1",
+         "head-sha": "a" * 40, "pr-status": "new"},
+    ]}
+    result = _prefetch_konflux_builds(payload)
+    assert result == {}
+
+
+def test_evaluate_konflux_gate_uses_prefetched_clients(monkeypatch):
+    """When prefetched_clients is provided, reuse those clients."""
+    from lib.konflux_builds import BuildObservation
+    observed = []
+    class _Prefetched:
+        def observe(self, **kwargs):
+            observed.append(kwargs)
+            return BuildObservation(COMPONENT, "success", "Prefetched", SHA,
+                                    "prefetched-run", "prefetched-uid")
+    prefetched = {"p02": _Prefetched()}
+    monkeypatch.delenv("KONFLUX_DEFAULT_CLUSTER", raising=False)
+    gate, evidence = evaluate_konflux_gate(
+        repo=REPO, number=123, sha=SHA,
+        expected=[ExpectedCheck(key=COMPONENT)],
+        prefetched_clients=prefetched,
+    )
+    assert gate.outcome == "pass"
+    assert len(observed) == 1
+    assert evidence["runs"][0]["uid"] == "prefetched-uid"
+
+
 @pytest.mark.parametrize("initial,fresh,expected_overall", [
     (("success", "build-failure"), ("build-pending", "success"), None),
     (("build-failure", "build-failure"), ("success", "success"), "early-gate-triggered"),

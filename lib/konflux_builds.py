@@ -605,6 +605,20 @@ class KonfluxClient:
                     self._cache.pop(key, None)
                     self._errors[key] = str(exc)
 
+    def prefetch_prs_chunked(self, queries, *, max_workers=4, chunk_size=15, chunk_delay=0.5):
+        """Prefetch PR builds in chunks with backpressure.
+
+        Splits *queries* into groups of *chunk_size*, delegates each chunk to
+        :meth:`prefetch_prs`, and sleeps *chunk_delay* seconds between chunks
+        to avoid overwhelming the Konflux API with concurrent requests.
+        """
+        unique = sorted({(repo.lower(), str(number), sha) for repo, number, sha in queries})
+        for i in range(0, len(unique), chunk_size):
+            chunk = unique[i:i + chunk_size]
+            self.prefetch_prs(chunk, max_workers=max_workers)
+            if i + chunk_size < len(unique):
+                time.sleep(chunk_delay)
+
     def clear_cache(self):
         """Start a fresh polling observation without reusing prior run lists."""
         self._cache.clear()

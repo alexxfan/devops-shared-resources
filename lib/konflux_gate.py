@@ -49,6 +49,7 @@ def evaluate_konflux_gate(
     cel_error=None,
     cluster=None,
     check_runs=None,
+    prefetched_clients=None,
 ):
     """Translate expected Konflux builds into a gate verdict and evidence receipt.
 
@@ -88,7 +89,7 @@ def evaluate_konflux_gate(
                         component_clusters[item.key] = run_cluster
 
         default_cluster_id: str | None = None
-        clients_cache: dict[str, KonfluxClient] = {}
+        clients_cache: dict[str, KonfluxClient] = dict(prefetched_clients) if prefetched_clients else {}
 
         if expected:
             if client is None:
