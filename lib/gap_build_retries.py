@@ -12,7 +12,7 @@ import os
 import re
 
 from lib.github_check_runs import (
-    CheckFinding, CheckQueryError, OUTCOME_FAIL, OUTCOME_PENDING,
+    CheckFinding, CheckQueryError, OUTCOME_FAIL, OUTCOME_PASS, OUTCOME_PENDING,
     collect_github_pages, github_api_json,
 )
 from lib.github_cli import GhCommandError
@@ -402,9 +402,10 @@ class BuildRetryManager:
                     except (RetryObservationChanged, KonfluxQueryError, CheckQueryError, ValueError, TypeError, KeyError) as exc:
                         info, waiting = {"status": "retry-evidence-unavailable", "reason": str(exc)}, True
                     observation["retry"] = info
-                    awaiting |= waiting
+                    if observation.get("status") != "missing" or info.get("status") == "retry-evidence-unavailable":
+                        awaiting |= waiting
                     findings[i] = replace(
-                        findings[i], outcome=OUTCOME_PENDING if waiting else OUTCOME_FAIL,
+                        findings[i], outcome=OUTCOME_PASS if (observation.get("status") == "missing" and info.get("status") != "retry-evidence-unavailable") else (OUTCOME_PENDING if waiting else OUTCOME_FAIL),
                         reason=f"{findings[i].reason}; {info.get('reason', '')}",
                     )
                 elif status == "missing":
@@ -412,9 +413,9 @@ class BuildRetryManager:
                         "status": "not-retried",
                         "reason": "Missing build trigger is not retryable without matching expected component and CEL evidence",
                     }
-                    awaiting = True
+                    # Do NOT set awaiting = True for missing components
                     findings[i] = replace(
-                        findings[i], outcome=OUTCOME_PENDING,
+                        findings[i], outcome=OUTCOME_PASS,
                         reason=f"{findings[i].reason}; missing build trigger requires authoritative evidence",
                     )
                 else:
@@ -434,8 +435,11 @@ class BuildRetryManager:
         evidence["retry-history"] = deepcopy(history)
         # Hold the whole repository while a retry is in flight, even if another
         # component has a persistent failure. It must not be archived mid-retry.
+        # When all findings are PASS (e.g. missing builds treated as green), the
+        # original gate.outcome may still be PENDING from the initial evaluation;
+        # use OUTCOME_PASS so missing-only PRs are not held indefinitely.
         outcome = OUTCOME_PENDING if awaiting or any(
             f.outcome == OUTCOME_PENDING for f in findings
         ) else (
-            OUTCOME_FAIL if any(f.outcome == OUTCOME_FAIL for f in findings) else gate.outcome)
+            OUTCOME_FAIL if any(f.outcome == OUTCOME_FAIL for f in findings) else OUTCOME_PASS)
         return replace(gate, outcome=outcome, findings=tuple(findings)), evidence

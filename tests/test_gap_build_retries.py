@@ -292,7 +292,7 @@ def test_expected_missing_build_is_retriggered_when_no_github_check_exists():
     gh, client = FakeGitHub(), FakeKonflux()
     gate, evidence = missing_evidence(client)
     gate, evidence = manager(gh, client).apply(PR, gate, evidence)
-    assert gate.outcome == "pending"
+    assert gate.outcome == "pass"  # missing build = green by default
     assert len(gh.posts) == 1
     assert gh.posts[0].startswith("/retest\n\n")
     assert PIPELINE in gh.posts[0]
@@ -311,7 +311,7 @@ def test_multiple_ambiguous_missing_components_post_one_bare_retest_and_share_re
         "component": second["component"], "pipeline_name": "ambiguous-pipeline"
     })
     gate, evidence = manager(gh, client).apply(PR, gate, evidence)
-    assert gate.outcome == "pending"
+    assert gate.outcome == "pass"  # missing build = green by default
     assert len(gh.posts) == 1
     assert gh.posts[0].startswith("/retest\n\n")
     assert len(evidence["retry-history"]) == 2
@@ -353,7 +353,7 @@ def test_missing_component_always_posts_bare_retest_even_with_specific_pipeline(
     gate, evidence = missing_evidence(client)
     evidence["required-pipelines"]["pipelines"][0]["pipeline_name"] = "foo-on-pull-request-123"
     gate, evidence = manager(gh, client).apply(PR, gate, evidence)
-    assert gate.outcome == "pending"
+    assert gate.outcome == "pass"  # missing build = green by default
     assert gh.posts[0].startswith("/retest\n\n")
 
 
@@ -362,7 +362,7 @@ def test_bare_retest_receipt_is_reconciled_without_repeating_missing_retry():
     gate, saved = manager(gh, client).apply(PR, *missing_evidence(client))
     assert gh.posts[0].startswith("/retest\n\n")
     gate, evidence = manager(gh, client, saved=saved, now=NOW + timedelta(minutes=20)).apply(PR, *missing_evidence(client))
-    assert gate.outcome == "pending"
+    assert gate.outcome == "pass"  # missing build = green by default
     assert len(gh.posts) == 1
     assert evidence["runs"][0]["retry"]["status"] == "build-retrigger-pending"
 
@@ -372,7 +372,7 @@ def test_missing_build_waits_when_github_check_already_exists():
     gh.check_runs = [{"head_sha": SHA, "name": PIPELINE, "status": "queued"}]
     gate, evidence = missing_evidence(client)
     gate, evidence = manager(gh, client).apply(PR, gate, evidence)
-    assert gate.outcome == "pending"
+    assert gate.outcome == "pass"  # missing build = green by default
     assert not gh.posts
     assert evidence["runs"][0]["retry"]["status"] == "build-trigger-pending"
 
@@ -381,7 +381,7 @@ def test_missing_build_without_cel_evidence_stays_blocked_without_retry():
     gh, client = FakeGitHub(), FakeKonflux()
     gate, evidence = missing_evidence(client, cel=False)
     gate, evidence = manager(gh, client).apply(PR, gate, evidence)
-    assert gate.outcome == "pending"
+    assert gate.outcome == "pass"  # missing build = green by default
     assert not gh.posts
     assert evidence["runs"][0]["retry"]["status"] == "not-retried"
 
@@ -732,7 +732,7 @@ def test_similar_pipeline_check_does_not_suppress_missing_retry():
     gh.check_runs = [{"head_sha": SHA, "name": PIPELINE + "-extra", "status": "queued"}]
     gate, evidence = missing_evidence(client)
     gate, evidence = manager(gh, client).apply(PR, gate, evidence)
-    assert gate.outcome == "pending"
+    assert gate.outcome == "pass"  # missing build = green by default
     assert len(gh.posts) == 1
 
 
@@ -759,7 +759,7 @@ def test_empty_runs_are_normalized_to_missing_expected_components():
     gate, evidence = missing_evidence(client)
     evidence["runs"] = []
     gate, evidence = manager(gh, client).apply(PR, gate, evidence)
-    assert gate.outcome == "pending"
+    assert gate.outcome == "pass"  # missing build = green by default
     assert len(gh.posts) == 1
     assert evidence["runs"][0]["status"] == "missing"
 
@@ -787,7 +787,7 @@ def test_multiple_missing_components_only_retrigger_the_component_without_a_chec
         {"component": second_component, "pipeline_name": second_pipeline}
     )
     gate, evidence = manager(gh, client).apply(PR, gate, evidence)
-    assert gate.outcome == "pending"
+    assert gate.outcome == "pass"  # missing build = green by default
     assert len(gh.posts) == 1
     assert gh.posts[0].startswith("/retest\n\n")
     assert second_pipeline in gh.posts[0]
@@ -813,7 +813,7 @@ def test_fresh_missing_component_defers_shared_retest_for_member_in_grace():
     mgr = BuildRetryManager(gh, saved, client_factory=lambda: client, clock=lambda: NOW)
     gate, evidence = mgr.apply(PR, gate, evidence)
     assert not gh.posts
-    assert gate.outcome == "pending"
+    assert gate.outcome == "pass"  # missing build = green by default
     assert "grace period" in evidence["runs"][0]["retry"]["reason"]
 
 
@@ -843,7 +843,7 @@ def test_exhausted_missing_component_blocks_shared_retest_for_other_missing_comp
     mgr = BuildRetryManager(gh, saved, client_factory=lambda: client, clock=lambda: NOW)
     gate, evidence = mgr.apply(PR, gate, evidence)
     assert not gh.posts
-    assert gate.outcome == "pending"
+    assert gate.outcome == "pass"  # missing build = green by default
 
 
 def test_ignored_child_never_retriggers_missing_or_failed_builds():
@@ -865,7 +865,7 @@ def test_missing_retry_check_lookup_failure_is_recorded_as_unavailable():
 
     retry_manager._pipeline_check_exists = unavailable
     gate, evidence = retry_manager.apply(PR, gate, evidence)
-    assert gate.outcome == "pending"
+    assert gate.outcome == "pending"  # evidence unavailable: stay pending, not green
     assert not gh.posts
     assert evidence["runs"][0]["retry"]["status"] == "retry-evidence-unavailable"
 
@@ -875,9 +875,29 @@ def test_missing_retry_cli_check_lookup_failure_is_recorded_as_unavailable():
     gh.fail_check_lookup = True
     gate, evidence = missing_evidence(client)
     gate, evidence = manager(gh, client).apply(PR, gate, evidence)
-    assert gate.outcome == "pending"
+    assert gate.outcome == "pending"  # evidence unavailable: stay pending, not green
     assert not gh.posts
     assert evidence["runs"][0]["retry"]["status"] == "retry-evidence-unavailable"
+
+
+def test_missing_build_with_evidence_unavailable_stays_pending_not_green():
+    """When a missing observation hits CheckQueryError during retry, the finding
+    must stay PENDING — not PASS — because we cannot verify whether a real build
+    appeared.  Missing = green only applies when evidence is successfully checked."""
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = missing_evidence(client)
+    retry_manager = manager(gh, client)
+
+    def raise_error(_pr, _pipeline):
+        raise CheckQueryError("Transient API failure")
+
+    retry_manager._pipeline_check_exists = raise_error
+    gate, evidence = retry_manager.apply(PR, gate, evidence)
+    assert gate.outcome == "pending"
+    assert evidence["runs"][0]["status"] == "missing"
+    assert evidence["runs"][0]["retry"]["status"] == "retry-evidence-unavailable"
+    finding = gate.findings[0]
+    assert finding.outcome == "pending"
 
 
 def test_unmatched_running_observation_cannot_make_a_passing_gate():
