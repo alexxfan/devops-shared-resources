@@ -78,7 +78,12 @@ from lib.gap_check_selection import (
     multi_cluster_enabled,
 )
 from lib.leader_lifecycle import retire_leader, retired_outcome, validate_replacement
-from lib.konflux_builds import build_status_source
+from lib.konflux_builds import (
+    KonfluxClient,
+    KonfluxQueryError,
+    build_status_source,
+    default_konflux_cluster,
+)
 from lib.konflux_gate import evaluate_konflux_gate
 from lib.gap_build_retries import BuildRetryManager, retries_enabled
 from lib.gap_component_map import fetch_component_repo_map, repository_components
@@ -2525,6 +2530,59 @@ def _label_names(labels: Any) -> frozenset[str]:
     return frozenset(names)
 
 
+def _prefetch_konflux_builds(payload):
+    """Pre-warm Konflux API caches for all child PRs with known head SHAs.
+
+    Returns a dict mapping cluster_id → :class:`KonfluxClient` with pre-warmed
+    caches, or an empty dict if prefetch is not applicable.  Errors are
+    non-fatal: failed reads are cached as errors on the client and handled
+    normally during sequential evaluation.
+    """
+    entries = payload.get("pull-requests")
+    if not isinstance(entries, list):
+        return {}
+    queries_by_cluster: dict[str, list[tuple[str, int, str]]] = {}
+    fallback_cluster = default_konflux_cluster()
+    for entry in entries:
+        if not isinstance(entry, dict) or child_entry_ignored(entry):
+            continue
+        pr_url = str(entry.get("pr-url") or "").strip()
+        head_sha = str(entry.get("head-sha") or "").strip()
+        if not pr_url or not head_sha or len(head_sha) != 40:
+            continue
+        parts = pr_url.rstrip("/").split("/")
+        if len(parts) < 5 or parts[-2] != "pull":
+            continue
+        try:
+            owner, repo_name = parts[-4], parts[-3]
+            number = int(parts[-1])
+        except (ValueError, IndexError):
+            continue
+        full_repo = f"{owner}/{repo_name}"
+        obs = entry.get("build-observations") or {}
+        cluster = obs.get("konflux-cluster") or fallback_cluster
+        queries_by_cluster.setdefault(cluster, []).append(
+            (full_repo, number, head_sha)
+        )
+    if not queries_by_cluster:
+        return {}
+    prefetched: dict[str, KonfluxClient] = {}
+    for cluster_id, queries in queries_by_cluster.items():
+        try:
+            # Use a generous deadline (5 min) so later chunks and cache misses
+            # are not blocked by a 60-second budget shared across the batch.
+            client = KonfluxClient.for_cluster(
+                cluster_id, deadline=time.monotonic() + 300,
+            )
+            client.prefetch_prs_chunked(
+                queries, max_workers=4, chunk_size=15, chunk_delay=0.5,
+            )
+            prefetched[cluster_id] = client
+        except KonfluxQueryError:
+            pass
+    return prefetched
+
+
 def run_monitor(
     state_path: Path,
     *,
@@ -2568,6 +2626,11 @@ def run_monitor(
     factory = updater_factory or PRStatusUpdater
     updater = factory(check_name=check_name, dry_run=dry_run)
 
+    # Prefetch Konflux builds for all child PRs in parallel.
+    prefetched_clients: dict[str, KonfluxClient] | None = None
+    if build_status_source() == "konflux":
+        prefetched_clients = _prefetch_konflux_builds(payload) or None
+
     decisions: list[RepositoryGateDecision] = []
     classify_errors: list[tuple[str, str]] = []
     for url in pr_urls:
@@ -2581,6 +2644,7 @@ def run_monitor(
                     build_app_id=build_app_id,
                     retry_unknown=gh_runner is None,
                     component_repo_map=component_repo_map,
+                    prefetched_clients=prefetched_clients,
                 )
             )
         except (GapPrMonitorError, GhCommandError, ValueError, RuntimeError) as exc:
@@ -2603,6 +2667,7 @@ def run_monitor(
         build_app_id=build_app_id,
         retry_unknown=gh_runner is None,
         component_repo_map=component_repo_map,
+        prefetched_clients=prefetched_clients,
     )
 
 
@@ -2616,6 +2681,7 @@ def _decide_url(
     retry_unknown: bool,
     component_repo_map: dict[str, frozenset[str]],
     retry_manager: BuildRetryManager | None = None,
+    prefetched_clients: dict[str, KonfluxClient] | None = None,
 ) -> RepositoryGateDecision:
     pull_request = fetch_repository_pull_request(
         url, gh_runner=runner, retry_unknown=retry_unknown
@@ -2711,6 +2777,7 @@ def _decide_url(
             query_error=configuration_error, cel_evaluated=cel_evaluated,
             cel_error=configuration_error,
             check_runs=check_runs,
+            prefetched_clients=prefetched_clients,
         )
 
     decision = decide_repository_pr(
@@ -2785,6 +2852,7 @@ def _publish_gate_decision(
     overall_status: str | None,
     payload: dict[str, Any] | None = None,
     retry_manager: BuildRetryManager | None = None,
+    prefetched_clients: dict[str, KonfluxClient] | None = None,
 ) -> tuple[RepositoryGateDecision | None, StatusUpdateResult | None]:
     """Publish a decision, or re-evaluate once when the head has moved.
 
@@ -2814,6 +2882,7 @@ def _publish_gate_decision(
         retry_unknown=retry_unknown,
         component_repo_map=component_repo_map,
         retry_manager=retry_manager,
+        prefetched_clients=prefetched_clients,
     )
     # The head changed after the batch refresh. Recompute the shared probe
     # before posting this decision or any following sibling: an old terminal
@@ -2862,6 +2931,7 @@ def _publish_decisions(
     build_app_id: int | None,
     retry_unknown: bool,
     component_repo_map: dict[str, frozenset[str]],
+    prefetched_clients: dict[str, KonfluxClient] | None = None,
 ) -> MonitorResult:
     status_updates: dict[str, str] = {}
     updated: list[str] = []
@@ -2883,6 +2953,8 @@ def _publish_decisions(
         # can turn a terminal failure into pending/success; mixing fresh child
         # decisions with the old batch outcome could release a green before EG.
         # This is the existing second observation, moved ahead of all POSTs.
+        # Do not reuse prefetched_clients here: this refresh must observe
+        # current Konflux attempts, not the potentially stale first-pass cache.
         try:
             decisions = tuple(
                 decision if decision.skip_status_post else _decide_url(
@@ -2925,6 +2997,7 @@ def _publish_decisions(
                 overall_status=overall_status,
                 payload=probe,
                 retry_manager=retry_manager,
+                prefetched_clients=prefetched_clients,
             )
         except (ValueError, RuntimeError, GhCommandError, GapPrMonitorError) as exc:
             post_errors.append((url, str(exc)))

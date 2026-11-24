@@ -49,6 +49,9 @@ class FakeKonflux:
         self.refreshes += bool(query.pop("refresh", False))
         return select_latest(self.items, namespace=self.namespace, ui_url=self.ui_url, **query)
 
+    def prefetch_prs_chunked(self, queries, **kwargs):
+        pass
+
     def _list_resources(self, selector, resource="pipelineruns"):
         return self.tasks if resource == "taskruns" else self.pushes
 
