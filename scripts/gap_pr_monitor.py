@@ -153,7 +153,7 @@ BATCH_FAILURE_CHILD_PENDING_DESCRIPTION = (
 WAITING_FOR_EARLY_GATE_DESCRIPTION = (
     "GAP: waiting for Early Gate (auto-merge held)"
 )
-EARLY_GATE_COMMENT_BODY = "/early-gate"
+EARLY_GATE_COMMENT_BODY = "/early-gate-build"
 EARLY_GATE_BATCH_MARKER_RE = re.compile(r"<!-- gap-early-gate-batch:v1 ([0-9a-f]{64}) -->")
 EARLY_GATE_COMMENT_RE = re.compile(
     r"^/early-gate(-build)?(?:\n<!-- gap-early-gate-batch:v1 [0-9a-f]{64} -->)?\s*$"
