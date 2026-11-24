@@ -94,17 +94,33 @@ def _parse_name_status(data: bytes) -> list[dict[str, str]]:
     return files
 
 
+def _authenticated_url(url: str) -> str:
+    """Inject GH_TOKEN into an HTTPS GitHub URL for private repository access.
+
+    Returns the original URL unmodified when no token is available, preserving
+    fail-closed behavior.  The token value is never logged or included in error
+    messages.
+    """
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+    if token and url.startswith("https://github.com/"):
+        return url.replace("https://github.com/", f"https://x-access-token:{token}@github.com/", 1)
+    return url
+
+
 def _git_file_collections(url: str, base_sha: str, head_sha: str, merge_base: str | None = None) -> dict[str, tuple[str, ...]]:
     """Bounded no-checkout fetch; no credential helpers, hooks, or external diff.
 
     No shallow boundary when finding a merge base locally. With an API-provided
     merge base only the three commit tips are needed. Rename detection may lazily
-    download blobs. Private repositories requiring Git credentials fail closed.
+    download blobs. When ``GH_TOKEN`` or ``GITHUB_TOKEN`` is set, the token is
+    injected into the fetch URL so that private repositories can be accessed.
+    Without a token, authentication-required fetches fail closed.
     """
     _sha(base_sha)
     _sha(head_sha)
     if merge_base is not None:
         _sha(merge_base)
+    fetch_url = _authenticated_url(url)
     deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0")
@@ -114,11 +130,14 @@ def _git_file_collections(url: str, base_sha: str, head_sha: str, merge_base: st
             if remaining <= 0:
                 raise CheckQueryError("local diff exceeded time budget")
             with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-                result = subprocess.run(
-                    ["git", "-c", "credential.helper=", "-c", "core.hooksPath=/dev/null", *args],
-                    cwd=directory, env=env, stdout=stdout, stderr=stderr,
-                    timeout=remaining, check=False,
-                )
+                try:
+                    result = subprocess.run(
+                        ["git", "-c", "credential.helper=", "-c", "core.hooksPath=/dev/null", *args],
+                        cwd=directory, env=env, stdout=stdout, stderr=stderr,
+                        timeout=remaining, check=False,
+                    )
+                except subprocess.TimeoutExpired:
+                    raise CheckQueryError("local Git comparison timed out") from None
                 if result.returncode:
                     raise CheckQueryError("local Git comparison command failed")
                 if stdout.tell() > MAX_DIFF_BYTES:
@@ -126,7 +145,7 @@ def _git_file_collections(url: str, base_sha: str, head_sha: str, merge_base: st
                 stdout.seek(0)
                 return stdout.read()
         git("init", "--bare", "--template=", ".")
-        git("remote", "add", "origin", url)
+        git("remote", "add", "origin", fetch_url)
         args = ["fetch", "--filter=blob:none", "--no-tags"]
         if merge_base:
             args.append("--depth=1")
