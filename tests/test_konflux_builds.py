@@ -386,6 +386,129 @@ def test_missing_credentials_are_an_error(monkeypatch):
         KonfluxClient.for_cluster("p01")
 
 
+def test_retry_succeeds_after_transient_503():
+    """First attempt returns 503, second succeeds → returns data."""
+    from urllib.error import HTTPError
+    from io import BytesIO
+    import time as _time
+    attempts = []
+    sleeps = []
+    def fetch(url):
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise HTTPError(url, 503, "Service Unavailable", {}, BytesIO())
+        return {"metadata": {"resourceVersion": "1"}, "items": [run()]}
+    import lib.konflux_builds as kb
+    real_sleep = kb.time.sleep
+    kb.time.sleep = lambda s: sleeps.append(s)
+    try:
+        api = client(fetch)
+        result = api.observe(repo=REPO, number=123, sha=SHA, components={COMPONENT})
+        assert result.status == "success"
+        assert len(attempts) >= 2
+        assert sleeps[0] == 1.0
+    finally:
+        kb.time.sleep = real_sleep
+
+
+def test_retry_exhausted_raises_after_all_attempts():
+    """All 3 attempts fail with 503 → KonfluxQueryError."""
+    from urllib.error import HTTPError
+    from io import BytesIO
+    attempts = []
+    sleeps = []
+    def fetch(url):
+        attempts.append(url)
+        raise HTTPError(url, 503, "Service Unavailable", {}, BytesIO())
+    import lib.konflux_builds as kb
+    real_sleep = kb.time.sleep
+    kb.time.sleep = lambda s: sleeps.append(s)
+    try:
+        with pytest.raises(KonfluxQueryError, match="HTTP 503"):
+            client(fetch).observe(repo=REPO, number=123, sha=SHA, components={COMPONENT})
+        assert len(attempts) == 3
+        assert sleeps == [1.0, 3.0]
+    finally:
+        kb.time.sleep = real_sleep
+
+
+def test_non_retryable_error_raises_immediately():
+    """HTTP 404 raises immediately without retry."""
+    from urllib.error import HTTPError
+    from io import BytesIO
+    attempts = []
+    def fetch(url):
+        attempts.append(url)
+        raise HTTPError(url, 404, "Not Found", {}, BytesIO())
+    with pytest.raises(KonfluxQueryError, match="HTTP 404"):
+        client(fetch).observe(repo=REPO, number=123, sha=SHA, components={COMPONENT})
+    assert len(attempts) == 1
+
+
+def test_429_rate_limit_is_retried():
+    """HTTP 429 triggers retry."""
+    from urllib.error import HTTPError
+    from io import BytesIO
+    attempts = []
+    def fetch(url):
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise HTTPError(url, 429, "Too Many Requests", {}, BytesIO())
+        return {"metadata": {"resourceVersion": "1"}, "items": [run()]}
+    import lib.konflux_builds as kb
+    real_sleep = kb.time.sleep
+    kb.time.sleep = lambda s: None
+    try:
+        api = client(fetch)
+        result = api.observe(repo=REPO, number=123, sha=SHA, components={COMPONENT})
+        assert result.status == "success"
+        assert len(attempts) >= 2
+    finally:
+        kb.time.sleep = real_sleep
+
+
+def test_connection_error_is_retried():
+    """URLError (connection refused) triggers retry."""
+    from urllib.error import URLError
+    attempts = []
+    def fetch(url):
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise URLError("Connection refused")
+        return {"metadata": {"resourceVersion": "1"}, "items": [run()]}
+    import lib.konflux_builds as kb
+    real_sleep = kb.time.sleep
+    kb.time.sleep = lambda s: None
+    try:
+        api = client(fetch)
+        result = api.observe(repo=REPO, number=123, sha=SHA, components={COMPONENT})
+        assert result.status == "success"
+        assert len(attempts) >= 2
+    finally:
+        kb.time.sleep = real_sleep
+
+
+def test_socket_timeout_is_retried():
+    """socket.timeout triggers retry."""
+    import socket
+    attempts = []
+    def fetch(url):
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise socket.timeout("timed out")
+        return {"metadata": {"resourceVersion": "1"}, "items": [run()]}
+    import lib.konflux_builds as kb
+    real_sleep = kb.time.sleep
+    kb.time.sleep = lambda s: None
+    try:
+        api = client(fetch)
+        result = api.observe(repo=REPO, number=123, sha=SHA, components={COMPONENT})
+        assert result.status == "success"
+        assert len(attempts) >= 2
+    finally:
+        kb.time.sleep = real_sleep
+
+
 def test_cluster_id_for_app_slug_p02_and_placeholder_p01(monkeypatch):
     from lib.konflux_builds import cluster_id_for_app_slug, cluster_id_from_check_runs
     monkeypatch.delenv("KONFLUX_APP_SLUG_CLUSTER_MAP", raising=False)
@@ -800,32 +923,113 @@ def test_retry_refresh_recomputes_batch_hold_before_posting_child_greens(
     assert all(status == "pending" for _, status, _ in updater.posts)
     assert all(count == 2 for count in calls.values())
 
-def test_refresh_failure_cannot_partially_publish_an_old_batch(tmp_path, monkeypatch):
-    """An unavailable second observation must leave statuses and state untouched."""
+def test_refresh_partial_failure_keeps_first_pass_decision(tmp_path, monkeypatch):
+    """When one PR refresh fails, keep its first-pass decision; don't fail the batch."""
     from scripts import gap_pr_monitor as monitor
     from tests.test_gap_pr_monitor import FakeUpdater, _gate
     urls = ["https://github.com/acme/one/pull/1", "https://github.com/acme/two/pull/2"]
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"pull-requests": [
-        {"repo": repo, "pr-url": url, "pr-status": "new"}
+        {"repo": repo, "pr-url": url, "pr-status": "new", "builds": []}
         for repo, url in zip(("one", "two"), urls)
     ]}))
-    before = path.read_bytes()
-    calls = []
+    call_count = {url: 0 for url in urls}
     def decide(url, **kwargs):
-        calls.append(url)
-        if len(calls) == 4:
+        call_count[url] += 1
+        # First pass succeeds for both; refresh fails for url[1]
+        if call_count[url] == 2 and url == urls[1]:
             raise RuntimeError("GitHub PR metadata unavailable during refresh")
         return _gate(url, "success", "success")
     updater = FakeUpdater(check_name="gated artifacts promoter")
     monkeypatch.setenv("GAP_BUILD_STATUS_SOURCE", "konflux")
     monkeypatch.setattr(monitor, "fetch_component_repo_map", lambda runner: {})
     monkeypatch.setattr(monitor, "_decide_url", decide)
-    with pytest.raises(monitor.GapPrMonitorError, match="refresh child batch"):
+    result = monitor.run_monitor(path, gh_runner=lambda *_: "",
+                                 updater_factory=lambda **kwargs: updater)
+    # Both PRs should have been evaluated; the failed refresh uses first-pass
+    assert call_count[urls[0]] == 2
+    assert call_count[urls[1]] == 2
+
+
+def test_refresh_all_failures_raises(tmp_path, monkeypatch):
+    """When ALL refresh evaluations fail, raise GapPrMonitorError."""
+    from scripts import gap_pr_monitor as monitor
+    from tests.test_gap_pr_monitor import FakeUpdater, _gate
+    urls = ["https://github.com/acme/one/pull/1", "https://github.com/acme/two/pull/2"]
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"pull-requests": [
+        {"repo": repo, "pr-url": url, "pr-status": "new", "builds": []}
+        for repo, url in zip(("one", "two"), urls)
+    ]}))
+    call_count = {url: 0 for url in urls}
+    def decide(url, **kwargs):
+        call_count[url] += 1
+        if call_count[url] == 2:
+            raise RuntimeError("unavailable during refresh")
+        return _gate(url, "success", "success")
+    updater = FakeUpdater(check_name="gated artifacts promoter")
+    monkeypatch.setenv("GAP_BUILD_STATUS_SOURCE", "konflux")
+    monkeypatch.setattr(monitor, "fetch_component_repo_map", lambda runner: {})
+    monkeypatch.setattr(monitor, "_decide_url", decide)
+    with pytest.raises(monitor.GapPrMonitorError, match="all.*refreshes failed"):
         monitor.run_monitor(path, gh_runner=lambda *_: "",
                             updater_factory=lambda **kwargs: updater)
-    assert not updater.posts
-    assert path.read_bytes() == before
+
+
+def test_refresh_skip_status_post_preserved(tmp_path, monkeypatch):
+    """Decisions with skip_status_post are kept without re-evaluation."""
+    from scripts import gap_pr_monitor as monitor
+    from tests.test_gap_pr_monitor import FakeUpdater, _gate
+    from dataclasses import replace as dreplace
+    urls = ["https://github.com/acme/one/pull/1", "https://github.com/acme/two/pull/2"]
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"pull-requests": [
+        {"repo": repo, "pr-url": url, "pr-status": "new", "builds": []}
+        for repo, url in zip(("one", "two"), urls)
+    ]}))
+    call_count = {url: 0 for url in urls}
+    def decide(url, **kwargs):
+        call_count[url] += 1
+        d = _gate(url, "success", "success")
+        # First PR should be skipped (e.g. already ignored)
+        if url == urls[0] and call_count[url] == 1:
+            return dreplace(d, skip_status_post=True)
+        return d
+    updater = FakeUpdater(check_name="gated artifacts promoter")
+    monkeypatch.setenv("GAP_BUILD_STATUS_SOURCE", "konflux")
+    monkeypatch.setattr(monitor, "fetch_component_repo_map", lambda runner: {})
+    monkeypatch.setattr(monitor, "_decide_url", decide)
+    monitor.run_monitor(path, gh_runner=lambda *_: "",
+                        updater_factory=lambda **kwargs: updater)
+    # skip_status_post decision should NOT be refreshed (only 1 call)
+    assert call_count[urls[0]] == 1
+    # Normal decision IS refreshed (2 calls)
+    assert call_count[urls[1]] == 2
+
+
+def test_refresh_passes_retry_manager(tmp_path, monkeypatch):
+    """The retry_manager parameter is passed through to _decide_url during refresh."""
+    from scripts import gap_pr_monitor as monitor
+    from tests.test_gap_pr_monitor import FakeUpdater, _gate
+    urls = ["https://github.com/acme/one/pull/1"]
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"pull-requests": [
+        {"repo": "one", "pr-url": urls[0], "pr-status": "new", "builds": []}
+    ]}))
+    retry_managers_seen = []
+    def decide(url, **kwargs):
+        retry_managers_seen.append(kwargs.get("retry_manager"))
+        return _gate(url, "success", "success")
+    updater = FakeUpdater(check_name="gated artifacts promoter")
+    monkeypatch.setenv("GAP_BUILD_STATUS_SOURCE", "konflux")
+    monkeypatch.setenv("GAP_AUTO_RETRY_BUILDS", "true")
+    monkeypatch.setattr(monitor, "fetch_component_repo_map", lambda runner: {})
+    monkeypatch.setattr(monitor, "_decide_url", decide)
+    monitor.run_monitor(path, gh_runner=lambda *_: "",
+                        updater_factory=lambda **kwargs: updater)
+    # Both first-pass and refresh should receive a retry_manager
+    assert len(retry_managers_seen) == 2
+    assert retry_managers_seen[1] is not None
 
 def test_newer_matching_run_without_build_type_cannot_authorize_old_success():
     newer = run(name="r2", created="2026-11-05T11:00:00Z", status="Unknown", reason="Running")

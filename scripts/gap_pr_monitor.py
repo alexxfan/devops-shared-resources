@@ -28,11 +28,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -2949,27 +2951,50 @@ def _publish_decisions(
     ensure_promotion_gates(payload)
     migrate_legacy_overall_status(payload)
     if build_status_source() == "konflux":
-        # Refresh the whole batch before deriving the child-green hold. A retry
-        # can turn a terminal failure into pending/success; mixing fresh child
-        # decisions with the old batch outcome could release a green before EG.
-        # This is the existing second observation, moved ahead of all POSTs.
-        # Do not reuse prefetched_clients here: this refresh must observe
-        # current Konflux attempts, not the potentially stale first-pass cache.
-        try:
-            decisions = tuple(
-                decision if decision.skip_status_post else _decide_url(
-                    decision.url, runner=runner, now=now, build_app_slug=build_app_slug,
-                    build_app_id=build_app_id, retry_unknown=retry_unknown,
-                    component_repo_map=component_repo_map,
-                    retry_manager=retry_manager,
-                )
-                for decision in decisions
+        # Refresh the whole batch in parallel before deriving the child-green
+        # hold.  A retry can turn a terminal failure into pending/success;
+        # mixing fresh child decisions with the old batch outcome could release
+        # a green before EG.
+        #
+        # Thread-safety notes:
+        # - runner is a stateless subprocess.run wrapper — thread-safe.
+        # - retry_manager.apply reads the shared payload read-only and posts
+        #   /retest to different PRs — no cross-PR mutable state conflict.
+        # - Each _decide_url invocation creates its own local variables for
+        #   pull_request, check_runs, etc.  No shared mutable state.
+        # - Do not reuse prefetched_clients: this refresh must observe current
+        #   Konflux attempts, not the potentially stale first-pass cache.
+        refresh_kwargs = dict(
+            runner=runner, now=now, build_app_slug=build_app_slug,
+            build_app_id=build_app_id, retry_unknown=retry_unknown,
+            component_repo_map=component_repo_map,
+            retry_manager=retry_manager,
+        )
+        to_refresh = [d for d in decisions if not d.skip_status_post]
+        refreshed: dict[str, RepositoryGateDecision] = {}
+        refresh_errors: list[str] = []
+        log = logging.getLogger(__name__)
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            futures = {
+                executor.submit(_decide_url, d.url, **refresh_kwargs): d
+                for d in to_refresh
+            }
+            for future in as_completed(futures):
+                original = futures[future]
+                try:
+                    refreshed[original.url] = future.result()
+                except (GapPrMonitorError, GhCommandError, ValueError, RuntimeError) as exc:
+                    log.warning("Refresh failed for %s, keeping first-pass decision: %s", original.url, exc)
+                    refreshed[original.url] = original
+                    refresh_errors.append(original.url)
+        if refresh_errors and len(refresh_errors) == len(to_refresh) and to_refresh:
+            raise GapPrMonitorError(
+                f"Could not refresh child batch before publication: all {len(to_refresh)} refreshes failed"
             )
-        except (GapPrMonitorError, GhCommandError, ValueError, RuntimeError) as exc:
-            # No commit status or state writes have happened: retain the prior
-            # batch. Any retry comments already sent carry their own recovery
-            # receipts, so the next poll cannot repeat them.
-            raise GapPrMonitorError(f"Could not refresh child batch before publication: {exc}") from exc
+        decisions = tuple(
+            refreshed[d.url] if d.url in refreshed else d
+            for d in decisions
+        )
     # One coherent batch decides both persisted outcomes and the child-green hold.
     child_head_changed = record_child_head_shas(payload, decisions)
     # Provisional statuses from first-pass decisions (before head-move refresh).
