@@ -222,5 +222,71 @@ def test_git_timeout_propagates_without_partial_files(monkeypatch):
     def timeout(*args, **kwargs):
         raise subprocess.TimeoutExpired("git", 1)
     monkeypatch.setattr(diff.subprocess, "run", timeout)
-    with pytest.raises(subprocess.TimeoutExpired):
+    with pytest.raises(CheckQueryError, match="timed out"):
         diff._git_file_collections("https://github.com/owner/repo.git", BASE, HEAD)
+
+
+def test_authenticated_url_injects_token(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "ghp_secret123")
+    assert diff._authenticated_url("https://github.com/owner/repo.git") == \
+        "https://x-access-token:ghp_secret123@github.com/owner/repo.git"
+
+
+def test_authenticated_url_prefers_gh_token(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "primary")
+    monkeypatch.setenv("GITHUB_TOKEN", "fallback")
+    assert "primary" in diff._authenticated_url("https://github.com/owner/repo.git")
+
+
+def test_authenticated_url_falls_back_to_github_token(monkeypatch):
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_fallback")
+    assert "ghp_fallback" in diff._authenticated_url("https://github.com/owner/repo.git")
+
+
+def test_authenticated_url_returns_original_without_token(monkeypatch):
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    url = "https://github.com/owner/repo.git"
+    assert diff._authenticated_url(url) == url
+
+
+def test_authenticated_url_ignores_non_github_urls(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "ghp_secret123")
+    url = "https://gitlab.com/owner/repo.git"
+    assert diff._authenticated_url(url) == url
+
+
+def test_git_fallback_uses_authenticated_url(monkeypatch):
+    """The git fetch uses the token-injected URL for private repo access."""
+    from types import SimpleNamespace
+    monkeypatch.setenv("GH_TOKEN", "ghp_private")
+    remote_urls = []
+    def run(command, **kwargs):
+        if "remote" in command and "add" in command:
+            remote_urls.append(command[-1])
+        if "diff" in command:
+            kwargs["stdout"].write(b"A\0file\0")
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(diff.subprocess, "run", run)
+    diff._git_file_collections("https://github.com/owner/repo.git", BASE, HEAD, MERGE)
+    assert len(remote_urls) == 1
+    assert remote_urls[0] == "https://x-access-token:ghp_private@github.com/owner/repo.git"
+
+
+def test_git_fallback_no_token_keeps_plain_url(monkeypatch):
+    """Without a token, the original URL is used (fail-closed for private repos)."""
+    from types import SimpleNamespace
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    remote_urls = []
+    def run(command, **kwargs):
+        if "remote" in command and "add" in command:
+            remote_urls.append(command[-1])
+        if "diff" in command:
+            kwargs["stdout"].write(b"A\0file\0")
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(diff.subprocess, "run", run)
+    diff._git_file_collections("https://github.com/owner/repo.git", BASE, HEAD, MERGE)
+    assert len(remote_urls) == 1
+    assert remote_urls[0] == "https://github.com/owner/repo.git"
