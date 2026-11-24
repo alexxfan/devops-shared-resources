@@ -57,13 +57,18 @@ def monitor_arguments(env):
         ledger = str(Path(env["RUNNER_TEMP"]) / "gap-notifications" / scope / f"{env['GITHUB_RUN_ID']}-{env['GITHUB_RUN_ATTEMPT']}" / "journal.json") if mode == "write" else None
         transition = "41" if mode == "write" and target.name == "stage" else None
         fields = {"resolution": {"id": "10000"}} if transition else {}
+        tagging = env.get("GAP_TEAM_TAGGING", "true").strip().lower()
+        if tagging not in {"true", "false"}:
+            raise ValueError("invalid team-tagging setting")
         NotificationConfig(mode=mode, ledger=ledger, trial_id=trial, jira_environment=target.name,
-                           channel=channel, transition_id=transition, transition_fields=fields).validate()
+                           channel=channel, transition_id=transition, transition_fields=fields,
+                           team_tagging=tagging == "true").validate()
     except (ValueError, KeyError, TypeError):
         return args, "invalid-configuration"
     args += ["--notification-mode", mode, "--notification-trial-id", trial]
     if ledger:
         args += ["--notification-ledger", ledger]
+    args += ["--notification-team-tagging", "enabled" if tagging == "true" else "disabled"]
     if transition:
         import json
         args += ["--notification-transition-id", transition, "--notification-transition-fields", json.dumps(fields)]

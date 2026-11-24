@@ -63,6 +63,18 @@ def test_missing_channel_disabled(channel):
     assert workflow.monitor_arguments({**env, 'GAP_NOTIFICATION_MODE': 'disabled'}) == (["--publish-state"], "disabled")
 
 
+# Team tagging is an explicit presentation switch; delivery remains enabled when false.
+def test_team_tagging_setting_is_forwarded_and_validated(tmp_path):
+    env = {"GAP_NOTIFICATION_MODE": "write", "GAP_SLACK_CHANNEL": "C012OTHER",
+           "GAP_TEAM_TAGGING": "false", "RUNNER_TEMP": str(tmp_path / "runner"),
+           "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}
+    args, reason = workflow.monitor_arguments(env)
+    assert reason == "configured-write"
+    assert args[args.index("--notification-team-tagging") + 1] == "disabled"
+    invalid = {**env, "GAP_TEAM_TAGGING": "maybe"}
+    assert workflow.monitor_arguments(invalid) == (["--publish-state"], "invalid-configuration")
+
+
 # Environment-specific defaults belong to shared policy, with production recovery held.
 @pytest.mark.parametrize("environment", ["stage", "production"])
 def test_monitor_configuration(environment):
