@@ -319,7 +319,7 @@ def test_multiple_ambiguous_missing_components_post_one_bare_retest_and_share_re
     assert gh.posts[0].startswith("/retest\n\n")
     assert len(evidence["retry-history"]) == 2
     assert {r["comment_id"] for r in evidence["retry-history"]} == {1}
-    restarted = manager(gh, client, now=NOW + timedelta(minutes=20))
+    restarted = manager(gh, client, now=NOW + timedelta(minutes=10))
     _, recovered = restarted.apply(PR, *missing_evidence(client))
     assert len(gh.posts) == 1
     assert len(recovered["retry-history"]) == 2
@@ -364,7 +364,7 @@ def test_bare_retest_receipt_is_reconciled_without_repeating_missing_retry():
     gh, client = FakeGitHub(), FakeKonflux()
     gate, saved = manager(gh, client).apply(PR, *missing_evidence(client))
     assert gh.posts[0].startswith("/retest\n\n")
-    gate, evidence = manager(gh, client, saved=saved, now=NOW + timedelta(minutes=20)).apply(PR, *missing_evidence(client))
+    gate, evidence = manager(gh, client, saved=saved, now=NOW + timedelta(minutes=10)).apply(PR, *missing_evidence(client))
     assert gate.outcome == "pass"  # missing build = green by default
     assert len(gh.posts) == 1
     assert evidence["runs"][0]["retry"]["status"] == "build-retrigger-pending"
@@ -582,14 +582,17 @@ def test_human_quote_of_receipt_cannot_consume_the_retry_budget():
     assert receipt["runs"][0]["retry"]["retrigger_count"] == 1
 
 
-def test_new_attempt_within_grace_period_does_not_trigger_second_retest():
+def test_new_failed_attempt_triggers_immediate_retry():
+    """When PaC creates a new PipelineRun (different UID) that also fails,
+    retry immediately instead of waiting — UID comparison detects the new attempt."""
     gh, client = FakeGitHub(), FakeKonflux()
     apply(manager(gh, client), client)
     client.items = [attempt(name="r2", created=NOW.isoformat())]
     gate, receipt = apply(manager(gh, client, now=NOW + timedelta(minutes=20)), client)
-    # Within the 2-hour grace period, no second retry is posted.
-    assert len(gh.posts) == 1
+    # Different UID + failure → immediate retry (no 2-hour wait).
+    assert len(gh.posts) == 2
     assert receipt["runs"][0]["retry"]["status"] == "build-retrigger-pending"
+    assert receipt["runs"][0]["retry"]["retrigger_count"] == 2
     assert gate.outcome == "pending"
 
 
@@ -1078,3 +1081,105 @@ def test_merge_conflict_pr_gets_konflux_observations(tmp_path, monkeypatch):
     # Check runs are fetched and Konflux gate is evaluated even for
     # merge-conflicted PRs.
     assert "head-sha" in obs
+
+
+# --- UID-based realtime build evaluation ---
+
+
+def test_same_uid_past_verify_grace_retries_again():
+    """Same UID + >15min elapsed + failure status → falls through to retry."""
+    gh, client = FakeGitHub(), FakeKonflux()
+    # First apply: posts /retest, records retry with run_uid = observation uid.
+    _, saved = apply(manager(gh, client), client)
+    # Second apply: same observation (same uid), 20 min later (>15min verify grace).
+    gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(minutes=20)), client)
+    # Same UID past verify grace → stale retrigger → falls through → posts another retry.
+    assert gate.outcome == "pending"
+    assert len(gh.posts) == 2
+    assert receipt["runs"][0]["retry"]["retrigger_count"] == 2
+
+
+def test_same_uid_within_verify_grace_stays_pending():
+    """Same UID + <15min elapsed → waiting=True (still in verify grace)."""
+    gh, client = FakeGitHub(), FakeKonflux()
+    _, saved = apply(manager(gh, client), client)
+    # 10 min later: within the 15-min verify grace window.
+    gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(minutes=10)), client)
+    assert gate.outcome == "pending"
+    assert receipt["runs"][0]["retry"]["status"] == "build-retrigger-pending"
+    assert "Waiting for PaC to process retrigger" in receipt["runs"][0]["retry"]["reason"]
+    assert len(gh.posts) == 1
+
+
+def test_different_uid_failure_triggers_immediate_retry():
+    """Different UID (new PipelineRun created) + failure → immediate retry."""
+    gh, client = FakeGitHub(), FakeKonflux()
+    _, saved = apply(manager(gh, client), client)
+    # PaC created a new PipelineRun with a different UID (still failing).
+    client.items = [attempt(name="r2", created="2026-11-05T12:05:00Z")]
+    gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(minutes=20)), client)
+    # Different UID + failure → falls through → posts another retry.
+    assert gate.outcome == "pending"
+    assert len(gh.posts) == 2
+    assert receipt["runs"][0]["retry"]["retrigger_count"] == 2
+
+
+def test_different_uid_running_stays_pending():
+    """Different UID + running status → pending (legitimate wait for completion).
+
+    Running observations are NOT in retryable_statuses, so apply() routes
+    them through the non-retryable path which records the pending retry state.
+    """
+    gh, client = FakeGitHub(), FakeKonflux()
+    _, saved = apply(manager(gh, client), client)
+    # PaC created a new PipelineRun that is still running.
+    newer = attempt(name="r2", created="2026-11-05T12:05:00Z")
+    newer["status"]["conditions"][0].update(status="Unknown", reason="Running")
+    newer["status"].pop("completionTime")
+    client.items = [newer]
+    gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(minutes=20)), client)
+    # Running is not retryable — apply() recognizes it as an in-flight retry.
+    assert gate.outcome == "pending"
+    assert receipt["runs"][0]["retry"]["status"] == "build-retrigger-pending"
+    assert receipt["runs"][0]["retry"]["retrigger_count"] == 1
+    assert len(gh.posts) == 1
+
+
+def test_no_uids_within_verify_grace_stays_pending():
+    """Empty UIDs + <15min elapsed → pending (brief grace)."""
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = missing_evidence(client)
+    _, saved = manager(gh, client).apply(PR, gate, evidence)
+    # Missing observations have empty UIDs; verify grace protects the retrigger.
+    gate, evidence = missing_evidence(client)
+    gate, evidence = manager(gh, client, saved=saved, now=NOW + timedelta(minutes=5)).apply(PR, gate, evidence)
+    assert gate.outcome == "pass"  # missing build = green by default
+    assert evidence["runs"][0]["retry"]["status"] == "build-retrigger-pending"
+    assert "UID unavailable" in evidence["runs"][0]["retry"]["reason"]
+    assert len(gh.posts) == 1
+
+
+def test_no_uids_past_verify_grace_falls_through():
+    """Empty UIDs + >15min elapsed → falls through to retry."""
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = missing_evidence(client)
+    _, saved = manager(gh, client).apply(PR, gate, evidence)
+    # 20 min later: past the 15-min verify grace window.
+    gate, evidence = missing_evidence(client)
+    gate, evidence = manager(gh, client, saved=saved, now=NOW + timedelta(minutes=20)).apply(PR, gate, evidence)
+    assert gate.outcome == "pass"  # missing build = green by default
+    assert len(gh.posts) == 2  # second retry posted
+
+
+def test_exhaustion_after_same_uid_stale():
+    """Same UID + 5 retries used + past verify grace → retry-exhausted (FAIL)."""
+    gh, client = FakeGitHub(), FakeKonflux()
+    _, saved = apply(manager(gh, client), client)
+    for i in range(2, 6):  # retries 2 through 5
+        client.items = [attempt(name=f"r{i}", created=f"2026-11-05T{9 + i}:00:00Z")]
+        _, saved = apply(manager(gh, client, saved=saved, now=NOW + timedelta(hours=i * 2)), client)
+    assert len(gh.posts) == 5
+    # Same observation as the last retry (same UID), past verify grace → exhausted.
+    gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(hours=14)), client)
+    assert len(gh.posts) == 5 and gate.outcome == "fail"
+    assert receipt["runs"][0]["retry"]["status"] == "retry-exhausted"

@@ -19,7 +19,8 @@ from lib.github_cli import GhCommandError
 from lib.konflux_builds import KonfluxQueryError, NAME
 
 MAX_RETRIGGERS = 5
-START_GRACE = timedelta(hours=2)
+RETRIGGER_VERIFY_GRACE = timedelta(minutes=15)
+STALE_VERIFIABLE_STATUSES = {"failure", "timed_out", "cancelled"}
 MARKER = re.compile(r"<!-- gap-build-retry:v1 (\{[^\n]+\}) -->")
 
 
@@ -158,19 +159,78 @@ class BuildRetryManager:
             return info, True
         if records:
             last = max(records, key=lambda r: _moment(r["requested_at"]))
-            waiting = now - _moment(last["requested_at"]) < START_GRACE
-            if waiting:
-                info.update(
-                    status="build-retrigger-pending",
-                    reason="Waiting for a new Konflux attempt",
-                    requested_at=last["requested_at"], comment_url=last.get("comment_url"),
-                )
-                return info, True
+            elapsed = now - _moment(last["requested_at"])
+            retried_uid = last.get("run_uid", "")
+            current_uid = observation.get("uid", "")
+
+            # Direct pipeline evaluation: compare current observation with retry record
+            if current_uid and retried_uid:
+                if current_uid == retried_uid:
+                    # Same PipelineRun — retrigger didn't create a new one
+                    if observation_status in STALE_VERIFIABLE_STATUSES:
+                        if elapsed > RETRIGGER_VERIFY_GRACE:
+                            # PaC had enough time, retrigger unsuccessful
+                            # Fall through to retry-or-exhaust logic below
+                            pass
+                        else:
+                            # Brief grace for PaC to process
+                            info.update(
+                                status="build-retrigger-pending",
+                                reason="Waiting for PaC to process retrigger",
+                                requested_at=last["requested_at"],
+                                comment_url=last.get("comment_url"),
+                                retrigger_count=count,
+                                run_uid=current_uid,
+                            )
+                            return info, True
+                    else:
+                        # Non-failure status (success/pending/running) with same UID
+                        info.update(
+                            status="build-retrigger-pending",
+                            reason="Waiting for Konflux status update",
+                            requested_at=last["requested_at"],
+                            comment_url=last.get("comment_url"),
+                            retrigger_count=count,
+                            run_uid=current_uid,
+                        )
+                        return info, True
+                else:
+                    # Different UID — a new PipelineRun was created from the retrigger
+                    if observation_status in STALE_VERIFIABLE_STATUSES:
+                        # New PipelineRun also failed — fall through to retry-or-exhaust
+                        pass
+                    else:
+                        # New PipelineRun is pending/running/success — legitimate wait
+                        info.update(
+                            status="build-retrigger-pending",
+                            reason="New PipelineRun detected, waiting for completion",
+                            requested_at=last["requested_at"],
+                            comment_url=last.get("comment_url"),
+                            retrigger_count=count,
+                            run_uid=current_uid,
+                        )
+                        return info, True
+            else:
+                # Can't compare UIDs — brief grace period only
+                if elapsed < RETRIGGER_VERIFY_GRACE:
+                    info.update(
+                        status="build-retrigger-pending",
+                        reason="Waiting for PaC to process retrigger (UID unavailable)",
+                        requested_at=last["requested_at"],
+                        comment_url=last.get("comment_url"),
+                        retrigger_count=count,
+                        run_uid=current_uid or retried_uid or "",
+                    )
+                    return info, True
+                # else: past grace, fall through to retry-or-exhaust
+
+            # Exhaustion check (reached when retrigger was stale or new PipelineRun also failed)
             if count >= MAX_RETRIGGERS:
                 info.update(
                     status="retry-exhausted",
                     reason="Five automatic retries already used for this component and SHA",
-                    requested_at=last["requested_at"], comment_url=last.get("comment_url"),
+                    requested_at=last["requested_at"],
+                    comment_url=last.get("comment_url"),
                 )
                 return info, False
         if count >= MAX_RETRIGGERS:
@@ -233,7 +293,15 @@ class BuildRetryManager:
                 continue
             if previous:
                 last = max(previous, key=lambda r: _moment(r["requested_at"]))
-                if now - _moment(last["requested_at"]) < START_GRACE:
+                elapsed = now - _moment(last["requested_at"])
+                item_uid = item.get("run_uid") or ""
+                last_uid = last.get("run_uid", "")
+                # UID-based evaluation: defer only while verifying retrigger
+                if item_uid and last_uid:
+                    if item_uid == last_uid and elapsed <= RETRIGGER_VERIFY_GRACE:
+                        grace_components.append(component)
+                        continue
+                elif elapsed < RETRIGGER_VERIFY_GRACE:
                     grace_components.append(component)
                     continue
             batch_records.append({
