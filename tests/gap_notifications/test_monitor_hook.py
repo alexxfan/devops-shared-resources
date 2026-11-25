@@ -130,6 +130,18 @@ def test_disabled_dry_run_no_mapping_fetch(hook, mode, dry_run):
     invoke(config=replace(opts['config'], mode=mode), dry_run=dry_run, ownership_fetch=fail)
 
 
+def test_team_tagging_can_be_disabled_without_disabling_delivery(hook):
+    invoke, jira, slack, opts, calls = hook
+    def fail(name):
+        pytest.fail("ownership mapping must not be fetched when team tagging is disabled")
+    result = invoke(config=replace(opts["config"], team_tagging=False), ownership_fetch=fail)
+    assert result["status"] == "settled"
+    assert calls and jira.issues["RHAI-1"]["fields"].get("components", []) == []
+    assert len(slack.calls) == 1
+    assert "Owning team:" not in slack.calls[0][0]
+    assert "blocks" not in slack.calls[0][1]
+
+
 def test_creation_fields_and_existing_ownership_unchanged(hook):
     invoke, jira, slack, _, _ = hook
     assert invoke()['status'] == 'settled'

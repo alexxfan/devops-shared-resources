@@ -3262,6 +3262,8 @@ def build_parser() -> argparse.ArgumentParser:
     notifications.add_argument("--notification-trial-id", default="default")
     notifications.add_argument("--notification-transition-id", help="Explicit verified done transition for the selected Jira environment")
     notifications.add_argument("--notification-transition-fields", default="{}", help="JSON fields for recovery transition")
+    notifications.add_argument("--notification-team-tagging", choices=("enabled", "disabled"), default="enabled",
+                               help="Include Jira ownership and Slack team tagging (default: enabled)")
     return parser
 
 
@@ -3285,6 +3287,7 @@ def main(argv: list[str] | None = None) -> int:
                 channel=os.environ.get("GAP_SLACK_CHANNEL", ""),
                 transition_id=args.notification_transition_id,
                 transition_fields=json.loads(args.notification_transition_fields),
+                team_tagging=args.notification_team_tagging == "enabled",
             )
         except Exception as exc:
             print("WARNING: Invalid notification configuration: " + type(exc).__name__, file=sys.stderr)

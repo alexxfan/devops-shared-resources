@@ -36,12 +36,15 @@ class NotificationConfig:
     transition_fields: dict = field(default_factory=dict)
     jira_environment: str = "stage"
     channel: str | None = None
+    team_tagging: bool = True
 
     def validate(self):
         from lib.gap_notifications.notify_tools import routing_target
         routing_target(self.jira_environment, self.channel)
         if self.mode not in {"disabled", "preview", "write"}:
             raise ValueError("invalid notification mode")
+        if not isinstance(self.team_tagging, bool):
+            raise ValueError("team tagging must be a boolean")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.trial_id):
             raise ValueError("invalid trial ID")
         if self.mode == "write" and not self.ledger:
@@ -112,22 +115,24 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
         target = routing_target(config.jira_environment, config.channel)
         observations = collector(filtered, environment=target.scope, leader_url=leader_url, state_url=link)
         validate_observations(observations, **target.options)
-        from lib.gap_notifications.ownership import OwnershipPolicy
-        if ownership_ca_bundle is None:
-            if environ is None:
-                import os
-                ownership_ca_bundle = os.environ.get('GAP_OWNERSHIP_CA_BUNDLE')
-            else:
-                ownership_ca_bundle = environ.get('GAP_OWNERSHIP_CA_BUNDLE')
-        ownership_options = {'ca_bundle': ownership_ca_bundle}
-        if observations and ownership_fetch is None:
-            # The monitor already has GitHub read access; keep notification
-            # credentials untouched during preview and injected offline loads.
-            if environ is None:
-                import os
-                environ = os.environ
-            ownership_options['github_token'] = environ.get('GH_TOKEN') or environ.get('GITHUB_TOKEN')
-        ownership = OwnershipPolicy.load(ownership_fetch, **ownership_options) if observations else None
+        ownership = None
+        if config.team_tagging:
+            from lib.gap_notifications.ownership import OwnershipPolicy
+            if ownership_ca_bundle is None:
+                if environ is None:
+                    import os
+                    ownership_ca_bundle = os.environ.get('GAP_OWNERSHIP_CA_BUNDLE')
+                else:
+                    ownership_ca_bundle = environ.get('GAP_OWNERSHIP_CA_BUNDLE')
+            ownership_options = {'ca_bundle': ownership_ca_bundle}
+            if observations and ownership_fetch is None:
+                # The monitor already has GitHub read access; keep notification
+                # credentials untouched during preview and injected offline loads.
+                if environ is None:
+                    import os
+                    environ = os.environ
+                ownership_options['github_token'] = environ.get('GH_TOKEN') or environ.get('GITHUB_TOKEN')
+            ownership = OwnershipPolicy.load(ownership_fetch, **ownership_options) if observations else None
         counts = {s: sum(o["status"] == s for o in observations) for s in ("failure", "success", "unknown")}
         if config.mode == "preview" or not observations:
             result = {"status": "preview" if config.mode == "preview" else "no-observations", "counts": counts}

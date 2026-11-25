@@ -81,6 +81,10 @@ workflow completion; no Konflux completion timestamp is attached to merge failur
   `--notification-transition-fields '{"resolution":{"id":"VERIFIED_ID"}}'`:
   explicitly verified done transition/required fields for the selected Jira site. Without a done
   transition, positive recovery holds visibly instead of guessing how to close.
+- `--notification-team-tagging enabled|disabled` (default `enabled`): controls only
+  Jira ownership components and Slack owning-team presentation. `disabled` still
+  delivers notifications to the configured Jira and Slack destinations, but does not
+  fetch ownership mappings or add team tags/mentions.
 
 Preview collects/validates and prints observation counts; it does **not** access
 notification credentials, create clients, or read/write the notification ledger.
@@ -234,6 +238,8 @@ uv run --no-project --python /path/to/existing/.venv/bin/python -m pytest -q \
 ## Configured destination and workflow boundary
 
 `GAP_SLACK_CHANNEL` is authoritative and must be a nonblank Slack channel ID.
+`GAP_TEAM_TAGGING` may be set to `true` or `false` by workflow callers; it is
+forwarded to the same explicit notification switch and fails closed on any other value.
 There is no fixed-channel allowlist or routing fallback. CLI `--channel` is
 an optional matching assertion, never an override. Requested channel, adapter,
 acknowledgement, stored root and manually attested receipt must agree.
