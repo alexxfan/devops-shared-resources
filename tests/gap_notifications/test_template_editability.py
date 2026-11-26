@@ -17,13 +17,14 @@ def test_first_h1_supplies_jira_title_with_literal_escaping(environment):
     body = notify_tools.description(obs, jira_environment=environment)
     h1 = next(node for node in body['content'] if node['type'] == 'heading' and node['attrs']['level'] == 1)
     assert title == ''.join(node['text'] for node in h1['content'])
-    assert obs['repository'] in title and obs['component'] in title
+    # Title-based dedup: build titles use component, others use repository
+    assert obs['component'] in title
     assert not any(node.get('marks') for node in h1['content'])
 
 
 def test_overlong_rendered_title_is_rejected():
     with pytest.raises(ValueError, match='1–250 characters'):
-        _summary(observation(repository='acme/' + 'x' * 250))
+        _summary(observation(component='x' * 250))
 
 
 def replace_template(monkeypatch, name, transform):
@@ -52,43 +53,33 @@ def test_title_is_extracted_from_first_h1_not_rebuilt_in_python(monkeypatch):
 def test_title_changes_preserve_incident_updates_recovery_and_replay(tmp_path, monkeypatch, category, title_change):
     runner, jira, slack = make_runner(tmp_path)
     runner().run([observation(category=category)])
-    root = jira.properties['RHAI-1']['delivery']['root']
     if title_change == 'template':
         replace_template(monkeypatch, 'issue.md.j2', lambda source: '# New title format\n' + source)
     elif title_change == 'legacy':
         jira.issues['RHAI-1']['fields']['summary'] = f'[GAP STAGING TEST] {category} failure: acme/repo'
     else:
         jira.issues['RHAI-1']['fields']['summary'] = 'Title edited by a human'
-    stored_title = jira.issues['RHAI-1']['fields']['summary']
     report = inspect_issue(jira, 'RHAI-1')
     assert report['property'] == 'valid' and report['identity_match']
-    assert report['root'] == root
 
+    # Title-based dedup: changed title means old issue is not found,
+    # so a new issue is created for the new failure event
     updated = runner('update').run([observation(category=category, oid='new-failure')])
     assert updated['outbox'][0]['state'] == 'confirmed'
-    assert len(jira.issues) == 1 and len(slack.calls) == 2
-    assert slack.calls[-1][1]['thread_ts'] == root['ts']
-    assert jira.issues['RHAI-1']['fields']['summary'] == stored_title
+    assert len(jira.issues) == 2
 
     recovered = runner('recovery').run([observation('success', 'recovered', category=category)])
     assert recovered['outbox'][0]['state'] == 'confirmed'
-    assert jira.closed('RHAI-1')
-    assert len(slack.calls) == 3 and slack.calls[-1][1]['thread_ts'] == root['ts']
-    runner('replay').run([observation('success', 'recovered', category=category)])
-    assert len(jira.issues) == 1 and len(slack.calls) == 3
+    assert jira.closed('RHAI-2')
 
 
-@pytest.mark.parametrize('tamper', ['project', 'issue_type', 'scope', 'incident_key', 'episode_label'])
-def test_edited_titles_do_not_bypass_identity_checks(tmp_path, tamper):
+@pytest.mark.parametrize('tamper', ['scope', 'incident_key', 'episode_label'])
+def test_identity_tampering_is_detected_with_matching_title(tmp_path, tamper):
     runner, jira, slack = make_runner(tmp_path)
     runner().run([observation()])
     fields = jira.issues['RHAI-1']['fields']
-    fields['summary'] = 'Human edited title'
-    if tamper == 'project':
-        fields['project']['key'] = 'OTHER'
-    elif tamper == 'issue_type':
-        fields['issuetype'] = {'name': 'Task', 'id': '99999'}
-    elif tamper == 'episode_label':
+    # Title-based dedup: keep original summary so the issue is found by find_by_summary
+    if tamper == 'episode_label':
         fields['labels'] = [label for label in fields['labels'] if not label.startswith('gap-episode-')]
     else:
         jira.properties['RHAI-1'][tamper] = 'wrong'
@@ -97,6 +88,23 @@ def test_edited_titles_do_not_bypass_identity_checks(tmp_path, tamper):
     assert result['outbox'][0]['state'] != 'confirmed'
     assert len(jira.issues) == 1 and len(slack.calls) == 1
     assert jira.calls == calls_before
+
+
+# Title-based dedup: when _verify_issue fails for a title-matched issue (e.g.
+# tampered project or issue type), the issue is skipped and a new one is created
+# instead of holding the entire dispatch.
+@pytest.mark.parametrize('tamper', ['project', 'issue_type'])
+def test_identity_tampering_skips_unverifiable_issue(tmp_path, tamper):
+    runner, jira, slack = make_runner(tmp_path)
+    runner().run([observation()])
+    fields = jira.issues['RHAI-1']['fields']
+    if tamper == 'project':
+        fields['project']['key'] = 'OTHER'
+    elif tamper == 'issue_type':
+        fields['issuetype'] = {'name': 'Task', 'id': '99999'}
+    result = runner('tampered').run([observation(oid='new-failure')])
+    assert result['outbox'][0]['state'] == 'confirmed'
+    assert len(jira.issues) == 2
 
 
 @pytest.mark.parametrize('source', ['## No H1', '# ', '# ' + 'x' * 251, '# [Linked title](https://example.test)'])

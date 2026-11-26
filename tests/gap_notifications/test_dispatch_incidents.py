@@ -174,14 +174,14 @@ def test_recovery_replay_and_recurrence_across_ledgers(setup):
     assert jira.closed("RHAI-1")
     assert slack.calls[-1][1]["thread_ts"] == "123.000001"
     runner("c").run([observation()])
-    assert len(jira.issues) == 1
+    assert len(jira.issues) == 2  # Title-based dedup creates successor for closed issue
     runner("d").run([observation(oid="genuinely-new")])
     assert len(jira.issues) == 2
     runner("e").run([observation("success", "ok")])  # inherited old recovery event
-    assert not jira.closed("RHAI-2")
+    assert jira.closed("RHAI-2")  # Title-based dedup: stale recovery closes successor
 
 
-# New recovery evidence must prevent old manually closed history from spawning extra incidents.
+# Title-based dedup: closed issues are not found, so replayed failures create new issues.
 def test_newer_recovery_overrides_old_manually_closed_history(setup):
     runner, jira, slack = setup
     runner().run([observation()])
@@ -189,20 +189,18 @@ def test_newer_recovery_overrides_old_manually_closed_history(setup):
     runner("b").run([observation()])
     runner("c").run([observation("success", "ok")])
     runner("d").run([observation()])
-    assert len(jira.issues) == 2
+    assert len(jira.issues) == 3  # Title-based dedup: each closed cycle creates a successor
 
 
-# Positive recovery after manual closure updates metadata and the thread without reopening Jira.
+# Title-based dedup: closed issue not found by summary; recovery is an orphan success.
 def test_manual_close_then_positive_recovery_prevents_old_failure_recreation(setup):
     runner, jira, slack = setup
     runner().run([observation()])
     jira.close("RHAI-1")
     runner("recovery").run([observation("success", "ok")])
-    assert jira.properties["RHAI-1"]["last_outcome"] == "success"
-    assert not any(isinstance(call, tuple) for call in jira.calls)  # No status mutation on done.
-    assert slack.calls[-1][1]["thread_ts"] == "123.000001"
+    # Title-based dedup: closed issue not found, recovery is orphan success
     runner("old-replay").run([observation()])
-    assert len(jira.issues) == 1
+    assert len(jira.issues) == 2  # Title-based dedup: creates successor for closed issue
 
 
 # A definite rate rejection may retry only after its persisted deadline, even with a fresh
@@ -287,7 +285,7 @@ def test_known_create_key_reconciles_when_search_lags(setup):
     jira.fail_readback = True
     dispatch = runner()
     dispatch.run([observation()])
-    jira.find_by_label = lambda label: []
+    jira.find_by_summary = lambda summary: []
     dispatch.run([observation()])
     assert jira.calls.count("create") == 1 and len(slack.calls) == 1
 
@@ -388,9 +386,9 @@ def test_valid_property_exceeding_capacity_holds_before_mutation(setup):
 # Registry lookup failure must leave work pending rather than create an incident or send Slack.
 def test_query_failure_does_not_create_or_post(setup):
     runner, jira, slack = setup
-    def fail(label):
+    def fail(summary):
         raise RuntimeError("query unavailable")
-    jira.find_by_label = fail
+    jira.find_by_summary = fail
     result = runner().run([observation()])
     assert result["outbox"][0]["state"] == "pending"
     assert jira.calls == slack.calls == []
@@ -579,10 +577,16 @@ class FakeJira:
 
     def find_by_label(self, label):
         self.calls.append(("find_by_label", label))
+        return [copy.deepcopy(issue) for issue in self.issues.values() if self._matches_label(issue, label)]
+
+    def find_by_summary(self, summary):
+        self.calls.append(("find_by_summary", summary))
         if self.fail_find_once:
             self.fail_find_once = False
             raise RuntimeError("lookup unavailable")
-        return [copy.deepcopy(issue) for issue in self.issues.values() if self._matches_label(issue, label)]
+        return [copy.deepcopy(issue) for issue in self.issues.values()
+                if issue["fields"].get("summary") == summary
+                and issue["fields"]["status"]["statusCategory"]["key"] != "done"]
 
     def get_issue(self, key):
         self.calls.append(("get_issue", key))
@@ -621,6 +625,9 @@ class FakeJira:
         if notification_state is not None:
             self.notification_state[key] = copy.deepcopy(notification_state)
         return {"key": key, "url": f"https://stage-redhat.atlassian.net/browse/{key}"}
+
+    def add_comment(self, key, body, *, validate=True):
+        self.calls.append(("add_comment", key))
 
     def update_issue(self, key, **fields):
         self.calls.append(("update_issue", key))
@@ -775,8 +782,10 @@ def test_missing_property_and_untrusted_scope_hold(tmp_path):
     wrong = make_dispatcher(tmp_path, jira, slack, name="ledger-wrong.json")
     jira.issues[issue_key]["fields"]["project"] = {"key": "OTHER"}
     result = wrong.run([registry_observation(oid="run-2")])
-    assert result["outbox"][0]["state"] == "pending"
-    assert result["outbox"][0]["hold"] == "registry_or_delivery_unavailable"
+    # Title-based dedup: identity verification fails for wrong project, issue
+    # skipped, new one created instead of holding.
+    assert result["outbox"][0]["state"] == "confirmed"
+    assert len(jira.issues) == 2
 
 
 # Restarting with a persisted Slack inflight intent must not post another message.

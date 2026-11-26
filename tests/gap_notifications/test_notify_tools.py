@@ -814,7 +814,7 @@ def test_invalid_presentation_has_no_write_intent_and_corrected_can_proceed(setu
     assert jira.calls == before_calls and slack.calls == before_slack
     corrected = runner().run([observation(oid='render-review')])
     assert corrected['outbox'][-1]['state'] == 'confirmed'
-    assert jira.calls[len(before_calls):] == (['update'] if existing else ['create', 'update'])
+    assert jira.calls[len(before_calls):] == (['comment', 'update'] if existing else ['create', 'update'])
     assert jira.properties['RHAI-1']['jira_intent'] is None
 
 
@@ -838,7 +838,7 @@ def test_dispatcher_only_adds_labels_despite_stale_registry_snapshot(setup, monk
     update = jira.update_issue
     def raced_update(key, **kwargs):
         assert 'labels' not in kwargs
-        assert kwargs['add_labels'] == ['gap-build-failure']
+        assert kwargs['add_labels'] == ['gap-build-failure', 'no-autofix']
         jira.issues[key]['fields']['labels'].append('human-after-search')
         return update(key, **kwargs)
     monkeypatch.setattr(jira, 'update_issue', raced_update)

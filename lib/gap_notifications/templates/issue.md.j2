@@ -1,7 +1,6 @@
 {# The first H1 supplies the Jira summary. Keep this format compatible with existing issues. -#}
 {% set banner = 'JIRA STAGE - ' if jira_environment == 'stage' else '' -%}
-{% set context = 'merge feasibility' if category in ['feasibility', 'conflict'] else component -%}
-# {{ banner }}Promotion Gate Failure in {{ repository }} ({{ context }})
+# {{ banner }}Promotion Gate {{ title_context }} Failure in {{ title_object }}
 
 {% if jira_environment == 'stage' %}
 STAGE JIRA ENVIRONMENT
