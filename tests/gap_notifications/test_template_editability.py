@@ -56,15 +56,15 @@ def test_actionable_summary_and_key_links_appear_before_technical_details():
         obs, discussion_url='https://slack.example/archives/C123/p456'
     )
     what_happened = markdown.index('## What happened')
-    what_to_do = markdown.index('## What to do next')
     key_links = markdown.index('## Key links')
     slack_links = markdown.index('## Slack discussion')
+    what_to_do = markdown.index('## What to do next')
     technical = markdown.index('## Failure Details')
-    assert what_happened < what_to_do < key_links < slack_links < technical
+    assert what_happened < key_links < slack_links < what_to_do < technical
     key_section = markdown[key_links:slack_links]
     assert '[Child PR](https://github.com/acme/repo/pull/1)' in key_section
     assert '[Build logs or PipelineRun](https://build.example/run/1)' in key_section
-    assert '[Open Slack discussion](https://slack.example/archives/C123/p456)' in markdown[slack_links:technical]
+    assert '[Open Slack discussion](https://slack.example/archives/C123/p456)' in markdown[slack_links:what_to_do]
 
 
 def test_title_is_extracted_from_first_h1_not_rebuilt_in_python(monkeypatch):
