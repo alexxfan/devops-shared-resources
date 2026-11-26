@@ -214,7 +214,7 @@ def test_lost_create_response_adopts_without_duplicate(tmp_path, known):
     runner().run([observation()])
     jira.create_bug = original
     if known:
-        jira.find_by_label = lambda label: []
+        jira.find_by_summary = lambda summary: []
     runner().run([observation()])
     assert jira.calls.count('create') == 1 and len(slack.calls) == 1
 
@@ -223,15 +223,15 @@ def test_lost_create_response_adopts_without_duplicate(tmp_path, known):
 def test_create_cooldown_allows_positive_reconciliation_without_new_events(tmp_path):
     runner, jira, slack = make_runner(tmp_path)
     original = jira.create_bug
-    search = jira.find_by_label
+    search = jira.find_by_summary
     def lost(*a, **kw):
         original(*a, **kw)
         raise TimeoutError('lost')
     jira.create_bug = lost
-    jira.find_by_label = lambda label: []
+    jira.find_by_summary = lambda summary: []
     runner().run([observation()])
     runner().run([])  # No match yet; POST remains in cooldown.
-    jira.find_by_label = search
+    jira.find_by_summary = search
     jira.create_bug = original
     runner().run([])  # Prior issue appears before the cooldown deadline.
     assert jira.calls.count('create') == 1 and len(slack.calls) == 1
@@ -249,13 +249,13 @@ def test_delayed_index_duplicate_preference_and_later_hold(tmp_path, monkeypatch
     jira.create_bug = lost
     runner().run([observation()])
     jira.create_bug = original
-    search = jira.find_by_label
-    jira.find_by_label = lambda label: []
+    search = jira.find_by_summary
+    jira.find_by_summary = lambda summary: []
     clock[0] += 60
     runner().run([observation()])
     assert len(jira.issues) == 2
     before = copy.deepcopy((jira.calls, slack.calls))
-    jira.find_by_label = search
+    jira.find_by_summary = search
     result = runner().run([observation()])
     assert result['outbox'][0]['state'] == 'reconciliation_required'
     assert (jira.calls, slack.calls) == before
@@ -275,9 +275,9 @@ def test_create_retry_registry_failure_and_backoff(tmp_path, monkeypatch):
         runner().run([observation(oid=f'event-{n}-new')])
         assert jira.calls.count('create') == n
         clock[0] += delay
-    def unavailable(label):
+    def unavailable(summary):
         raise TimeoutError('search unavailable')
-    jira.find_by_label = unavailable
+    jira.find_by_summary = unavailable
     runner().run([observation(oid='after-search-failure')])
     assert jira.calls.count('create') == 6
 
@@ -425,7 +425,7 @@ def test_volatile_journal_duplicate_risk(tmp_path):
     jira.create_bug = lost
     runner('old').run([observation()])
     jira.create_bug = original
-    jira.find_by_label = lambda label: []
+    jira.find_by_summary = lambda summary: []
     runner('fresh').run([observation()])
     assert len(jira.issues) == 2
 
@@ -490,7 +490,7 @@ def test_attribution_unavailable_blocks_create(tmp_path, monkeypatch, fault):
     runner().run([observation()])
     monkeypatch.setattr('lib.gap_notifications.dispatch_incidents.time.time', lambda: 10 ** 12)
     if fault == 'known-read':
-        jira.find_by_label = lambda label: []
+        jira.find_by_summary = lambda summary: []
         def unavailable(key):
             raise TimeoutError('GET unavailable')
         jira.get_issue = unavailable

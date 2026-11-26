@@ -24,6 +24,11 @@ class Jira:
     def find_by_label(self, label):
         return [copy.deepcopy(i) for i in self.issues.values() if label in i["fields"]["labels"]]
 
+    def find_by_summary(self, summary):
+        return [copy.deepcopy(i) for i in self.issues.values()
+                if i["fields"]["summary"] == summary
+                and i["fields"]["status"]["statusCategory"]["key"] != "done"]
+
     def get_issue(self, key):
         return copy.deepcopy(self.issues[key])
 
@@ -51,6 +56,9 @@ class Jira:
             error.key = key
             raise error
         return {"key": key, "url": "https://stage-redhat.atlassian.net/browse/" + key}
+
+    def add_comment(self, key, body, *, validate=True):
+        self.calls.append("comment")
 
     def update_issue(self, key, **fields):
         self.calls.append("update")

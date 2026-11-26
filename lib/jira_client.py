@@ -402,6 +402,17 @@ class JiraClient:
             raise JiraAmbiguousError("Jira creation outcome could not be established")
         return {"key": key, "url": f"{self.base_url}/browse/{key}"}
 
+    def add_comment(self, key, body):
+        """Post an ADF comment to a Jira issue."""
+        key = self._issue_key(key)
+        if not isinstance(body, dict):
+            raise ValueError("comment body must be an ADF document")
+        payload = {"body": copy.deepcopy(body)}
+        _, data = self._session_request(
+            operation="issue comment", write=True,
+            sdk_call=lambda sdk: sdk.post(f"rest/api/3/issue/{key}/comment", data=payload))
+        return data
+
     def update_issue(self, key, *, fields=None, update=None):
         key = self._issue_key(key)
         payload = {}

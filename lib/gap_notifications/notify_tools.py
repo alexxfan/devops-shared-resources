@@ -405,6 +405,13 @@ class JiraNotifier:
         jql = f'project = {self.project} AND labels = "{self._escape_jql(label)}" ORDER BY key ASC'
         return [self._issue_fields(issue) for issue in self._client.search(jql, fields=SEARCH_FIELDS)]
 
+    def find_by_summary(self, summary: str) -> list[dict[str, Any]]:
+        """Find issues by exact summary match (open issues only)."""
+        summary = self._summary(summary)
+        escaped = self._escape_jql(summary)
+        jql = f'project = {self.project} AND summary = "{escaped}" AND statusCategory != "Done" ORDER BY key ASC'
+        return [self._issue_fields(issue) for issue in self._client.search(jql, fields=SEARCH_FIELDS)]
+
     def create_bug(
         self,
         summary: str,
@@ -524,6 +531,13 @@ class JiraNotifier:
                 raise JiraAmbiguousError("Jira creation readback did not match", key=issue["key"])
         elif type_id != STAGING_JIRA_ISSUE_TYPE_ID:
             raise JiraAmbiguousError("Jira creation readback did not match", key=issue["key"])
+
+    def add_comment(self, key: str, body: dict, *, validate: bool = True) -> Any:
+        """Post an ADF comment to a Jira issue."""
+        key = self._issue_key(key)
+        if validate:
+            self._validate_adf(body)
+        return self._client.add_comment(key, body)
 
     def update_issue(self, key: str, *, description: dict | None = None, labels: list[str] | None = None,
                      add_labels: list[str] | None = None) -> dict[str, Any]:
@@ -884,9 +898,10 @@ def markdown_to_adf(markdown):
 
 
 def category_labels(category):
-    return {"build": ["gap-build-failure"],
+    base = {"build": ["gap-build-failure"],
             "conflict": ["gap-sync-failure", "gap-merge-conflict"],
             "feasibility": ["gap-sync-failure", "gap-feasibility-failure"]}[category]
+    return base + ["no-autofix"]
 
 
 def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira_environment="stage", channel=None):
@@ -896,7 +911,14 @@ def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira
     creator = e.get("creator-outcome") or {}
     context = {key: literal(observation.get(key)) for key in (
         "repository", "category", "source_branch", "destination_branch", "component", "pipeline", "observation_id")}
+    if observation['category'] == 'build':
+        title_context, title_object = "PR Build", observation['component']
+    elif observation['category'] == 'feasibility':
+        title_context, title_object = "merge-feasibility", observation['repository']
+    else:  # conflict
+        title_context, title_object = "merge-conflict", observation['repository']
     context.update(jira_environment=target.name,
+                   title_context=literal(title_context), title_object=literal(title_object),
                    title_category=observation['category'], title_repository=observation['repository'],
                    pipeline=literal(observation.get("pipeline") or run.get("pipeline")),
                    reason=literal(e.get("reason") or run.get("reason") or creator.get("reason")),

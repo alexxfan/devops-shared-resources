@@ -20,6 +20,8 @@ Cosmetic ADF mechanics live in notify_tools; delivery never imports lookup_tools
 """
 from __future__ import annotations
 
+import logging
+
 from lib.gap_notifications.notify_tools import (JiraNotifier, category_labels, description, issue_summary,
     project_body, slack_message, routing_target, configured_channel, SLACK_ORIGIN, SlackRateLimitError, SlackPermanentError)
 import copy
@@ -37,6 +39,8 @@ import uuid
 from urllib.parse import urlsplit
 from contextlib import contextmanager
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 
 VALID_CATEGORIES = frozenset({"build", "conflict", "feasibility"})
@@ -450,7 +454,8 @@ class Dispatcher:
     def _registry(self, task):
         obs, identity = task["observation"], task["incident_key"]
         label = incident_label(identity, self.trial_id)
-        issues = self.jira.find_by_label(label)  # Adapter guarantees complete pagination.
+        summary = _summary(obs, **self.target.options)
+        issues = self.jira.find_by_summary(summary)  # Title-based dedup.
         if not isinstance(issues, list):
             raise RegistryHold("incomplete registry")
         journal = _create_journal(self.data.get("creates", {}).get(identity))
@@ -463,7 +468,13 @@ class Dispatcher:
                 issues.append(self.jira.get_issue(known))  # Known key beats eventual JQL visibility.
         records = []
         for issue in issues:
-            _verify_issue(issue, {"label": label, "latest": obs}, **self.target.options)
+            try:
+                _verify_issue(issue, {"label": label, "latest": obs}, **self.target.options)
+            except ValueError:
+                if issue.get("key") in known_keys:
+                    raise  # Known key: genuine identity error
+                logger.info("Skipping %s: title matched but identity verification failed", issue.get("key"))
+                continue
             state = _validate_state(self.jira.get_notification_state(issue["key"]), identity, self.trial_id, label, **self.target.options)
             if "gap-episode-" + uuid.UUID(state["episode_id"]).hex not in issue["fields"]["labels"]:
                 raise RegistryHold("episode property/label mismatch")
@@ -699,6 +710,13 @@ class Dispatcher:
                 if not _closed(issue):
                     self.jira.transition_to_done(key, self.transition_id, fields=self.transition_fields)
             else:
+                # Archive the current description as a comment before overwriting
+                try:
+                    current = self.jira.get_issue(key)
+                    if current.get("fields", {}).get("description"):
+                        self.jira.add_comment(key, current["fields"]["description"], validate=False)
+                except Exception:
+                    pass  # Archive is best-effort; must not block the failure update
                 self.jira.update_issue(key, description=body, add_labels=labels)
             state["seen_event_ids"][event] = obs["status"]
             state.update(last_event=event, last_outcome=obs["status"], jira_intent=None)
